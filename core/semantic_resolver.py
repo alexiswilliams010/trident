@@ -80,6 +80,7 @@ class ResolveFileResult:
     n_references: int
     n_call_edges: int
     n_data_access: int
+    n_inherits_edges: int = 0
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -168,13 +169,78 @@ def _extract_name_from_field(ts_node, field_name: str | None) -> str | None:
     return None
 
 
+def _terminal_identifier(ts_node) -> str | None:
+    """Walk into wrapper nodes (user_defined_type, expression, attribute, …) to
+    pull out the trailing identifier text. Used by inheritance extraction where
+    the base name is wrapped in a type node."""
+    node = _peel_expression(ts_node)
+    if node is None:
+        return None
+    if node.type in ("identifier", "type_identifier"):
+        return _text(node)
+    if node.type == "user_defined_type":
+        # Solidity: user_defined_type wraps the base identifier (or a dotted path).
+        last_ident: str | None = None
+        for c in node.children:
+            if c.type in ("identifier", "type_identifier"):
+                last_ident = _text(c)
+        return last_ident
+    if node.type == "attribute":
+        prop = node.child_by_field_name("attribute")
+        return _text(prop) if prop is not None else None
+    if node.type == "member_expression":
+        prop = node.child_by_field_name("property")
+        return _text(prop) if prop is not None else None
+    return None
+
+
+def _extract_bases(ts_node, cfg) -> list[str]:
+    """Return ordered list of base-class names declared on this node, per the
+    inheritance config. Two shapes:
+
+      Solidity — `parent.children[type=child_node_type]`, each with a field
+      pointing at a (possibly wrapped) identifier:
+
+        contract Foo is Bar, Baz {...}
+          ↳ inheritance_specifier.ancestor → user_defined_type → identifier "Bar"
+          ↳ inheritance_specifier.ancestor → user_defined_type → identifier "Baz"
+
+      Python — `parent.bases_field` resolves to a list-like node whose
+      identifier children are the base names:
+
+        class Foo(Bar, Baz): ...
+          ↳ class_definition.superclasses → argument_list → identifier "Bar", "Baz"
+    """
+    out: list[str] = []
+    if cfg.child_node_type:
+        for c in ts_node.children:
+            if c.type != cfg.child_node_type:
+                continue
+            target = c.child_by_field_name(cfg.child_name_field) if cfg.child_name_field else c
+            name = _terminal_identifier(target)
+            if name:
+                out.append(name)
+    elif cfg.bases_field:
+        list_node = ts_node.child_by_field_name(cfg.bases_field)
+        if list_node is not None:
+            for c in list_node.children:
+                name = _terminal_identifier(c)
+                if name:
+                    out.append(name)
+    return out
+
+
 # ────────────────────────────────────────────────────────────────────
 # Resolver
 # ────────────────────────────────────────────────────────────────────
 
 
 async def _clear_semantic_for_file(conn: asyncpg.Connection, file_id: int) -> None:
-    """Idempotency: drop any prior Tier 2 rows tied to this file."""
+    """Idempotency: drop any prior Tier 2 rows tied to this file.
+
+    Note: inherits_edges and overrides_edges cascade off definitions(id), so
+    deleting definitions also drops them — no explicit DELETE needed here.
+    """
     await conn.execute(
         "DELETE FROM call_edges WHERE callsite_node_id IN (SELECT id FROM nodes WHERE file_id=$1)",
         file_id,
@@ -338,6 +404,31 @@ async def resolve_file(
         if rule.scope_boundary:
             scope_def_id_by_ts[ts.id] = new_def_id
         file_def_ids.append(new_def_id)
+
+    # ── P2.5: inheritance edges (intra-file resolution) ──
+    inh_records: list[tuple[int, str, int, int | None]] = []  # (child, base_name, ord, base_def_id)
+    if config.inheritance is not None:
+        parent_types = set(config.inheritance.parent_node_types)
+        for ts in ts_walk:
+            if ts.type not in parent_types:
+                continue
+            child_def_id = scope_def_id_by_ts.get(ts.id)
+            if child_def_id is None:
+                continue
+            for ordinal, base_name in enumerate(_extract_bases(ts, config.inheritance), start=1):
+                # Try intra-file resolution: does any module-scope def in this file
+                # match the base name? (Cross-file matches go through Phase 3.)
+                base_def_id = defs_by_scope_and_name.get((module_def_id, base_name))
+                inh_records.append((child_def_id, base_name, ordinal, base_def_id))
+
+    if inh_records:
+        await conn.executemany(
+            """
+            INSERT INTO inherits_edges (child_def_id, base_name, ord, base_def_id, confidence)
+            VALUES ($1, $2, $3, $4, 'certain')
+            """,
+            inh_records,
+        )
 
     # ── P3 + P5 + P6: references, calls, data_access ──
     ref_rules = list(config.references)
@@ -521,6 +612,7 @@ async def resolve_file(
         n_references=len(ref_records),
         n_call_edges=len(call_records),
         n_data_access=len(da_records),
+        n_inherits_edges=len(inh_records),
     )
 
 

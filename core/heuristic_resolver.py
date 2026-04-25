@@ -94,6 +94,8 @@ class ResolutionStats:
     by_class: dict[str, int] = field(default_factory=dict)  # 'intra_repo' / 'external' / 'unresolved'
     cross_file_refs_resolved: int = 0
     cross_file_calls_resolved: int = 0
+    cross_file_inherits_resolved: int = 0
+    overrides_inserted: int = 0
     unresolved_paths: list[str] = field(default_factory=list)
 
 
@@ -455,7 +457,7 @@ async def _link_cross_file(
     conn: asyncpg.Connection,
     repo_id: int,
     idx: RepoIndex,
-) -> tuple[int, int]:
+) -> tuple[int, int, dict[int, set[int]]]:
     """Two-tier cross-file linking:
 
     Tier A (certain) — direct imports: each name in `imports.imported_names`
@@ -574,7 +576,173 @@ async def _link_cross_file(
             importer, names, defs,
         ))
 
-    return refs_updated, calls_updated
+    return refs_updated, calls_updated, imported_files_by
+
+
+async def _link_cross_file_inheritance(
+    conn: asyncpg.Connection,
+    repo_id: int,
+    idx: RepoIndex,
+    imported_files_by: dict[int, set[int]],
+) -> int:
+    """Resolve `inherits_edges.base_def_id` for rows where the base definition
+    lives in a different file. Mirrors the call/reference linker:
+
+      Tier A — direct hit on an inheritance-eligible def in an imported file: certain.
+      Tier B — multiple candidates: pick first, mark inferred.
+
+    The name lookup is kind-filtered to {contract, interface, class}. The
+    repo-wide `name_index` would otherwise also surface synthetic module defs
+    (file `Policy.sol` produces a module def named `Policy`, same as the
+    contract), and `is Policy` would ambiguously match both.
+
+    Returns the number of edges newly resolved.
+    """
+    pending = await conn.fetch(
+        """
+        SELECT ie.id, ie.child_def_id, ie.base_name, d.file_id AS child_file_id
+        FROM inherits_edges ie
+        JOIN definitions d ON d.id = ie.child_def_id
+        JOIN files f ON f.id = d.file_id
+        WHERE f.repo_id = $1 AND ie.base_def_id IS NULL
+        """,
+        repo_id,
+    )
+    if not pending:
+        return 0
+
+    target_rows = await conn.fetch(
+        """
+        SELECT d.id, d.file_id, d.name
+        FROM definitions d JOIN files f ON f.id = d.file_id
+        WHERE f.repo_id = $1 AND d.kind IN ('contract', 'interface', 'class')
+        """,
+        repo_id,
+    )
+    targets_by_name: dict[str, list[tuple[int, int]]] = {}
+    for r in target_rows:
+        targets_by_name.setdefault(r["name"], []).append((r["file_id"], r["id"]))
+
+    updates: list[tuple[int, int, str]] = []  # (edge_id, base_def_id, confidence)
+    for r in pending:
+        name = r["base_name"]
+        child_file = r["child_file_id"]
+        imported = imported_files_by.get(child_file, set())
+        cands = targets_by_name.get(name, [])
+        in_imported = [(fid, did) for fid, did in cands if fid in imported]
+        if len(in_imported) == 1:
+            updates.append((r["id"], in_imported[0][1], "certain"))
+        elif len(in_imported) > 1:
+            updates.append((r["id"], in_imported[0][1], "inferred"))
+
+    if not updates:
+        return 0
+    await conn.executemany(
+        "UPDATE inherits_edges SET base_def_id=$2, confidence=$3 WHERE id=$1",
+        updates,
+    )
+    return len(updates)
+
+
+async def _generate_overrides(
+    conn: asyncpg.Connection,
+    repo_id: int,
+) -> int:
+    """For each resolved (child_class, base_class) inheritance pair, find
+    method/function/modifier defs inside the child whose `name` matches one in
+    the base (or any transitive ancestor — closest match wins). Insert into
+    overrides_edges. Pre-clears repo's overrides so re-runs are idempotent.
+    """
+    # Drop any pre-existing rows scoped to this repo.
+    await conn.execute(
+        """
+        DELETE FROM overrides_edges
+        WHERE child_def_id IN (
+            SELECT d.id FROM definitions d
+            JOIN files f ON f.id = d.file_id
+            WHERE f.repo_id = $1
+        )
+        """,
+        repo_id,
+    )
+
+    inh_resolved = await conn.fetch(
+        """
+        SELECT ie.child_def_id AS child_class, ie.base_def_id AS base_class
+        FROM inherits_edges ie
+        JOIN definitions d ON d.id = ie.child_def_id
+        JOIN files f ON f.id = d.file_id
+        WHERE f.repo_id = $1 AND ie.base_def_id IS NOT NULL
+        ORDER BY ie.child_def_id, ie.ord
+        """,
+        repo_id,
+    )
+    if not inh_resolved:
+        return 0
+
+    # child_class → ordered list of direct bases (preserve declaration order).
+    direct_bases: dict[int, list[int]] = {}
+    for r in inh_resolved:
+        direct_bases.setdefault(r["child_class"], []).append(r["base_class"])
+
+    # Per-class methods: scope_id → [(name, kind, def_id), ...].
+    method_rows = await conn.fetch(
+        """
+        SELECT d.id, d.name, d.kind, d.scope_id
+        FROM definitions d
+        JOIN files f ON f.id = d.file_id
+        WHERE f.repo_id = $1
+          AND d.kind IN ('function', 'method', 'modifier', 'constructor')
+          AND d.scope_id IS NOT NULL
+        """,
+        repo_id,
+    )
+    methods_by_class: dict[int, list[asyncpg.Record]] = {}
+    for m in method_rows:
+        methods_by_class.setdefault(m["scope_id"], []).append(m)
+
+    def _ancestors_in_order(cls: int) -> list[int]:
+        """Linearised ancestor list (BFS over direct_bases). Closest first."""
+        seen: set[int] = set()
+        out: list[int] = []
+        frontier = list(direct_bases.get(cls, []))
+        while frontier:
+            nxt: list[int] = []
+            for a in frontier:
+                if a in seen:
+                    continue
+                seen.add(a)
+                out.append(a)
+                nxt.extend(direct_bases.get(a, []))
+            frontier = nxt
+        return out
+
+    pairs: list[tuple[int, int]] = []
+    for child_class in direct_bases:
+        ancestors = _ancestors_in_order(child_class)
+        if not ancestors:
+            continue
+        child_methods = methods_by_class.get(child_class, [])
+        for cm in child_methods:
+            # Walk ancestors closest-first; first matching name+kind wins.
+            for anc in ancestors:
+                anc_methods = methods_by_class.get(anc, [])
+                match = next(
+                    (am for am in anc_methods if am["name"] == cm["name"] and am["kind"] == cm["kind"]),
+                    None,
+                )
+                if match is not None:
+                    pairs.append((cm["id"], match["id"]))
+                    break
+
+    if not pairs:
+        return 0
+    await conn.executemany(
+        "INSERT INTO overrides_edges (child_def_id, base_def_id) VALUES ($1, $2) "
+        "ON CONFLICT (child_def_id, base_def_id) DO NOTHING",
+        pairs,
+    )
+    return len(pairs)
 
 
 def _affected_rows(execute_status: str) -> int:
@@ -651,9 +819,17 @@ async def resolve_repo_imports(pool: asyncpg.Pool, repo_id: int) -> ResolutionSt
                 stats.unresolved_paths.append(f"{entry.source_rel_path}: {entry.import_path}")
 
         await _insert_imports(conn, repo_id, resolved)
-        refs_updated, calls_updated = await _link_cross_file(conn, repo_id, idx)
+        refs_updated, calls_updated, imported_files_by = await _link_cross_file(conn, repo_id, idx)
         stats.cross_file_refs_resolved = refs_updated
         stats.cross_file_calls_resolved = calls_updated
+
+        # Inheritance: cross-file linking + override generation. Both are
+        # repo-scoped (semantic_resolver wrote the rows with intra-file
+        # base_def_id where possible; we fill in the rest).
+        stats.cross_file_inherits_resolved = await _link_cross_file_inheritance(
+            conn, repo_id, idx, imported_files_by,
+        )
+        stats.overrides_inserted = await _generate_overrides(conn, repo_id)
 
     return stats
 

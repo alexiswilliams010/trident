@@ -155,67 +155,162 @@ async def hybrid_query(
     top_k: int = 10,
     candidate_pool: int = 20,
     graph_weight: float = 0.3,
+    override_weight: float = 1.0,
 ) -> list[RetrievedChunk]:
-    """Pull `candidate_pool` semantic candidates, expand each anchor by 1 hop
-    via call_edges, blend graph proximity with semantic score, return top-k.
+    """Pull `candidate_pool` semantic candidates, expand each anchor via:
+
+      - call_edges, 1 hop outbound (caller → callees);
+      - inherits_edges, bidirectional (children of a high-ranking base, bases
+        of a high-ranking child) — `graph_weight`;
+      - overrides_edges, bidirectional (overrides of a base method, base of an
+        override) — `override_weight`, higher than `graph_weight` because an
+        override IS the implementation of the base, not just structurally
+        related.
+
+    Bonuses are blended additively, then results are re-ranked. Bidirectional
+    walking on inheritance is what surfaces `SingleExecutorPolicy.onExecute`
+    when the user's query happens to match `Policy.onExecute` first, and vice
+    versa.
     """
     candidates = await semantic_query(pool, repo_id, query, embed_fn, top_k=candidate_pool)
     if not candidates:
         return []
 
-    # Score map: chunk_id → score (start with semantic).
     by_id: dict[int, RetrievedChunk] = {c.chunk_id: c for c in candidates}
     scores: dict[int, float] = {c.chunk_id: c.score for c in candidates}
 
-    # Expand 1 hop: for each candidate's anchor, boost (or add) callee chunks.
+    # Take the MAX semantic score per anchor (a function chunk and its
+    # cross-module chunk share an anchor_def_id; we must not let the lower one
+    # win).
+    anchor_scores: dict[int, float] = {}
+    for c in candidates:
+        if c.anchor_def_id is None:
+            continue
+        if c.score > anchor_scores.get(c.anchor_def_id, float("-inf")):
+            anchor_scores[c.anchor_def_id] = c.score
+
+    if not anchor_scores:
+        ranked = sorted(by_id.values(), key=lambda c: scores[c.chunk_id], reverse=True)
+        for c in ranked:
+            c.score = scores[c.chunk_id]
+        return ranked[:top_k]
+
+    anchor_ids = list(anchor_scores.keys())
+    conf_weight = {"certain": 1.0, "inferred": 0.7, "uncertain": 0.4}
+
+    # related_def_id → max bonus across all incoming edges from the candidate pool.
+    related_bonus: dict[int, float] = {}
+
+    def _add_bonus(target_def_id: int, source_anchor: int, weight: float) -> None:
+        bonus = anchor_scores.get(source_anchor, 0.0) * weight * graph_weight
+        if bonus > related_bonus.get(target_def_id, 0.0):
+            related_bonus[target_def_id] = bonus
+
     async with pool.acquire() as conn:
-        anchor_ids = [c.anchor_def_id for c in candidates if c.anchor_def_id is not None]
-        if anchor_ids:
-            neighbour_rows = await conn.fetch(
-                """
-                SELECT ce.caller_def_id, ce.callee_def_id, ce.confidence
-                FROM call_edges ce
-                WHERE ce.caller_def_id = ANY($1::bigint[]) AND ce.callee_def_id IS NOT NULL
-                """,
-                anchor_ids,
+        # ── 1. call_edges: caller → callees (1 hop outbound) ──
+        call_rows = await conn.fetch(
+            """
+            SELECT caller_def_id, callee_def_id, confidence
+            FROM call_edges
+            WHERE caller_def_id = ANY($1::bigint[]) AND callee_def_id IS NOT NULL
+            """,
+            anchor_ids,
+        )
+        for r in call_rows:
+            _add_bonus(r["callee_def_id"], r["caller_def_id"],
+                       conf_weight.get(r["confidence"], 0.5))
+
+        # Promote call callees into the anchor set for the inheritance/override
+        # passes below. Without this, a query that hits the public dispatcher
+        # (e.g. `Policy.onExecute`) never reaches the virtual hook's overrides
+        # (`Policy._onExecute → SingleExecutorPolicy._onExecute`), since the
+        # override chain hangs off the *callee*, not the seed.
+        #
+        # Use the *effective* caller score (raw seed + any inbound call bonus
+        # already accumulated in this pass) so that a callee transitively
+        # dispatching to overrides receives a magnitude comparable to its
+        # caller's effective rank. Without the effective score, a chain like
+        # `top_candidate → onExecute → _onExecute → override_impl` collapses to
+        # noise by the time it reaches the override.
+        effective_anchor_scores = dict(anchor_scores)
+        for cid, bonus in related_bonus.items():
+            # If an anchor was also a call target from another anchor, its
+            # effective score is the max(raw_semantic, raw_semantic + bonus).
+            if cid in effective_anchor_scores:
+                effective_anchor_scores[cid] = effective_anchor_scores[cid] + bonus
+        callee_seed_score: dict[int, float] = {}
+        for r in call_rows:
+            seed = effective_anchor_scores.get(r["caller_def_id"], 0.0)
+            if seed > callee_seed_score.get(r["callee_def_id"], 0.0):
+                callee_seed_score[r["callee_def_id"]] = seed
+        expanded_scores = dict(effective_anchor_scores)
+        for cid, seed in callee_seed_score.items():
+            if seed > expanded_scores.get(cid, float("-inf")):
+                expanded_scores[cid] = seed
+        expanded_ids = list(expanded_scores.keys())
+
+        # ── 2. inherits_edges: bidirectional ──
+        # Downward (base in pool → its children): "show me the overrides of
+        # this base." Upward (child in pool → its bases): "show me what this
+        # inherits from."
+        inh_rows = await conn.fetch(
+            """
+            SELECT child_def_id, base_def_id, confidence
+            FROM inherits_edges
+            WHERE base_def_id IS NOT NULL
+              AND (base_def_id = ANY($1::bigint[]) OR child_def_id = ANY($1::bigint[]))
+            """,
+            expanded_ids,
+        )
+        for r in inh_rows:
+            w = conf_weight.get(r["confidence"], 0.5)
+            if r["base_def_id"] in expanded_scores:
+                src_score = expanded_scores[r["base_def_id"]]
+                bonus = src_score * w * graph_weight
+                if bonus > related_bonus.get(r["child_def_id"], 0.0):
+                    related_bonus[r["child_def_id"]] = bonus
+            if r["child_def_id"] in expanded_scores:
+                src_score = expanded_scores[r["child_def_id"]]
+                bonus = src_score * w * graph_weight
+                if bonus > related_bonus.get(r["base_def_id"], 0.0):
+                    related_bonus[r["base_def_id"]] = bonus
+
+        # ── 3. overrides_edges: bidirectional, weighted higher than calls/inherits ──
+        ovr_rows = await conn.fetch(
+            """
+            SELECT child_def_id, base_def_id
+            FROM overrides_edges
+            WHERE child_def_id = ANY($1::bigint[]) OR base_def_id = ANY($1::bigint[])
+            """,
+            expanded_ids,
+        )
+        for r in ovr_rows:
+            if r["base_def_id"] in expanded_scores:
+                src_score = expanded_scores[r["base_def_id"]]
+                bonus = src_score * override_weight
+                if bonus > related_bonus.get(r["child_def_id"], 0.0):
+                    related_bonus[r["child_def_id"]] = bonus
+            if r["child_def_id"] in expanded_scores:
+                src_score = expanded_scores[r["child_def_id"]]
+                bonus = src_score * override_weight
+                if bonus > related_bonus.get(r["base_def_id"], 0.0):
+                    related_bonus[r["base_def_id"]] = bonus
+
+        if related_bonus:
+            related_ids = sorted(related_bonus.keys())
+            related_chunks = await _fetch_chunks_for_anchors(
+                conn, related_ids, scores={cid: 1.0 for cid in related_ids},
+                granularity="function",
             )
-            if neighbour_rows:
-                # Take the MAX semantic score per anchor; a function and its
-                # cross-module chunk share the same anchor_def_id and we must
-                # not let the lower-scoring one overwrite the higher.
-                caller_scores: dict[int, float] = {}
-                for c in candidates:
-                    if c.anchor_def_id is None:
-                        continue
-                    if c.score > caller_scores.get(c.anchor_def_id, float("-inf")):
-                        caller_scores[c.anchor_def_id] = c.score
-                conf_weight = {"certain": 1.0, "inferred": 0.7, "uncertain": 0.4}
-
-                # callee_def_id → max bonus across incoming edges (any caller in the candidate pool).
-                callee_bonus: dict[int, float] = {}
-                for r in neighbour_rows:
-                    cid = r["callee_def_id"]
-                    bonus = caller_scores.get(r["caller_def_id"], 0.0) * \
-                            conf_weight.get(r["confidence"], 0.5) * graph_weight
-                    if bonus > callee_bonus.get(cid, 0.0):
-                        callee_bonus[cid] = bonus
-
-                callee_ids = sorted(callee_bonus.keys())
-                neighbour_chunks = await _fetch_chunks_for_anchors(
-                    conn, callee_ids, scores={cid: 1.0 for cid in callee_ids},
-                    granularity="function",
-                )
-                for nc in neighbour_chunks:
-                    bonus = callee_bonus.get(nc.anchor_def_id or -1, 0.0)
-                    if bonus == 0.0:
-                        continue
-                    if nc.chunk_id in by_id:
-                        # Boost an existing candidate.
-                        scores[nc.chunk_id] = scores[nc.chunk_id] + bonus
-                    else:
-                        # Pull in a new neighbour chunk.
-                        by_id[nc.chunk_id] = nc
-                        scores[nc.chunk_id] = bonus
+            for nc in related_chunks:
+                bonus = related_bonus.get(nc.anchor_def_id or -1, 0.0)
+                if bonus == 0.0:
+                    continue
+                if nc.chunk_id in by_id:
+                    scores[nc.chunk_id] = scores[nc.chunk_id] + bonus
+                else:
+                    by_id[nc.chunk_id] = nc
+                    scores[nc.chunk_id] = bonus
 
     ranked = sorted(by_id.values(), key=lambda c: scores[c.chunk_id], reverse=True)
     for c in ranked:

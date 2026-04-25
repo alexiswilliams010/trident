@@ -52,6 +52,18 @@ class ImportsConfig:
 
 
 @dataclass(frozen=True)
+class InheritanceConfig:
+    parent_node_types: tuple[str, ...]
+    # Solidity-style: walk children of parent_node_types matching `child_node_type`,
+    # then descend into the named field to find the base identifier.
+    child_node_type: str | None = None
+    child_name_field: str | None = None
+    # Python-style: the parent has a `bases_field` pointing at a list-like node
+    # whose identifier children are the bases.
+    bases_field: str | None = None
+
+
+@dataclass(frozen=True)
 class LanguageConfig:
     language: str
     module_node_type: str
@@ -61,6 +73,7 @@ class LanguageConfig:
     calls: tuple[CallRule, ...]
     data_access: DataAccessConfig | None = None
     imports: ImportsConfig | None = None
+    inheritance: InheritanceConfig | None = None
     raw: dict = field(default_factory=dict)  # full parsed YAML
 
     def definition_rule_for(self, node_type: str) -> DefinitionRule | None:
@@ -129,6 +142,16 @@ def load_language_config(language: str, configs_dir: Path | None = None) -> Lang
             external_prefixes=tuple(imp_raw.get("external_prefixes", [])),
         )
 
+    inh_raw = raw.get("inheritance")
+    inh: InheritanceConfig | None = None
+    if inh_raw:
+        inh = InheritanceConfig(
+            parent_node_types=tuple(inh_raw["parent_node_types"]),
+            child_node_type=inh_raw.get("child_node_type"),
+            child_name_field=inh_raw.get("child_name_field"),
+            bases_field=inh_raw.get("bases_field"),
+        )
+
     return LanguageConfig(
         language=raw["language"],
         module_node_type=raw["module_node_type"],
@@ -138,5 +161,6 @@ def load_language_config(language: str, configs_dir: Path | None = None) -> Lang
         calls=calls,
         data_access=da,
         imports=imp,
+        inheritance=inh,
         raw=raw,
     )

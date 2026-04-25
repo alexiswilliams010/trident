@@ -74,7 +74,9 @@ async def _run(
                 f"unresolved={cls.get('unresolved', 0)} "
                 f"({100 * cls.get('intra_repo', 0) // total}% intra) "
                 f"| linked {stats.cross_file_refs_resolved} refs, "
-                f"{stats.cross_file_calls_resolved} call_edges"
+                f"{stats.cross_file_calls_resolved} call_edges, "
+                f"{stats.cross_file_inherits_resolved} inherits, "
+                f"{stats.overrides_inserted} overrides"
             )
 
         if do_chunks:

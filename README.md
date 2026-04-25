@@ -308,7 +308,7 @@ index:
 make query-semantic QUERY="how does the call graph link cross-module" REPO_NAME=myrepo
 
 # Hybrid: semantic seeds + 1-hop call-graph expansion (best general default).
-make query-hybrid   QUERY="reentrancy guard usage" REPO_NAME=solidity_fixture
+make query-hybrid QUERY="reentrancy guard usage" REPO_NAME=solidity_fixture
 
 # Per-repo DB variants:
 make query-isolated-hybrid QUERY="..." REPO_NAME=myrepo

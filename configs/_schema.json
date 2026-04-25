@@ -103,6 +103,31 @@
           "items": { "type": "string" }
         }
       }
+    },
+    "inheritance": {
+      "type": "object",
+      "description": "How contract/class inheritance is shaped in the AST. Two variants supported: Solidity-style (multiple specifier children) and Python-style (single field pointing at a list-like node).",
+      "additionalProperties": false,
+      "required": ["parent_node_types"],
+      "properties": {
+        "parent_node_types": {
+          "type": "array",
+          "description": "AST node types that can declare bases (e.g. 'contract_declaration', 'class_definition').",
+          "items": { "type": "string" }
+        },
+        "child_node_type": {
+          "type": "string",
+          "description": "Solidity-style: parent has multiple direct children of this type, each holding one base."
+        },
+        "child_name_field": {
+          "type": "string",
+          "description": "Solidity-style: field on `child_node_type` whose subtree resolves to the base identifier."
+        },
+        "bases_field": {
+          "type": "string",
+          "description": "Python-style: field on `parent_node_type` pointing at a list-like node whose identifier children are the bases."
+        }
+      }
     }
   }
 }

@@ -100,3 +100,10 @@ imports:
   node_types: [import_directive]
   # Source paths starting with these prefixes are classified external in Phase 3.
   external_prefixes: ["@"]
+
+inheritance:
+  # `contract Foo is Bar, Baz { ... }` and `interface IFoo is IBar { ... }`.
+  # Library declarations cannot inherit, so they're omitted.
+  parent_node_types: [contract_declaration, interface_declaration]
+  child_node_type: inheritance_specifier
+  child_name_field: ancestor    # → user_defined_type → identifier

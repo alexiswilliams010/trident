@@ -1,6 +1,6 @@
 .PHONY: help install lint test test-extractor \
         db-start db-stop db-create db-drop db-migrate db-setup db-teardown db-reset db-psql \
-        index-python index-solidity diagnose \
+        index-python index-solidity diagnose diagnose-isolated \
         embed-python embed-solidity query-semantic query-hybrid \
         index embed \
         index-isolated embed-isolated query-isolated-semantic query-isolated-hybrid \
@@ -170,6 +170,10 @@ diagnose-python: ## Print resolution stats for the Python fixture.
 diagnose-solidity: ## Print resolution stats for the Solidity fixture.
 	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.diagnose --repo-name $(SOLIDITY_REPO_NAME) --unresolved
 
+diagnose: ## Print resolution stats for any repo in $(DB). REPO_NAME=name [DB=...]
+	@if [ -z "$(REPO_NAME)" ]; then echo 'usage: make diagnose REPO_NAME=name [DB=...]'; exit 2; fi
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.diagnose --repo-name $(REPO_NAME) --unresolved
+
 # ------------------------------------------------------------------------------
 # Mode B — one DB per repo (CI-friendly, per-repo isolation).
 # Each *-isolated target derives DB=tsgrep_$(REPO_NAME), creates and migrates
@@ -199,3 +203,7 @@ query-isolated-semantic: ## Semantic query against per-repo DB. QUERY="..." REPO
 
 query-isolated-hybrid: ## Hybrid query against per-repo DB. QUERY="..." REPO_NAME=name
 	@$(MAKE) --no-print-directory query-hybrid QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME)
+
+diagnose-isolated: ## Print resolution stats from per-repo DB tsgrep_$(REPO_NAME). REPO_NAME=name
+	@if [ -z "$(REPO_NAME)" ]; then echo 'usage: make diagnose-isolated REPO_NAME=name'; exit 2; fi
+	@$(MAKE) --no-print-directory diagnose REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME)

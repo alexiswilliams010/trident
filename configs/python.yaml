@@ -60,3 +60,10 @@ data_access:
 
 imports:
   node_types: [import_statement, import_from_statement]
+
+inheritance:
+  # `class Foo(Bar, Baz): ...` — `superclasses` is the named field on
+  # `class_definition`; its child is an `argument_list` whose `identifier`
+  # children are the base names.
+  parent_node_types: [class_definition]
+  bases_field: superclasses

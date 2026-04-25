@@ -147,6 +147,41 @@ CREATE TABLE IF NOT EXISTS data_access (
 CREATE INDEX IF NOT EXISTS idx_data_access_accessor ON data_access(accessor_def_id);
 CREATE INDEX IF NOT EXISTS idx_data_access_target   ON data_access(target_def_id);
 
+-- Inheritance graph between contract/interface/class definitions.
+-- Solidity:  contract Foo is Bar { ... }      → child=Foo, base_name='Bar'
+-- Python:    class Foo(Bar): ...              → child=Foo, base_name='Bar'
+-- `ord` preserves declaration order (matters for C3 linearization / Solidity MRO).
+-- `base_def_id` is filled in by the resolver: intra-file in semantic_resolver,
+-- cross-file via the heuristic resolver's import-aware linking pass.
+CREATE TABLE IF NOT EXISTS inherits_edges (
+    id              BIGSERIAL PRIMARY KEY,
+    child_def_id    BIGINT NOT NULL REFERENCES definitions(id) ON DELETE CASCADE,
+    base_name       TEXT NOT NULL,
+    base_def_id     BIGINT REFERENCES definitions(id) ON DELETE SET NULL,
+    confidence      TEXT NOT NULL DEFAULT 'certain'
+                    CHECK (confidence IN ('certain', 'inferred', 'uncertain')),
+    ord             INT NOT NULL,
+    UNIQUE (child_def_id, ord)
+);
+
+CREATE INDEX IF NOT EXISTS idx_inherits_child ON inherits_edges(child_def_id);
+CREATE INDEX IF NOT EXISTS idx_inherits_base  ON inherits_edges(base_def_id);
+CREATE INDEX IF NOT EXISTS idx_inherits_name  ON inherits_edges(base_name);
+
+-- Method-override edges generated after inherits_edges is resolved.
+-- Pair (child_def_id, base_def_id) means: child function/method/modifier
+-- shadows / overrides the base one with the same name. Generated for the
+-- *nearest* matching ancestor; transitive shadowing collapses to the closest.
+CREATE TABLE IF NOT EXISTS overrides_edges (
+    id              BIGSERIAL PRIMARY KEY,
+    child_def_id    BIGINT NOT NULL REFERENCES definitions(id) ON DELETE CASCADE,
+    base_def_id     BIGINT NOT NULL REFERENCES definitions(id) ON DELETE CASCADE,
+    UNIQUE (child_def_id, base_def_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_overrides_child ON overrides_edges(child_def_id);
+CREATE INDEX IF NOT EXISTS idx_overrides_base  ON overrides_edges(base_def_id);
+
 -- ═══════════════════════════════════════════════════════════
 -- TIER 3: Chunk & embedding tables
 -- ═══════════════════════════════════════════════════════════
