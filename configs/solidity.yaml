@@ -95,3 +95,8 @@ data_access:
   write_when_parent_field:
     - assignment_expression.left
     - augmented_assignment_expression.left
+
+imports:
+  node_types: [import_directive]
+  # Source paths starting with these prefixes are classified external in Phase 3.
+  external_prefixes: ["@"]

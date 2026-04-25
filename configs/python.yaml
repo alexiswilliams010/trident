@@ -57,3 +57,6 @@ data_access:
   write_when_parent_field:
     - assignment.left
     - augmented_assignment.left
+
+imports:
+  node_types: [import_statement, import_from_statement]

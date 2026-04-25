@@ -108,9 +108,14 @@ CREATE TABLE IF NOT EXISTS call_edges (
     callsite_node_id BIGINT REFERENCES nodes(id) ON DELETE CASCADE,
     caller_def_id    BIGINT REFERENCES definitions(id) ON DELETE CASCADE,
     callee_def_id    BIGINT REFERENCES definitions(id) ON DELETE SET NULL,
+    -- Callee name as written at the call site (last identifier of the function expression).
+    -- Stored to enable Phase 3 cross-file re-linking without re-parsing the CST.
+    callee_name      TEXT,
     confidence       TEXT NOT NULL DEFAULT 'certain'
                      CHECK (confidence IN ('certain', 'inferred', 'uncertain'))
 );
+
+CREATE INDEX IF NOT EXISTS idx_call_edges_callee_name ON call_edges(callee_name);
 
 CREATE INDEX IF NOT EXISTS idx_call_edges_caller     ON call_edges(caller_def_id);
 CREATE INDEX IF NOT EXISTS idx_call_edges_callee     ON call_edges(callee_def_id);

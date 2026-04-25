@@ -46,6 +46,12 @@ class DataAccessConfig:
 
 
 @dataclass(frozen=True)
+class ImportsConfig:
+    node_types: tuple[str, ...] = ()
+    external_prefixes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class LanguageConfig:
     language: str
     module_node_type: str
@@ -54,7 +60,8 @@ class LanguageConfig:
     references: tuple[ReferenceRule, ...]
     calls: tuple[CallRule, ...]
     data_access: DataAccessConfig | None = None
-    raw: dict = field(default_factory=dict)  # full parsed YAML (Phase 3 reads `imports`)
+    imports: ImportsConfig | None = None
+    raw: dict = field(default_factory=dict)  # full parsed YAML
 
     def definition_rule_for(self, node_type: str) -> DefinitionRule | None:
         for r in self.definitions:
@@ -114,6 +121,14 @@ def load_language_config(language: str, configs_dir: Path | None = None) -> Lang
             write_when_parent_field=tuple(da_raw.get("write_when_parent_field", [])),
         )
 
+    imp_raw = raw.get("imports")
+    imp: ImportsConfig | None = None
+    if imp_raw:
+        imp = ImportsConfig(
+            node_types=tuple(imp_raw.get("node_types", [])),
+            external_prefixes=tuple(imp_raw.get("external_prefixes", [])),
+        )
+
     return LanguageConfig(
         language=raw["language"],
         module_node_type=raw["module_node_type"],
@@ -122,5 +137,6 @@ def load_language_config(language: str, configs_dir: Path | None = None) -> Lang
         references=refs,
         calls=calls,
         data_access=da,
+        imports=imp,
         raw=raw,
     )

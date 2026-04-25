@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from core.extractor import index_repo
+from core.heuristic_resolver import resolve_repo_imports
 from core.semantic_resolver import resolve_repo
 from db.connection import apply_migrations, pool_ctx
 
@@ -23,6 +24,7 @@ async def _run(
     dsn: str | None,
     init_schema: bool,
     do_resolve: bool,
+    do_imports: bool,
 ) -> int:
     async with pool_ctx(dsn) as pool:
         if init_schema:
@@ -38,8 +40,6 @@ async def _run(
         )
 
         if do_resolve:
-            # Resolve only the files we just (re)indexed; unchanged files keep
-            # their existing semantic rows.
             file_ids = [r.file_id for r in extract_result.indexed]
             if file_ids:
                 resolve_results = await resolve_repo(pool, repo_id, only_file_ids=file_ids)
@@ -53,6 +53,20 @@ async def _run(
                     f"{tot_calls} call_edges, {tot_da} data_access"
                 )
 
+        if do_imports:
+            stats = await resolve_repo_imports(pool, repo_id)
+            cls = stats.by_class
+            total = sum(cls.values()) or 1
+            print(
+                f"[Tier 2 imports] {sum(cls.values())} imports — "
+                f"intra_repo={cls.get('intra_repo', 0)} "
+                f"external={cls.get('external', 0)} "
+                f"unresolved={cls.get('unresolved', 0)} "
+                f"({100 * cls.get('intra_repo', 0) // total}% intra) "
+                f"| linked {stats.cross_file_refs_resolved} refs, "
+                f"{stats.cross_file_calls_resolved} call_edges"
+            )
+
     return 0
 
 
@@ -63,13 +77,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dsn", type=str, default=None, help="Postgres DSN (defaults to DATABASE_URL env)")
     parser.add_argument("--init-schema", action="store_true", help="Apply migrations before indexing (idempotent)")
     parser.add_argument("--no-resolve", action="store_true", help="Skip Tier 2 semantic resolution")
+    parser.add_argument("--no-imports", action="store_true", help="Skip Phase 3 import resolution / cross-file linking")
     args = parser.parse_args(argv)
 
     if not args.repo_path.is_dir():
         print(f"error: {args.repo_path} is not a directory", file=sys.stderr)
         return 2
 
-    return asyncio.run(_run(args.repo_path, args.repo_id, args.dsn, args.init_schema, not args.no_resolve))
+    return asyncio.run(
+        _run(
+            args.repo_path,
+            args.repo_id,
+            args.dsn,
+            args.init_schema,
+            not args.no_resolve,
+            not args.no_imports,
+        )
+    )
 
 
 if __name__ == "__main__":

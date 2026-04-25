@@ -34,6 +34,9 @@ test-extractor: ## Run only Phase 1 extractor tests.
 test-resolver: ## Run only Phase 2 semantic resolver tests.
 	@$(PYTHON) -m pytest -v tests/test_semantic_resolver.py
 
+test-imports: ## Run only Phase 3 heuristic resolver tests.
+	@$(PYTHON) -m pytest -v tests/test_heuristic_resolver.py
+
 # ------------------------------------------------------------------------------
 # Local PostgreSQL (Homebrew). Override PG_SERVICE / PG_DB as needed.
 # ------------------------------------------------------------------------------
@@ -83,5 +86,8 @@ index-python: ## Index the Python test fixture (repo-id 1).
 index-solidity: ## Index the Solidity test fixture (repo-id 2).
 	@$(PYTHON) -m cli.index $(SOLIDITY_FIXTURE) --repo-id 2
 
-diagnose: ## Print resolution stats (Phase 3+).
-	@$(PYTHON) -m cli.diagnose
+diagnose-python: ## Print resolution stats for the Python fixture (repo-id 1).
+	@$(PYTHON) -m cli.diagnose --repo-id 1 --unresolved
+
+diagnose-solidity: ## Print resolution stats for the Solidity fixture (repo-id 2).
+	@$(PYTHON) -m cli.diagnose --repo-id 2 --unresolved

@@ -89,8 +89,20 @@
     },
     "imports": {
       "type": "object",
-      "description": "Reserved for Phase 3. Tier 2 ignores this block.",
-      "additionalProperties": true
+      "description": "Phase 3: which AST nodes are imports. The actual extraction logic is per-language Python code in core/heuristic_resolver.py — this block lists the node types so the resolver knows what to look for.",
+      "additionalProperties": false,
+      "properties": {
+        "node_types": {
+          "type": "array",
+          "description": "Tree-sitter node types representing imports.",
+          "items": { "type": "string" }
+        },
+        "external_prefixes": {
+          "type": "array",
+          "description": "Path prefixes that classify an import as external (e.g. '@' for npm scoped packages).",
+          "items": { "type": "string" }
+        }
+      }
     }
   }
 }

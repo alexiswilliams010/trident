@@ -60,6 +60,7 @@ class _CallRecord:
     callsite_db_node_id: int
     caller_def_id: int | None
     callee_def_id: int | None
+    callee_name: str | None
     confidence: str
 
 
@@ -437,15 +438,16 @@ async def resolve_file(
         if fexpr is None:
             continue
 
+        callee_name: str | None = None
         if fexpr.type in ("identifier", "type_identifier"):
-            name = _text(fexpr)
-            target = _resolve_in_scope(name, ts)
+            callee_name = _text(fexpr)
+            target = _resolve_in_scope(callee_name, ts)
             confidence = "certain" if target is not None else "uncertain"
         elif fexpr.type in ("attribute", "member_expression"):
             prop_field = "attribute" if fexpr.type == "attribute" else "property"
             prop = fexpr.child_by_field_name(prop_field)
-            name = _text(prop) if prop is not None else None
-            cands = file_name_index.get(name, []) if name else []
+            callee_name = _text(prop) if prop is not None else None
+            cands = file_name_index.get(callee_name, []) if callee_name else []
             target = cands[0] if len(cands) == 1 else None
             confidence = "inferred" if target is not None else "uncertain"
         else:
@@ -458,6 +460,7 @@ async def resolve_file(
                 callsite_db_node_id=db_id_for[ts.id],
                 caller_def_id=caller_def_id,
                 callee_def_id=target,
+                callee_name=callee_name,
                 confidence=confidence,
             )
         )
@@ -465,11 +468,11 @@ async def resolve_file(
     if call_records:
         await conn.executemany(
             """
-            INSERT INTO call_edges (callsite_node_id, caller_def_id, callee_def_id, confidence)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO call_edges (callsite_node_id, caller_def_id, callee_def_id, callee_name, confidence)
+            VALUES ($1, $2, $3, $4, $5)
             """,
             [
-                (r.callsite_db_node_id, r.caller_def_id, r.callee_def_id, r.confidence)
+                (r.callsite_db_node_id, r.caller_def_id, r.callee_def_id, r.callee_name, r.confidence)
                 for r in call_records
             ],
         )

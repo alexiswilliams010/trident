@@ -45,6 +45,7 @@ the `DATABASE_URL` env var if needed.
 make test            # full pytest suite
 make test-extractor  # Phase 1 extractor tests only
 make test-resolver   # Phase 2 semantic resolver tests only
+make test-imports    # Phase 3 heuristic resolver tests only
 ```
 
 Tests that need Postgres connect via the same DSN; they auto-skip with a
@@ -57,6 +58,9 @@ clear message if the service is not reachable.
 ```sh
 make index-python    # indexes tests/fixtures/python_fixture under repo_id 1
 make index-solidity  # indexes tests/fixtures/solidity_foundry_fixture under repo_id 2
+
+make diagnose-python    # resolution stats for repo_id 1 (incl. unresolved imports)
+make diagnose-solidity  # resolution stats for repo_id 2
 ```
 
 Inspect the result:
@@ -154,11 +158,12 @@ tsgrep/
 │   └── solidity.yaml        # Phase 2 rules for Solidity
 │
 ├── core/
-│   ├── extractor.py         # Phase 1: Tree-sitter -> nodes table
-│   ├── file_walker.py       # Phase 1: dep-aware repo walker
-│   ├── grammar_meta.py      # Language registry (Python, Solidity)
-│   ├── config_loader.py     # Phase 2: YAML loader + validation
-│   └── semantic_resolver.py # Phase 2: defs / refs / calls / data_access
+│   ├── extractor.py          # Phase 1: Tree-sitter -> nodes table
+│   ├── file_walker.py        # Phase 1: dep-aware repo walker
+│   ├── grammar_meta.py       # Language registry (Python, Solidity)
+│   ├── config_loader.py      # Phase 2: YAML loader + validation
+│   ├── semantic_resolver.py  # Phase 2: defs / refs / calls / data_access
+│   └── heuristic_resolver.py # Phase 3: imports + cross-file linking
 │
 ├── db/
 │   ├── connection.py        # asyncpg pool + migration runner
@@ -166,7 +171,8 @@ tsgrep/
 │       └── 0001_init.up.sql # Tier 1 + 2 + 3 schema, pgvector, HNSW
 │
 ├── cli/
-│   └── index.py             # python -m cli.index <repo> --repo-id N
+│   ├── index.py             # python -m cli.index <repo> --repo-id N
+│   └── diagnose.py          # python -m cli.diagnose --repo-id N
 │
 └── tests/
     ├── conftest.py
@@ -185,8 +191,8 @@ tsgrep/
 |---|---|---|
 | 1 | Tier 1 extractor + DB schema | done |
 | 2 | YAML-driven semantic resolver (definitions, references, scopes, calls, data access) | done |
-| 3 | Heuristic cross-file import resolution | next |
-| 4 | Graph-informed chunk assembly + embeddings + retrieval | pending |
+| 3 | Heuristic cross-file import resolution + cross-file edge linking | done |
+| 4 | Graph-informed chunk assembly + embeddings + retrieval | next |
 
 Phase 5+ (eval harness, Deno resolver sandbox, additional languages) are
 deferred until the MVP shows the approach works.
