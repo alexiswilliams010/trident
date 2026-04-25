@@ -3,11 +3,14 @@
 Three granularities per definition:
 
     function     — anchor function source + state vars it touches
+                   + override base signature (always, if exists)
+                   + inheritance chain (always, if any bases)
+                   + signatures of inherited members from ancestors
                    + signatures of `certain` callees (1 hop)
                    + bodies of certain callees if budget allows
                    + signatures of `inferred` callees if budget allows
                    + synthetic comments for external calls
-                   TOKEN_BUDGET = 512
+                   SOFT BUDGET = 512, HARD CAP = 768
 
     module       — every definition in a file + imports preamble
                    + external dep summary
@@ -19,8 +22,15 @@ Three granularities per definition:
                    TOKEN_BUDGET = 2048
 
 Each chunk is preceded by a JSON metadata preamble (anchor, kind, language,
-file, dependencies, callers, external_deps, granularity). The preamble is
-inside the same TEXT we embed so the vector encodes structural info.
+file, dependencies, callers, external_deps, overrides, inheritance_chain,
+granularity). The preamble is inside the same TEXT we embed so the vector
+encodes structural info.
+
+Function chunks use a soft budget (512) plus a hard cap (768) so inheritance
+context — the override base signature, ancestor chain, and one or two
+inherited member signatures — survives even when the function body is large.
+The body, override block, and chain are mandatory; inherited members and
+callees are greedy under the hard cap.
 
 Token counting uses tiktoken's `cl100k_base` — overestimates ~10 % on code
 versus newer encoders (o200k_base), which is safe for budget fitting.
@@ -48,7 +58,14 @@ TOKEN_BUDGETS = {
     GRANULARITY_CROSS_MODULE: 2048,
 }
 
+# Function chunks may exceed the soft budget by up to 50% so inheritance
+# context survives. Anything past this is treated as pathological — the
+# enrichment greedy fit stops at the hard cap.
+HARD_CAP_MULTIPLIER = 1.5
+
 FUNCTION_KINDS = {"function", "method", "constructor", "modifier"}
+MEMBER_KINDS = FUNCTION_KINDS | {"modifier"}  # eligible for inherited-member listings
+CONTAINER_KINDS = {"contract", "interface", "library", "class"}
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -201,6 +218,37 @@ async def _load_imports(conn: asyncpg.Connection, repo_id: int) -> dict[int, lis
     return out
 
 
+async def _load_inherits_edges(conn: asyncpg.Connection, repo_id: int) -> list[asyncpg.Record]:
+    """All resolved inherits_edges for the repo, ordered by (child, ord) so
+    direct-base lists preserve declaration order."""
+    return await conn.fetch(
+        """
+        SELECT ie.child_def_id, ie.base_def_id, ie.ord
+        FROM inherits_edges ie
+        JOIN definitions d ON d.id = ie.child_def_id
+        JOIN files f ON f.id = d.file_id
+        WHERE f.repo_id = $1 AND ie.base_def_id IS NOT NULL
+        ORDER BY ie.child_def_id, ie.ord
+        """,
+        repo_id,
+    )
+
+
+async def _load_overrides_edges(conn: asyncpg.Connection, repo_id: int) -> list[asyncpg.Record]:
+    """All overrides_edges for the repo. Each child has at most one row
+    (the resolver picks the nearest ancestor's matching method)."""
+    return await conn.fetch(
+        """
+        SELECT oe.child_def_id, oe.base_def_id
+        FROM overrides_edges oe
+        JOIN definitions d ON d.id = oe.child_def_id
+        JOIN files f ON f.id = d.file_id
+        WHERE f.repo_id = $1
+        """,
+        repo_id,
+    )
+
+
 # ────────────────────────────────────────────────────────────────────
 # Index for in-memory traversal
 # ────────────────────────────────────────────────────────────────────
@@ -214,6 +262,12 @@ class _GraphIndex:
     data_access_by_accessor: dict[int, list[tuple[int, str]]]   # (target_def_id, op)
     defs_by_file: dict[int, list[int]]                          # file_id -> [def_id, ...]
     imports_by_file: dict[int, list[asyncpg.Record]]
+    # Inheritance: child class def_id → ordered list of direct base class def_ids.
+    bases_by_child: dict[int, list[int]]
+    # Method override: child method def_id → base method def_id (one or none).
+    override_base_by_child: dict[int, int]
+    # All members of a container, indexed by scope (contract/class def_id).
+    members_by_container: dict[int, list[int]]
 
 
 def _build_index(
@@ -221,6 +275,8 @@ def _build_index(
     edges: list[asyncpg.Record],
     da: list[asyncpg.Record],
     imports: dict[int, list[asyncpg.Record]],
+    inherits: list[asyncpg.Record],
+    overrides: list[asyncpg.Record],
 ) -> _GraphIndex:
     defs_by_id = {d.id: d for d in defs}
     callees: dict[int, list[tuple[int | None, str | None, str]]] = {}
@@ -237,6 +293,16 @@ def _build_index(
     by_file: dict[int, list[int]] = {}
     for d in defs:
         by_file.setdefault(d.file_id, []).append(d.id)
+    bases_by_child: dict[int, list[int]] = {}
+    for r in inherits:  # already ordered by (child, ord)
+        bases_by_child.setdefault(r["child_def_id"], []).append(r["base_def_id"])
+    override_base_by_child: dict[int, int] = {
+        r["child_def_id"]: r["base_def_id"] for r in overrides
+    }
+    members_by_container: dict[int, list[int]] = {}
+    for d in defs:
+        if d.scope_id is not None and d.kind in MEMBER_KINDS:
+            members_by_container.setdefault(d.scope_id, []).append(d.id)
     return _GraphIndex(
         defs_by_id=defs_by_id,
         callees_by_caller=callees,
@@ -244,7 +310,55 @@ def _build_index(
         data_access_by_accessor=da_by,
         defs_by_file=by_file,
         imports_by_file=imports,
+        bases_by_child=bases_by_child,
+        override_base_by_child=override_base_by_child,
+        members_by_container=members_by_container,
     )
+
+
+def _ancestor_chain(idx: _GraphIndex, container_id: int | None) -> list[int]:
+    """BFS over `bases_by_child`, closest first. Returns ancestors of
+    `container_id`, excluding the container itself."""
+    if container_id is None:
+        return []
+    seen: set[int] = set()
+    out: list[int] = []
+    frontier = list(idx.bases_by_child.get(container_id, []))
+    while frontier:
+        next_frontier: list[int] = []
+        for a in frontier:
+            if a in seen:
+                continue
+            seen.add(a)
+            out.append(a)
+            next_frontier.extend(idx.bases_by_child.get(a, []))
+        frontier = next_frontier
+    return out
+
+
+def _inherited_members_for(
+    idx: _GraphIndex,
+    container_id: int | None,
+    exclude_def_ids: set[int],
+) -> list[_DefRow]:
+    """Methods/modifiers defined on any ancestor of `container_id`, deduped by
+    name (closer ancestor wins, since BFS yields them in proximity order).
+    Excludes any def_id in `exclude_def_ids` (typically the override base
+    we're already showing as a dedicated block)."""
+    if container_id is None:
+        return []
+    out: list[_DefRow] = []
+    seen_names: set[str] = set()
+    for ancestor_id in _ancestor_chain(idx, container_id):
+        for member_id in idx.members_by_container.get(ancestor_id, []):
+            if member_id in exclude_def_ids:
+                continue
+            d = idx.defs_by_id.get(member_id)
+            if d is None or d.name in seen_names:
+                continue
+            seen_names.add(d.name)
+            out.append(d)
+    return out
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -308,8 +422,26 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
     if ext:
         parts.append("# external calls (unresolved)\n" + "\n".join(f"// external: {x}()" for x in ext))
 
-    # Add certain callee signatures (greedy under budget).
-    budget = TOKEN_BUDGETS[GRANULARITY_FUNCTION]
+    # ── Inheritance enrichment (always-include tiers) ──
+    # Override base: the specific method this one shadows.
+    override_base_id = idx.override_base_by_child.get(d.id)
+    override_base = idx.defs_by_id.get(override_base_id) if override_base_id else None
+    if override_base is not None:
+        parts.append(
+            f"# overrides: {override_base.qualified_name}\n{_format_signature(override_base)}"
+        )
+
+    # Inheritance chain of the enclosing container (e.g. contract → base → interface).
+    container_id = d.scope_id if d.scope_id and idx.defs_by_id.get(d.scope_id) and idx.defs_by_id[d.scope_id].kind in CONTAINER_KINDS else None
+    ancestor_ids = _ancestor_chain(idx, container_id)
+    if container_id is not None and ancestor_ids:
+        chain_names = [idx.defs_by_id[container_id].name] + [
+            idx.defs_by_id[a].name for a in ancestor_ids if a in idx.defs_by_id
+        ]
+        parts.append("# inheritance chain: " + " → ".join(chain_names))
+
+    soft_budget = TOKEN_BUDGETS[GRANULARITY_FUNCTION]
+    hard_cap = int(soft_budget * HARD_CAP_MULTIPLIER)
 
     metadata = {
         "anchor": d.qualified_name,
@@ -319,25 +451,46 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
         "dependencies": [s.split(": ", 1)[1] for s in da_lines],
         "callers": sorted({idx.defs_by_id[c].qualified_name for c in idx.callers_by_callee.get(d.id, []) if c in idx.defs_by_id}),
         "external_deps": ext,
+        "overrides": override_base.qualified_name if override_base is not None else None,
+        "inheritance_chain": [
+            idx.defs_by_id[a].qualified_name for a in ancestor_ids if a in idx.defs_by_id
+        ],
         "granularity": GRANULARITY_FUNCTION,
     }
 
     def _join(extras: list[str] = []) -> str:
         return _md_preamble(metadata) + "\n\n".join(parts + extras)
 
-    # Phase 1: signatures of certain callees.
     extras: list[str] = []
+
+    # Phase: inherited member signatures (greedy under hard_cap). Excluded:
+    # the override base (already shown as its own block above).
+    inherited = _inherited_members_for(
+        idx, container_id,
+        exclude_def_ids={override_base_id} if override_base_id else set(),
+    )
+    if inherited:
+        sigs: list[str] = []
+        for m in inherited:
+            trial = sigs + [_format_signature(m)]
+            block = "# inherited members\n" + "\n\n".join(trial)
+            if count_tokens(_join(extras + [block])) > hard_cap:
+                break
+            sigs = trial
+        if sigs:
+            extras.append("# inherited members\n" + "\n\n".join(sigs))
+
+    # Phase 1: signatures of certain callees.
     if certain:
         sig_block = "# callees [certain]\n" + "\n\n".join(_format_signature(c) for c in certain)
-        if count_tokens(_join([sig_block])) <= budget:
+        if count_tokens(_join(extras + [sig_block])) <= hard_cap:
             extras.append(sig_block)
         else:
-            # Try one-by-one until budget exhausted.
             sigs: list[str] = []
             for c in certain:
                 trial = sigs + [_format_signature(c)]
                 block = "# callees [certain]\n" + "\n\n".join(trial)
-                if count_tokens(_join([block])) > budget:
+                if count_tokens(_join(extras + [block])) > hard_cap:
                     break
                 sigs = trial
             if sigs:
@@ -349,7 +502,7 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
         for c in certain:
             trial = body_chunks + [_format_body(c, header=f"# callee body: {c.qualified_name}")]
             block = "# callee bodies [certain]\n" + "\n\n".join(trial)
-            if count_tokens(_join(extras + [block])) > budget:
+            if count_tokens(_join(extras + [block])) > hard_cap:
                 break
             body_chunks = trial
         if body_chunks:
@@ -361,7 +514,7 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
         for c in inferred:
             trial = sigs + [_format_signature(c)]
             block = "# callees [inferred]\n" + "\n\n".join(trial)
-            if count_tokens(_join(extras + [block])) > budget:
+            if count_tokens(_join(extras + [block])) > hard_cap:
                 break
             sigs = trial
         if sigs:
@@ -591,7 +744,9 @@ async def assemble_chunks(pool: asyncpg.Pool, repo_id: int) -> ChunkStats:
         edges = await _load_call_edges(conn, repo_id)
         da = await _load_data_access(conn, repo_id)
         imports = await _load_imports(conn, repo_id)
-        idx = _build_index(defs, edges, da, imports)
+        inherits = await _load_inherits_edges(conn, repo_id)
+        overrides = await _load_overrides_edges(conn, repo_id)
+        idx = _build_index(defs, edges, da, imports, inherits, overrides)
 
         chunks: list[_ChunkRow] = []
         for d in defs:

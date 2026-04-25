@@ -1,8 +1,9 @@
 """Inheritance + overrides: schema, intra-file resolution, cross-file linking,
-override edge generation, and retrieval expansion."""
+override edge generation, retrieval expansion, and chunk-content enrichment."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -163,6 +164,42 @@ async def test_python_intra_file_inheritance_and_override(
 # ────────────────────────────────────────────────────────────────────
 # Retrieval: bidirectional expansion pulls in overrides
 # ────────────────────────────────────────────────────────────────────
+
+
+async def test_chunk_enrichment_for_overriding_method(
+    clean_repo, solidity_fixture_root: Path,
+):
+    """The chunk for an overriding method should include:
+       - an `# overrides:` block with the base method's signature,
+       - an `# inheritance chain:` line naming the ancestor classes,
+       - metadata fields `overrides` and `inheritance_chain`.
+    """
+    pool, repo_id = clean_repo
+    await _seed(pool, repo_id, solidity_fixture_root)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT c.content, c.metadata
+            FROM chunks c
+            JOIN definitions d ON d.id = c.anchor_def_id
+            JOIN files f ON f.id = c.file_id
+            WHERE f.repo_id = $1
+              AND d.qualified_name = 'Policy.SingleExecutorPolicy.isPolicyActive'
+              AND c.granularity = 'function'
+            """,
+            repo_id,
+        )
+        assert row is not None, "chunk for SingleExecutorPolicy.isPolicyActive missing"
+        meta = json.loads(row["metadata"])
+        assert meta["overrides"] == "Policy.Policy.isPolicyActive"
+        assert "Policy.Policy" in meta["inheritance_chain"]
+        # IPolicy is also an ancestor (via Policy is IPolicy).
+        assert "Policy.IPolicy" in meta["inheritance_chain"]
+        content = row["content"]
+        assert "# overrides: Policy.Policy.isPolicyActive" in content
+        assert "# inheritance chain:" in content
+        # Inherited members from Policy/IPolicy should appear (signatures only).
+        assert "onlyManager" in content or "_requireSender" in content
 
 
 async def test_hybrid_pulls_in_overrides(clean_repo, solidity_fixture_root: Path):
