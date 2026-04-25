@@ -30,7 +30,7 @@ async def _can_connect(dsn: str) -> bool:
     return True
 
 
-@pytest_asyncio.fixture(scope="session")
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
 async def pg_pool():
     dsn = get_dsn()
     if not await _can_connect(dsn):
@@ -44,7 +44,7 @@ async def pg_pool():
         await pool.close()
 
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(loop_scope="session")
 async def clean_repo(pg_pool):
     """Yield (pool, repo_id). Removes all rows for that repo_id afterwards."""
     # Use process pid + a counter via attribute on the fixture function.

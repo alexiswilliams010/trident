@@ -59,7 +59,6 @@ def test_walk_dependency_files_rejects_path_escape(solidity_fixture_root: Path) 
 # ────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.asyncio
 async def test_index_python_fixture(clean_repo, python_fixture_root: Path) -> None:
     pool, repo_id = clean_repo
     result = await index_repo(pool, repo_id, python_fixture_root)
@@ -113,7 +112,6 @@ async def test_index_python_fixture(clean_repo, python_fixture_root: Path) -> No
         assert leaf_with_text > 0
 
 
-@pytest.mark.asyncio
 async def test_index_solidity_fixture(clean_repo, solidity_fixture_root: Path) -> None:
     pool, repo_id = clean_repo
     result = await index_repo(pool, repo_id, solidity_fixture_root)
@@ -147,7 +145,6 @@ async def test_index_solidity_fixture(clean_repo, solidity_fixture_root: Path) -
         assert functions >= 2
 
 
-@pytest.mark.asyncio
 async def test_incremental_indexing_skips_unchanged(clean_repo, python_fixture_root: Path) -> None:
     pool, repo_id = clean_repo
     first = await index_repo(pool, repo_id, python_fixture_root)
