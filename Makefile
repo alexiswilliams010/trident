@@ -37,6 +37,9 @@ test-resolver: ## Run only Phase 2 semantic resolver tests.
 test-imports: ## Run only Phase 3 heuristic resolver tests.
 	@$(PYTHON) -m pytest -v tests/test_heuristic_resolver.py
 
+test-chunks: ## Run only Phase 4 chunk + retrieval tests.
+	@$(PYTHON) -m pytest -v tests/test_chunk_assembler.py tests/test_retrieval.py
+
 # ------------------------------------------------------------------------------
 # Local PostgreSQL (Homebrew). Override PG_SERVICE / PG_DB as needed.
 # ------------------------------------------------------------------------------
@@ -85,6 +88,12 @@ index-python: ## Index the Python test fixture (repo-id 1).
 
 index-solidity: ## Index the Solidity test fixture (repo-id 2).
 	@$(PYTHON) -m cli.index $(SOLIDITY_FIXTURE) --repo-id 2
+
+embed-python-fake: ## Embed Python fixture chunks with the deterministic stub.
+	@$(PYTHON) -m cli.index $(PYTHON_FIXTURE) --repo-id 1 --embed fake
+
+embed-solidity-fake: ## Embed Solidity fixture chunks with the deterministic stub.
+	@$(PYTHON) -m cli.index $(SOLIDITY_FIXTURE) --repo-id 2 --embed fake
 
 diagnose-python: ## Print resolution stats for the Python fixture (repo-id 1).
 	@$(PYTHON) -m cli.diagnose --repo-id 1 --unresolved

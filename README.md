@@ -46,6 +46,7 @@ make test            # full pytest suite
 make test-extractor  # Phase 1 extractor tests only
 make test-resolver   # Phase 2 semantic resolver tests only
 make test-imports    # Phase 3 heuristic resolver tests only
+make test-chunks     # Phase 4 chunk assembly + retrieval tests
 ```
 
 Tests that need Postgres connect via the same DSN; they auto-skip with a
@@ -61,6 +62,19 @@ make index-solidity  # indexes tests/fixtures/solidity_foundry_fixture under rep
 
 make diagnose-python    # resolution stats for repo_id 1 (incl. unresolved imports)
 make diagnose-solidity  # resolution stats for repo_id 2
+
+make embed-python-fake     # embed Python fixture chunks with the deterministic stub embedder
+make embed-solidity-fake   # ditto for Solidity
+```
+
+Retrieval queries (use `--fake` for the stub embedder; otherwise set
+`EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` to call a
+real OpenAI-compatible gateway):
+
+```sh
+.venv/bin/python -m cli.query --repo-id 2 --structural deposit --depth 2
+.venv/bin/python -m cli.query --repo-id 2 --semantic "token transfer balance update" --fake
+.venv/bin/python -m cli.query --repo-id 2 --hybrid "reentrancy guard usage" --fake
 ```
 
 Inspect the result:
@@ -117,6 +131,64 @@ actually imported.
 
 ---
 
+## Embeddings (Phase 4b)
+
+Chunks are embedded via an OpenAI-compatible HTTP gateway, configured by
+**three required environment variables**. No `.env` file is auto-loaded;
+keys live in your shell only.
+
+| Var | Required | Default | Purpose |
+|---|---|---|---|
+| `EMBEDDING_BASE_URL` | yes | — | Gateway URL, e.g. `https://api.openai.com/v1` |
+| `EMBEDDING_API_KEY`  | yes | — | API key for that gateway |
+| `EMBEDDING_MODEL`    | yes | — | Model name, e.g. `text-embedding-3-large` |
+| `EMBEDDING_DIM`      | no  | `1024` | Must match `chunk_embeddings.embedding vector(1024)` in schema |
+| `EMBEDDING_BATCH_SIZE` | no | `64` | Batch size for embedding API calls |
+
+If you don't want to set up a real provider yet, append `--fake` to any
+query (or `--embed fake` to `cli.index`) to use the deterministic SHA-256
+stub embedder. It exercises the full pipeline locally with no API key.
+
+**Provider configurations:**
+
+| Provider | Vars |
+|---|---|
+| OpenAI | `EMBEDDING_BASE_URL=https://api.openai.com/v1`<br>`EMBEDDING_API_KEY=sk-...`<br>`EMBEDDING_MODEL=text-embedding-3-large` |
+| Voyage AI | `EMBEDDING_BASE_URL=https://api.voyageai.com/v1`<br>`EMBEDDING_API_KEY=pa-...`<br>`EMBEDDING_MODEL=voyage-code-3` |
+| LiteLLM proxy | `EMBEDDING_BASE_URL=http://localhost:4000`<br>`EMBEDDING_API_KEY=<anything>`<br>`EMBEDDING_MODEL=<as-registered>` |
+| Self-hosted (vLLM, etc.) | `EMBEDDING_BASE_URL=http://localhost:8000/v1`<br>`EMBEDDING_API_KEY=<anything>`<br>`EMBEDDING_MODEL=nomic-embed-code` |
+
+**Setting them:**
+
+```sh
+# session-wide (recommended for repeated runs)
+export EMBEDDING_BASE_URL=https://api.openai.com/v1
+export EMBEDDING_API_KEY=sk-...
+export EMBEDDING_MODEL=text-embedding-3-large
+
+# or one-shot, inline:
+EMBEDDING_BASE_URL=https://api.openai.com/v1 \
+EMBEDDING_API_KEY=sk-... \
+EMBEDDING_MODEL=text-embedding-3-large \
+.venv/bin/python -m cli.index tests/fixtures/python_fixture --repo-id 1 --embed real
+
+# or stash them in an out-of-tree file and source it:
+set -a; source ~/.config/tsgrep/env; set +a
+make index-python   # then pass --embed real to the underlying CLI as needed
+```
+
+**Schema constraint** — `chunk_embeddings.embedding` is `vector(1024)`. If
+your model emits a different native dimension, the gateway must truncate
+or project to 1024. OpenAI `text-embedding-3-large` accepts a `dimensions`
+parameter; Voyage `voyage-code-3` is natively 1024; for others (Nomic
+Embed Code at 768, etc.), put a projecting gateway like LiteLLM in front
+or change the schema dimension.
+
+**`from_env()` raises a clear error** if any required var is missing — so
+running `--embed real` without setup fails fast with the missing-var name.
+
+---
+
 ## Make targets
 
 ```
@@ -163,7 +235,10 @@ tsgrep/
 │   ├── grammar_meta.py       # Language registry (Python, Solidity)
 │   ├── config_loader.py      # Phase 2: YAML loader + validation
 │   ├── semantic_resolver.py  # Phase 2: defs / refs / calls / data_access
-│   └── heuristic_resolver.py # Phase 3: imports + cross-file linking
+│   ├── heuristic_resolver.py # Phase 3: imports + cross-file linking
+│   ├── chunk_assembler.py    # Phase 4: multi-granularity chunks
+│   ├── embedder.py           # Phase 4: OpenAI-compatible embedding gateway
+│   └── retrieval.py          # Phase 4: structural / semantic / hybrid query
 │
 ├── db/
 │   ├── connection.py        # asyncpg pool + migration runner
@@ -172,7 +247,8 @@ tsgrep/
 │
 ├── cli/
 │   ├── index.py             # python -m cli.index <repo> --repo-id N
-│   └── diagnose.py          # python -m cli.diagnose --repo-id N
+│   ├── diagnose.py          # python -m cli.diagnose --repo-id N
+│   └── query.py             # python -m cli.query --repo-id N --semantic|--structural|--hybrid
 │
 └── tests/
     ├── conftest.py
@@ -192,7 +268,7 @@ tsgrep/
 | 1 | Tier 1 extractor + DB schema | done |
 | 2 | YAML-driven semantic resolver (definitions, references, scopes, calls, data access) | done |
 | 3 | Heuristic cross-file import resolution + cross-file edge linking | done |
-| 4 | Graph-informed chunk assembly + embeddings + retrieval | next |
+| 4 | Graph-informed chunk assembly + embeddings + dual retrieval | done — **MVP complete** |
 
 Phase 5+ (eval harness, Deno resolver sandbox, additional languages) are
 deferred until the MVP shows the approach works.

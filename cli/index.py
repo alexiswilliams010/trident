@@ -12,6 +12,8 @@ import asyncio
 import sys
 from pathlib import Path
 
+from core.chunk_assembler import assemble_chunks
+from core.embedder import EmbedderConfig, OpenAICompatibleEmbedder, embed_repo_chunks, make_fake_embedder
 from core.extractor import index_repo
 from core.heuristic_resolver import resolve_repo_imports
 from core.semantic_resolver import resolve_repo
@@ -25,6 +27,8 @@ async def _run(
     init_schema: bool,
     do_resolve: bool,
     do_imports: bool,
+    do_chunks: bool,
+    do_embed: str | None,
 ) -> int:
     async with pool_ctx(dsn) as pool:
         if init_schema:
@@ -67,6 +71,25 @@ async def _run(
                 f"{stats.cross_file_calls_resolved} call_edges"
             )
 
+        if do_chunks:
+            cstats = await assemble_chunks(pool, repo_id)
+            print(
+                f"[Tier 3 chunks] {cstats.total} chunks "
+                f"(function={cstats.n_function} module={cstats.n_module} "
+                f"cross-module={cstats.n_cross_module}) "
+                f"— inserted={cstats.n_inserted} updated={cstats.n_updated} unchanged={cstats.n_unchanged}"
+            )
+
+        if do_embed:
+            if do_embed == "fake":
+                embed_fn, model_name = make_fake_embedder()
+            else:  # "real"
+                cfg = EmbedderConfig.from_env()
+                embed_fn = OpenAICompatibleEmbedder(cfg).embed
+                model_name = cfg.model
+            estats = await embed_repo_chunks(pool, repo_id, embed_fn, model_name)
+            print(f"[Tier 3 embed] {estats.embedded}/{estats.chunks_seen} chunks embedded ({model_name})")
+
     return 0
 
 
@@ -78,6 +101,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--init-schema", action="store_true", help="Apply migrations before indexing (idempotent)")
     parser.add_argument("--no-resolve", action="store_true", help="Skip Tier 2 semantic resolution")
     parser.add_argument("--no-imports", action="store_true", help="Skip Phase 3 import resolution / cross-file linking")
+    parser.add_argument("--no-chunks", action="store_true", help="Skip Tier 3 chunk assembly")
+    parser.add_argument("--embed", choices=["real", "fake"], default=None,
+                        help="Run embedding step. 'real' uses EMBEDDING_BASE_URL/API_KEY/MODEL; 'fake' is the deterministic stub.")
     args = parser.parse_args(argv)
 
     if not args.repo_path.is_dir():
@@ -92,6 +118,8 @@ def main(argv: list[str] | None = None) -> int:
             args.init_schema,
             not args.no_resolve,
             not args.no_imports,
+            not args.no_chunks,
+            args.embed,
         )
     )
 
