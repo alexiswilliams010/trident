@@ -1,6 +1,8 @@
 .PHONY: help install lint test test-extractor \
         db-start db-stop db-create db-drop db-migrate db-setup db-teardown db-reset db-psql \
-        index-python index-solidity diagnose
+        index-python index-solidity diagnose \
+        embed-python embed-solidity query-semantic query-hybrid \
+        index embed
 
 UV ?= uv
 PYTHON := .venv/bin/python
@@ -11,6 +13,20 @@ MIGRATIONS_DIR := db/migrations
 
 PYTHON_FIXTURE := tests/fixtures/python_fixture
 SOLIDITY_FIXTURE := tests/fixtures/solidity_foundry_fixture
+
+PASS_CLI ?= pass-cli
+ENV_TEMPLATE ?= .env.template
+
+# Run $(1) with secrets streamed from pass-cli into the process env.
+# pass-cli inject's stdout is eval'd then unset; no file is written to disk.
+define inject_and_run
+	@OUTPUT=$$($(PASS_CLI) inject --in-file $(ENV_TEMPLATE)) || { echo "pass-cli inject failed"; exit 1; }; \
+	set -a; \
+	eval "$$OUTPUT"; \
+	set +a; \
+	unset OUTPUT; \
+	exec $(1)
+endef
 
 help: ## Show this help.
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-15s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -94,6 +110,46 @@ embed-python-fake: ## Embed Python fixture chunks with the deterministic stub.
 
 embed-solidity-fake: ## Embed Solidity fixture chunks with the deterministic stub.
 	@$(PYTHON) -m cli.index $(SOLIDITY_FIXTURE) --repo-id 2 --embed fake
+
+embed-python: ## Embed Python fixture chunks (real embedder, secrets via pass-cli).
+	$(call inject_and_run,$(PYTHON) -m cli.index $(PYTHON_FIXTURE) --repo-id 1 --embed real)
+
+embed-solidity: ## Embed Solidity fixture chunks (real embedder, secrets via pass-cli).
+	$(call inject_and_run,$(PYTHON) -m cli.index $(SOLIDITY_FIXTURE) --repo-id 2 --embed real)
+
+# Generic targets for any repo. Pass REPO_PATH and REPO_ID on the command line:
+#   make index REPO_PATH=/path/to/repo REPO_ID=42
+#   make embed REPO_PATH=/path/to/repo REPO_ID=42
+REPO_PATH ?=
+REPO_ID ?=
+
+index: ## Index any repo. REPO_PATH=/path REPO_ID=N
+	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_ID)" ]; then \
+		echo 'usage: make index REPO_PATH=/path/to/repo REPO_ID=N'; exit 2; \
+	fi
+	@$(PYTHON) -m cli.index $(REPO_PATH) --repo-id $(REPO_ID)
+
+embed: ## Index + embed any repo (real embedder, secrets via pass-cli). REPO_PATH=/path REPO_ID=N
+	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_ID)" ]; then \
+		echo 'usage: make embed REPO_PATH=/path/to/repo REPO_ID=N'; exit 2; \
+	fi
+	@OUTPUT=$$($(PASS_CLI) inject --in-file $(ENV_TEMPLATE)) || { echo "pass-cli inject failed"; exit 1; }; \
+	set -a; eval "$$OUTPUT"; set +a; unset OUTPUT; \
+	exec $(PYTHON) -m cli.index $(REPO_PATH) --repo-id $(REPO_ID) --embed real
+
+# Usage: make query-semantic QUERY="how does helper resolve?" [REPO=1]
+REPO ?= 1
+query-semantic: ## Run a semantic query. Pass QUERY="..." [REPO=N].
+	@if [ -z "$(QUERY)" ]; then echo 'usage: make query-semantic QUERY="..." [REPO=1]'; exit 2; fi
+	@OUTPUT=$$($(PASS_CLI) inject --in-file $(ENV_TEMPLATE)) || { echo "pass-cli inject failed"; exit 1; }; \
+	set -a; eval "$$OUTPUT"; set +a; unset OUTPUT; \
+	exec $(PYTHON) -m cli.query --repo-id $(REPO) --semantic "$(QUERY)"
+
+query-hybrid: ## Run a hybrid query. Pass QUERY="..." [REPO=N].
+	@if [ -z "$(QUERY)" ]; then echo 'usage: make query-hybrid QUERY="..." [REPO=1]'; exit 2; fi
+	@OUTPUT=$$($(PASS_CLI) inject --in-file $(ENV_TEMPLATE)) || { echo "pass-cli inject failed"; exit 1; }; \
+	set -a; eval "$$OUTPUT"; set +a; unset OUTPUT; \
+	exec $(PYTHON) -m cli.query --repo-id $(REPO) --hybrid "$(QUERY)"
 
 diagnose-python: ## Print resolution stats for the Python fixture (repo-id 1).
 	@$(PYTHON) -m cli.diagnose --repo-id 1 --unresolved

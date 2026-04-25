@@ -142,7 +142,7 @@ keys live in your shell only.
 | `EMBEDDING_BASE_URL` | yes | — | Gateway URL, e.g. `https://api.openai.com/v1` |
 | `EMBEDDING_API_KEY`  | yes | — | API key for that gateway |
 | `EMBEDDING_MODEL`    | yes | — | Model name, e.g. `text-embedding-3-large` |
-| `EMBEDDING_DIM`      | no  | `1024` | Must match `chunk_embeddings.embedding vector(1024)` in schema |
+| `EMBEDDING_DIM`      | no  | `4096` | Must match `chunk_embeddings.embedding vector(4096)` in schema |
 | `EMBEDDING_BATCH_SIZE` | no | `64` | Batch size for embedding API calls |
 
 If you don't want to set up a real provider yet, append `--fake` to any
@@ -177,15 +177,131 @@ set -a; source ~/.config/tsgrep/env; set +a
 make index-python   # then pass --embed real to the underlying CLI as needed
 ```
 
-**Schema constraint** — `chunk_embeddings.embedding` is `vector(1024)`. If
-your model emits a different native dimension, the gateway must truncate
-or project to 1024. OpenAI `text-embedding-3-large` accepts a `dimensions`
-parameter; Voyage `voyage-code-3` is natively 1024; for others (Nomic
-Embed Code at 768, etc.), put a projecting gateway like LiteLLM in front
-or change the schema dimension.
+**Schema constraint** — `chunk_embeddings.embedding` is `vector(4096)`,
+sized for qwen3-embedding-8b's native output. `EMBEDDING_DIM` must match
+both the schema and the vector your model returns; mismatches are caught
+at insert time by the validator in `embed_repo_chunks`. For models with a
+different native width:
+
+- OpenAI `text-embedding-3-large` — accepts a `dimensions` parameter; the
+  embedder forwards it automatically when `EMBEDDING_BASE_URL` contains
+  `openai.com` or `EMBEDDING_MODEL` starts with `text-embedding-3`.
+- Voyage `voyage-code-3` — natively 1024; needs a schema change to
+  `vector(1024)` (see `db/migrations/0001_init.up.sql`).
+- Self-hosted / other gateways — either project via a LiteLLM proxy or
+  truncate client-side, then bump `EMBEDDING_DIM` and the schema column to
+  match.
+
+**No ANN index** — pgvector caps HNSW at 2000 dims for `vector` and 4000
+for `halfvec`, so cosine NN runs as a sequential scan. Fine at small/medium
+scale; see [docs/halfvec-migration.md](docs/halfvec-migration.md) for the
+upgrade path when chunk counts grow.
 
 **`from_env()` raises a clear error** if any required var is missing — so
 running `--embed real` without setup fails fast with the missing-var name.
+
+---
+
+## End-to-end: index, embed, query
+
+The full pipeline takes four steps. Steps 1-2 are one-time per repo; step 3
+runs whenever the source changes; step 4 is the read path you'll hit
+repeatedly.
+
+### 1. Set up secrets via pass-cli (recommended)
+
+Edit `.env.template` at the repo root to point at your secret store:
+
+```
+EMBEDDING_BASE_URL=https://ai-gateway.vercel.sh/v1
+EMBEDDING_MODEL=alibaba/qwen3-embedding-8b
+EMBEDDING_DIM=4096
+EMBEDDING_API_KEY={{ pass://Personal/vercel-ai-gateway/secret }}
+```
+
+The `make embed-*` and `make query-*` targets stream the API key from
+pass-cli into the process env — nothing is written to disk. Verify with:
+
+```sh
+pass-cli inject --in-file .env.template
+```
+
+Plain values (URL, model name, dim) pass through; only the API key is
+fetched. If you'd rather export env vars manually, see the section above —
+the make targets and the raw CLI both read the same vars.
+
+### 2. Index the repo (Tiers 1-3a)
+
+Parses sources, builds the call graph, assembles chunks. No API calls.
+
+```sh
+make index-python                                  # bundled fixture, repo-id 1
+make index-solidity                                # bundled fixture, repo-id 2
+make index REPO_PATH=/path/to/repo REPO_ID=42      # any other repo
+```
+
+`REPO_ID` is just a namespace integer — pick anything; the schema uses it
+to keep multiple repos in one Postgres without colliding (uniqueness is on
+`(repo_id, path)`). If you only ever index one repo, `REPO_ID=1` is fine
+forever.
+
+### 3. Embed (Tier 3b)
+
+Walks `chunks` rows that don't yet have an embedding, batches them through
+the gateway, writes vectors to `chunk_embeddings`. Re-runs are cheap:
+unchanged chunks are skipped via `LEFT JOIN ... WHERE ce.id IS NULL`.
+
+```sh
+make embed-python                                  # bundled fixture, secrets via pass-cli
+make embed-solidity
+make embed REPO_PATH=/path/to/repo REPO_ID=42      # any other repo
+
+make embed-python-fake                             # stub embedder, no API key needed
+```
+
+The generic `make embed` target re-runs Tier 1-3a (idempotent / cheap if
+unchanged) and then embeds — same as the fixture-specific targets.
+
+### 4. Query
+
+Three modes, two of which need the same embedding model that produced the
+index:
+
+```sh
+# Semantic: pure cosine NN over chunk_embeddings.
+make query-semantic QUERY="how does the call graph link cross-module" REPO=1
+
+# Hybrid: semantic seeds + 1-hop call-graph expansion (best general default).
+make query-hybrid   QUERY="reentrancy guard usage" REPO=2
+
+# Structural: graph walk from a known definition name, no embedding needed.
+.venv/bin/python -m cli.query --repo-id 2 --structural deposit --depth 2
+```
+
+Add `--show-content` to print chunk bodies, `--top-k N` to change result
+count, `--context-budget N` to also emit a deduped, budget-fitted block
+suitable for pasting into an LLM prompt.
+
+### 5. Feed the result to another LLM
+
+`assemble_context(chunks, token_budget)` (`core/retrieval.py:231`) returns
+a single string ready to drop into a system or user message. From Python:
+
+```python
+from db.connection import pool_ctx
+from core.embedder import EmbedderConfig, OpenAICompatibleEmbedder
+from core.retrieval import hybrid_query, assemble_context
+
+async def get_context(repo_id: int, question: str, budget: int = 8000) -> str:
+    embed_fn = OpenAICompatibleEmbedder(EmbedderConfig.from_env()).embed
+    async with pool_ctx() as pool:
+        chunks = await hybrid_query(pool, repo_id, question, embed_fn, top_k=10)
+    return assemble_context(chunks, token_budget=budget)
+```
+
+Pass the returned string as context to any model — Claude, GPT, a local
+llama, whatever. The query-time embedding model **must** match the one
+used in step 3, otherwise cosine distances are meaningless.
 
 ---
 
@@ -206,69 +322,22 @@ make db-setup        # db-start + db-create + db-migrate
 make db-reset        # db-drop + db-create + db-migrate
 make db-psql         # interactive psql shell on tsgrep
 
-make index-python    # index the Python fixture
-make index-solidity  # index the Solidity fixture
+make index-python                              # index the Python fixture
+make index-solidity                            # index the Solidity fixture
+make index REPO_PATH=/path REPO_ID=N           # index any repo
+
+make embed-python-fake                         # embed Python fixture, deterministic stub
+make embed-solidity-fake                       # ditto Solidity
+make embed-python                              # embed Python fixture, real embedder + pass-cli
+make embed-solidity                            # ditto Solidity
+make embed REPO_PATH=/path REPO_ID=N           # index + embed any repo
+
+make query-semantic QUERY="..." [REPO=N]       # cosine NN over chunk_embeddings
+make query-hybrid   QUERY="..." [REPO=N]       # semantic seeds + 1-hop graph expand
+
+make diagnose-python                           # resolution stats for repo_id 1
+make diagnose-solidity                         # resolution stats for repo_id 2
 ```
 
 Override `PG_SERVICE` or `PG_DB` as `make` variables if your local setup
 differs (e.g. `make db-setup PG_DB=tsgrep_dev`).
-
----
-
-## Project layout
-
-```
-tsgrep/
-├── pyproject.toml           # uv-managed project, Python 3.12+
-├── .python-version          # 3.12
-├── Makefile                 # uv + Postgres + index helpers
-├── Architecture.md          # full design doc (8 phases)
-│
-├── configs/
-│   ├── _schema.json         # JSON Schema validating language YAMLs
-│   ├── python.yaml          # Phase 2 rules for Python
-│   └── solidity.yaml        # Phase 2 rules for Solidity
-│
-├── core/
-│   ├── extractor.py          # Phase 1: Tree-sitter -> nodes table
-│   ├── file_walker.py        # Phase 1: dep-aware repo walker
-│   ├── grammar_meta.py       # Language registry (Python, Solidity)
-│   ├── config_loader.py      # Phase 2: YAML loader + validation
-│   ├── semantic_resolver.py  # Phase 2: defs / refs / calls / data_access
-│   ├── heuristic_resolver.py # Phase 3: imports + cross-file linking
-│   ├── chunk_assembler.py    # Phase 4: multi-granularity chunks
-│   ├── embedder.py           # Phase 4: OpenAI-compatible embedding gateway
-│   └── retrieval.py          # Phase 4: structural / semantic / hybrid query
-│
-├── db/
-│   ├── connection.py        # asyncpg pool + migration runner
-│   └── migrations/
-│       └── 0001_init.up.sql # Tier 1 + 2 + 3 schema, pgvector, HNSW
-│
-├── cli/
-│   ├── index.py             # python -m cli.index <repo> --repo-id N
-│   ├── diagnose.py          # python -m cli.diagnose --repo-id N
-│   └── query.py             # python -m cli.query --repo-id N --semantic|--structural|--hybrid
-│
-└── tests/
-    ├── conftest.py
-    ├── test_extractor.py
-    ├── test_semantic_resolver.py
-    └── fixtures/
-        ├── python_fixture/             # multi-file package + .venv decoy
-        └── solidity_foundry_fixture/   # foundry layout + lib/ decoy
-```
-
----
-
-## Implementation phase status
-
-| Phase | Description | Status |
-|---|---|---|
-| 1 | Tier 1 extractor + DB schema | done |
-| 2 | YAML-driven semantic resolver (definitions, references, scopes, calls, data access) | done |
-| 3 | Heuristic cross-file import resolution + cross-file edge linking | done |
-| 4 | Graph-informed chunk assembly + embeddings + dual retrieval | done — **MVP complete** |
-
-Phase 5+ (eval harness, Deno resolver sandbox, additional languages) are
-deferred until the MVP shows the approach works.

@@ -151,9 +151,12 @@ CREATE TABLE IF NOT EXISTS chunks (
 CREATE TABLE IF NOT EXISTS chunk_embeddings (
     id         BIGSERIAL PRIMARY KEY,
     chunk_id   BIGINT REFERENCES chunks(id) ON DELETE CASCADE UNIQUE,
-    embedding  vector(1024),
+    embedding  vector(4096),
     model_name TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_vector ON chunk_embeddings
-    USING hnsw (embedding vector_cosine_ops);
+-- No ANN index: pgvector caps HNSW at 2000 dims for `vector` (4000 for
+-- `halfvec`), and qwen3-embedding-8b is natively 4096. Cosine NN runs as a
+-- sequential scan, which is fine at small/medium chunk counts. See
+-- docs/halfvec-migration.md for the path to halfvec(4000) + HNSW when scale
+-- demands it.
