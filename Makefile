@@ -2,7 +2,9 @@
         db-start db-stop db-create db-drop db-migrate db-setup db-teardown db-reset db-psql \
         index-python index-solidity diagnose \
         embed-python embed-solidity query-semantic query-hybrid \
-        index embed
+        index embed \
+        index-isolated embed-isolated query-isolated-semantic query-isolated-hybrid \
+        db-ensure-isolated
 
 UV ?= uv
 PYTHON := .venv/bin/python
@@ -17,15 +19,23 @@ SOLIDITY_FIXTURE := tests/fixtures/solidity_foundry_fixture
 PASS_CLI ?= pass-cli
 ENV_TEMPLATE ?= .env.template
 
-# Run $(1) with secrets streamed from pass-cli into the process env.
-# pass-cli inject's stdout is eval'd then unset; no file is written to disk.
+# DB selection. Default `tsgrep` is the shared multi-repo DB. Override on
+# any target with DB=tsgrep_myrepo, or use the *-isolated variants which do
+# this automatically.
+DB ?= $(PG_DB)
+DB_USER ?= $(USER)
+DB_DSN := postgresql://$(DB_USER)@localhost:5432/$(DB)
+
+# Run $(1) with:
+#   - secrets streamed from pass-cli into the env (no file on disk),
+#   - DATABASE_URL pointing at $(DB).
 define inject_and_run
 	@OUTPUT=$$($(PASS_CLI) inject --in-file $(ENV_TEMPLATE)) || { echo "pass-cli inject failed"; exit 1; }; \
 	set -a; \
 	eval "$$OUTPUT"; \
 	set +a; \
 	unset OUTPUT; \
-	exec $(1)
+	exec env DATABASE_URL=$(DB_DSN) $(1)
 endef
 
 help: ## Show this help.
@@ -99,60 +109,93 @@ db-psql: ## Open a psql shell on $(PG_DB).
 # ------------------------------------------------------------------------------
 # tsgrep CLI helpers
 # ------------------------------------------------------------------------------
-index-python: ## Index the Python test fixture (repo-id 1).
-	@$(PYTHON) -m cli.index $(PYTHON_FIXTURE) --repo-id 1
+# ------------------------------------------------------------------------------
+# Mode A — multi-repo into one shared DB (default `tsgrep`).
+# Repos are addressed by name; cross-repo queries are possible.
+# ------------------------------------------------------------------------------
+PYTHON_REPO_NAME   ?= python_fixture
+SOLIDITY_REPO_NAME ?= solidity_fixture
 
-index-solidity: ## Index the Solidity test fixture (repo-id 2).
-	@$(PYTHON) -m cli.index $(SOLIDITY_FIXTURE) --repo-id 2
+REPO_PATH ?=
+REPO_NAME ?=
+QUERY     ?=
+
+index-python: ## Index the Python test fixture into the shared DB.
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.index $(PYTHON_FIXTURE) --repo-name $(PYTHON_REPO_NAME)
+
+index-solidity: ## Index the Solidity test fixture into the shared DB.
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.index $(SOLIDITY_FIXTURE) --repo-name $(SOLIDITY_REPO_NAME)
 
 embed-python-fake: ## Embed Python fixture chunks with the deterministic stub.
-	@$(PYTHON) -m cli.index $(PYTHON_FIXTURE) --repo-id 1 --embed fake
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.index $(PYTHON_FIXTURE) --repo-name $(PYTHON_REPO_NAME) --embed fake
 
 embed-solidity-fake: ## Embed Solidity fixture chunks with the deterministic stub.
-	@$(PYTHON) -m cli.index $(SOLIDITY_FIXTURE) --repo-id 2 --embed fake
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.index $(SOLIDITY_FIXTURE) --repo-name $(SOLIDITY_REPO_NAME) --embed fake
 
 embed-python: ## Embed Python fixture chunks (real embedder, secrets via pass-cli).
-	$(call inject_and_run,$(PYTHON) -m cli.index $(PYTHON_FIXTURE) --repo-id 1 --embed real)
+	$(call inject_and_run,$(PYTHON) -m cli.index $(PYTHON_FIXTURE) --repo-name $(PYTHON_REPO_NAME) --embed real)
 
 embed-solidity: ## Embed Solidity fixture chunks (real embedder, secrets via pass-cli).
-	$(call inject_and_run,$(PYTHON) -m cli.index $(SOLIDITY_FIXTURE) --repo-id 2 --embed real)
+	$(call inject_and_run,$(PYTHON) -m cli.index $(SOLIDITY_FIXTURE) --repo-name $(SOLIDITY_REPO_NAME) --embed real)
 
-# Generic targets for any repo. Pass REPO_PATH and REPO_ID on the command line:
-#   make index REPO_PATH=/path/to/repo REPO_ID=42
-#   make embed REPO_PATH=/path/to/repo REPO_ID=42
-REPO_PATH ?=
-REPO_ID ?=
-
-index: ## Index any repo. REPO_PATH=/path REPO_ID=N
-	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_ID)" ]; then \
-		echo 'usage: make index REPO_PATH=/path/to/repo REPO_ID=N'; exit 2; \
+# Generic targets — any repo into $(DB) (default `tsgrep`).
+#   make index REPO_PATH=/path REPO_NAME=name [DB=tsgrep_other]
+index: ## Index any repo into $(DB). REPO_PATH=/path REPO_NAME=name
+	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
+		echo 'usage: make index REPO_PATH=/path REPO_NAME=name'; exit 2; \
 	fi
-	@$(PYTHON) -m cli.index $(REPO_PATH) --repo-id $(REPO_ID)
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME)
 
-embed: ## Index + embed any repo (real embedder, secrets via pass-cli). REPO_PATH=/path REPO_ID=N
-	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_ID)" ]; then \
-		echo 'usage: make embed REPO_PATH=/path/to/repo REPO_ID=N'; exit 2; \
+embed: ## Index + embed any repo into $(DB) (real embedder, secrets via pass-cli). REPO_PATH=/path REPO_NAME=name
+	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
+		echo 'usage: make embed REPO_PATH=/path REPO_NAME=name'; exit 2; \
 	fi
-	@OUTPUT=$$($(PASS_CLI) inject --in-file $(ENV_TEMPLATE)) || { echo "pass-cli inject failed"; exit 1; }; \
-	set -a; eval "$$OUTPUT"; set +a; unset OUTPUT; \
-	exec $(PYTHON) -m cli.index $(REPO_PATH) --repo-id $(REPO_ID) --embed real
+	$(call inject_and_run,$(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) --embed real)
 
-# Usage: make query-semantic QUERY="how does helper resolve?" [REPO=1]
-REPO ?= 1
-query-semantic: ## Run a semantic query. Pass QUERY="..." [REPO=N].
-	@if [ -z "$(QUERY)" ]; then echo 'usage: make query-semantic QUERY="..." [REPO=1]'; exit 2; fi
-	@OUTPUT=$$($(PASS_CLI) inject --in-file $(ENV_TEMPLATE)) || { echo "pass-cli inject failed"; exit 1; }; \
-	set -a; eval "$$OUTPUT"; set +a; unset OUTPUT; \
-	exec $(PYTHON) -m cli.query --repo-id $(REPO) --semantic "$(QUERY)"
+query-semantic: ## Semantic query. QUERY="..." REPO_NAME=name [DB=...]
+	@if [ -z "$(QUERY)" ] || [ -z "$(REPO_NAME)" ]; then \
+		echo 'usage: make query-semantic QUERY="..." REPO_NAME=name'; exit 2; \
+	fi
+	$(call inject_and_run,$(PYTHON) -m cli.query --repo-name $(REPO_NAME) --semantic "$(QUERY)")
 
-query-hybrid: ## Run a hybrid query. Pass QUERY="..." [REPO=N].
-	@if [ -z "$(QUERY)" ]; then echo 'usage: make query-hybrid QUERY="..." [REPO=1]'; exit 2; fi
-	@OUTPUT=$$($(PASS_CLI) inject --in-file $(ENV_TEMPLATE)) || { echo "pass-cli inject failed"; exit 1; }; \
-	set -a; eval "$$OUTPUT"; set +a; unset OUTPUT; \
-	exec $(PYTHON) -m cli.query --repo-id $(REPO) --hybrid "$(QUERY)"
+query-hybrid: ## Hybrid query. QUERY="..." REPO_NAME=name [DB=...]
+	@if [ -z "$(QUERY)" ] || [ -z "$(REPO_NAME)" ]; then \
+		echo 'usage: make query-hybrid QUERY="..." REPO_NAME=name'; exit 2; \
+	fi
+	$(call inject_and_run,$(PYTHON) -m cli.query --repo-name $(REPO_NAME) --hybrid "$(QUERY)")
 
-diagnose-python: ## Print resolution stats for the Python fixture (repo-id 1).
-	@$(PYTHON) -m cli.diagnose --repo-id 1 --unresolved
+diagnose-python: ## Print resolution stats for the Python fixture.
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.diagnose --repo-name $(PYTHON_REPO_NAME) --unresolved
 
-diagnose-solidity: ## Print resolution stats for the Solidity fixture (repo-id 2).
-	@$(PYTHON) -m cli.diagnose --repo-id 2 --unresolved
+diagnose-solidity: ## Print resolution stats for the Solidity fixture.
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.diagnose --repo-name $(SOLIDITY_REPO_NAME) --unresolved
+
+# ------------------------------------------------------------------------------
+# Mode B — one DB per repo (CI-friendly, per-repo isolation).
+# Each *-isolated target derives DB=tsgrep_$(REPO_NAME), creates and migrates
+# that DB if needed, then delegates to the generic target above.
+# ------------------------------------------------------------------------------
+db-ensure-isolated: ## Create (idempotent) and migrate tsgrep_$(REPO_NAME).
+	@if [ -z "$(REPO_NAME)" ]; then echo 'usage: requires REPO_NAME=name'; exit 2; fi
+	@createdb tsgrep_$(REPO_NAME) 2>/dev/null || true
+	@$(MAKE) --no-print-directory db-migrate PG_DB=tsgrep_$(REPO_NAME)
+
+index-isolated: ## Index any repo into its own DB tsgrep_$(REPO_NAME). REPO_PATH=/path REPO_NAME=name
+	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
+		echo 'usage: make index-isolated REPO_PATH=/path REPO_NAME=name'; exit 2; \
+	fi
+	@$(MAKE) --no-print-directory db-ensure-isolated REPO_NAME=$(REPO_NAME)
+	@$(MAKE) --no-print-directory index REPO_PATH=$(REPO_PATH) REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME)
+
+embed-isolated: ## Index + embed any repo into its own DB. REPO_PATH=/path REPO_NAME=name
+	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
+		echo 'usage: make embed-isolated REPO_PATH=/path REPO_NAME=name'; exit 2; \
+	fi
+	@$(MAKE) --no-print-directory db-ensure-isolated REPO_NAME=$(REPO_NAME)
+	@$(MAKE) --no-print-directory embed REPO_PATH=$(REPO_PATH) REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME)
+
+query-isolated-semantic: ## Semantic query against per-repo DB. QUERY="..." REPO_NAME=name
+	@$(MAKE) --no-print-directory query-semantic QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME)
+
+query-isolated-hybrid: ## Hybrid query against per-repo DB. QUERY="..." REPO_NAME=name
+	@$(MAKE) --no-print-directory query-hybrid QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME)

@@ -109,7 +109,7 @@ async def embed_repo_chunks(
     embed_fn: EmbedFn,
     model_name: str,
     *,
-    dim: int = 1024,
+    dim: int = 4096,
     batch_size: int = 64,
 ) -> EmbedStats:
     """Embed every chunk in `repo_id` that doesn't already have an embedding.
@@ -163,7 +163,7 @@ def embed_repo_sync(
     embed_fn: EmbedFn,
     model_name: str,
     *,
-    dim: int = 1024,
+    dim: int = 4096,
     dsn: str | None = None,
 ) -> EmbedStats:
     from db.connection import pool_ctx
@@ -180,7 +180,7 @@ def embed_repo_sync(
 # ────────────────────────────────────────────────────────────────────
 
 
-def make_fake_embedder(dim: int = 1024) -> tuple[EmbedFn, str]:
+def make_fake_embedder(dim: int = 4096) -> tuple[EmbedFn, str]:
     """Hash-based deterministic embedder. Used by Phase 4 retrieval tests so
     the suite doesn't need an API key. Same input always → same vector."""
 

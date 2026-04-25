@@ -8,12 +8,27 @@
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- ═══════════════════════════════════════════════════════════
+-- TIER 0: Repo directory
+-- One DB can hold many repos (multi-repo / complex-product mode) or just
+-- one (per-repo CI mode). The `repos.name` is what users reference at the
+-- CLI; `repos.id` is the namespace key threaded through every other table.
+-- ═══════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS repos (
+    id          BIGSERIAL PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    root_path   TEXT,
+    metadata    JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ═══════════════════════════════════════════════════════════
 -- TIER 1: Syntactic tables
 -- ═══════════════════════════════════════════════════════════
 
 CREATE TABLE IF NOT EXISTS files (
     id              BIGSERIAL PRIMARY KEY,
-    repo_id         BIGINT NOT NULL,
+    repo_id         BIGINT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
     path            TEXT NOT NULL,
     language        TEXT NOT NULL,
     content_hash    TEXT NOT NULL,
@@ -79,7 +94,7 @@ CREATE INDEX IF NOT EXISTS idx_references_name   ON "references"(name);
 
 CREATE TABLE IF NOT EXISTS external_dependencies (
     id           BIGSERIAL PRIMARY KEY,
-    repo_id      BIGINT NOT NULL,
+    repo_id      BIGINT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
     package_name TEXT NOT NULL,
     version      TEXT,
     language     TEXT NOT NULL,

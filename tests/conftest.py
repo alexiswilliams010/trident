@@ -46,12 +46,17 @@ async def pg_pool():
 
 @pytest_asyncio.fixture(loop_scope="session")
 async def clean_repo(pg_pool):
-    """Yield (pool, repo_id). Removes all rows for that repo_id afterwards."""
-    # Use process pid + a counter via attribute on the fixture function.
-    repo_id = int.from_bytes(os.urandom(4), "big") % 1_000_000_000
+    """Yield (pool, repo_id). Inserts a `repos` row first so the FK on
+    `files.repo_id → repos.id` is satisfied; deleting the repos row at
+    teardown cascades through files / nodes / definitions / chunks."""
+    name = f"test-{os.urandom(8).hex()}"
+    async with pg_pool.acquire() as conn:
+        repo_id = await conn.fetchval(
+            "INSERT INTO repos (name) VALUES ($1) RETURNING id", name,
+        )
     yield pg_pool, repo_id
     async with pg_pool.acquire() as conn:
-        await conn.execute("DELETE FROM files WHERE repo_id=$1", repo_id)
+        await conn.execute("DELETE FROM repos WHERE id=$1", repo_id)
 
 
 @pytest.fixture

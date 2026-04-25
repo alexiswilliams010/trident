@@ -1,9 +1,9 @@
 """CLI: print resolution stats for a repo.
 
 Usage:
-    python -m cli.diagnose --repo-id 1
-    python -m cli.diagnose --repo-id 1 --unresolved        # list unresolved imports
-    python -m cli.diagnose --repo-id 1 --top-callers 10    # top callers by # of edges
+    python -m cli.diagnose --repo-name myrepo
+    python -m cli.diagnose --repo-name myrepo --unresolved        # list unresolved imports
+    python -m cli.diagnose --repo-name myrepo --top-callers 10    # top callers by # of edges
 """
 
 from __future__ import annotations
@@ -128,15 +128,18 @@ async def _print_stats(pool, repo_id: int, show_unresolved: bool, top_callers: i
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="tsgrep — diagnostics for an indexed repo")
-    parser.add_argument("--repo-id", type=int, required=True)
+    parser.add_argument("--repo-name", type=str, required=True,
+                        help="Repo name (must already be indexed)")
     parser.add_argument("--dsn", type=str, default=None)
     parser.add_argument("--unresolved", action="store_true", help="List unresolved imports")
     parser.add_argument("--top-callers", type=int, default=0, help="Show N most-active callers")
     args = parser.parse_args(argv)
 
     async def _run() -> int:
+        from cli._repo import resolve_repo_id
         async with pool_ctx(args.dsn) as pool:
-            return await _print_stats(pool, args.repo_id, args.unresolved, args.top_callers)
+            repo_id = await resolve_repo_id(pool, name=args.repo_name, create=False)
+            return await _print_stats(pool, repo_id, args.unresolved, args.top_callers)
 
     return asyncio.run(_run())
 

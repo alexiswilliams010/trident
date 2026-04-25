@@ -54,27 +54,45 @@ clear message if the service is not reachable.
 
 ---
 
+## Two workflows: shared DB vs per-repo DB
+
+Repos are addressed by **name** (`--repo-name foo`). The schema has a
+`repos` table mapping each name to an internal id, and `files.repo_id`
+foreign-keys back to it (so `DELETE FROM repos WHERE name='foo'` cascades
+through everything). Pick whichever workflow fits:
+
+| Mode | DB | When to use | Pros |
+|---|---|---|---|
+| **A — shared** | one `tsgrep` DB, many repos | complex products spanning multiple repos; cross-repo analysis | one connection pool; `SELECT … FROM repos` lists everything; cross-repo queries possible |
+| **B — isolated** | one DB per repo (`tsgrep_<name>`) | CI workflows, per-project querying | clean uninstall via `DROP DATABASE`; smaller tables; one DSN = one repo |
+
+Switch modes per-call by setting `DB=tsgrep_other` on any target, or use
+the `*-isolated` variants which derive `DB` from `REPO_NAME` automatically
+and create + migrate the per-repo DB on first use.
+
+---
+
 ## Indexing the bundled fixtures
 
 ```sh
-make index-python    # indexes tests/fixtures/python_fixture under repo_id 1
-make index-solidity  # indexes tests/fixtures/solidity_foundry_fixture under repo_id 2
+make index-python                # repo name `python_fixture` in shared DB
+make index-solidity              # repo name `solidity_fixture` in shared DB
 
-make diagnose-python    # resolution stats for repo_id 1 (incl. unresolved imports)
-make diagnose-solidity  # resolution stats for repo_id 2
+make diagnose-python             # resolution stats for python_fixture
+make diagnose-solidity           # resolution stats for solidity_fixture
 
-make embed-python-fake     # embed Python fixture chunks with the deterministic stub embedder
-make embed-solidity-fake   # ditto for Solidity
+make embed-python-fake           # embed Python fixture chunks with the deterministic stub
+make embed-solidity-fake         # ditto for Solidity
 ```
 
 Retrieval queries (use `--fake` for the stub embedder; otherwise set
-`EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` to call a
-real OpenAI-compatible gateway):
+`EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` or use a
+`make query-*` target so pass-cli injects them):
 
 ```sh
-.venv/bin/python -m cli.query --repo-id 2 --structural deposit --depth 2
-.venv/bin/python -m cli.query --repo-id 2 --semantic "token transfer balance update" --fake
-.venv/bin/python -m cli.query --repo-id 2 --hybrid "reentrancy guard usage" --fake
+.venv/bin/python -m cli.query --repo-name solidity_fixture --structural deposit --depth 2
+.venv/bin/python -m cli.query --repo-name solidity_fixture --semantic "token transfer balance update" --fake
+.venv/bin/python -m cli.query --repo-name solidity_fixture --hybrid "reentrancy guard usage" --fake
 ```
 
 Inspect the result:
@@ -84,31 +102,26 @@ make db-psql
 ```
 
 ```sql
+-- repos in this database
+SELECT id, name, root_path, created_at FROM repos ORDER BY id;
+
 -- files indexed per repo
-SELECT repo_id, language, COUNT(*) FROM files GROUP BY repo_id, language;
+SELECT r.name, f.language, COUNT(*) FROM files f
+JOIN repos r ON r.id = f.repo_id
+GROUP BY r.name, f.language;
 
--- total nodes per repo
-SELECT f.repo_id, COUNT(n.id) FROM nodes n
-JOIN files f ON f.id = n.file_id GROUP BY f.repo_id;
-
--- definitions with qualified names (Phase 2)
+-- definitions for one repo
 SELECT d.kind, d.qualified_name FROM definitions d
 JOIN files f ON f.id = d.file_id
-WHERE f.repo_id = 1 ORDER BY d.id;
+JOIN repos r ON r.id = f.repo_id
+WHERE r.name = 'python_fixture' ORDER BY d.id;
 
--- call graph (Phase 2): caller → callee with confidence
+-- call graph: caller → callee with confidence
 SELECT caller.qualified_name, callee.qualified_name, ce.confidence
 FROM call_edges ce
 JOIN definitions caller ON caller.id = ce.caller_def_id
 LEFT JOIN definitions callee ON callee.id = ce.callee_def_id
 ORDER BY caller.qualified_name;
-
--- data access (Phase 2): function reads/writes of state vars
-SELECT accessor.qualified_name AS by, target.qualified_name AS field, da.access_type
-FROM data_access da
-JOIN definitions accessor ON accessor.id = da.accessor_def_id
-JOIN definitions target   ON target.id   = da.target_def_id
-ORDER BY by, field;
 ```
 
 Re-running `make index-python` after no source changes prints
@@ -119,15 +132,30 @@ each file's contents.
 
 ## Indexing your own repo
 
+**Mode A — into the shared `tsgrep` DB:**
+
 ```sh
-.venv/bin/python -m cli.index /path/to/your/repo --repo-id 42
+make index REPO_PATH=/path/to/your/repo REPO_NAME=myrepo
 ```
 
-Add `--init-schema` on first use (or just rely on `make db-setup`). The
-walker honors per-language dependency directories so dependency caches
-(`node_modules/`, `lib/`, `.venv/`, etc.) stay unparsed; they will be
-visited only by the Phase 3 targeted resolver pass for files that are
-actually imported.
+**Mode B — into its own DB `tsgrep_myrepo` (auto-created and migrated):**
+
+```sh
+make index-isolated REPO_PATH=/path/to/your/repo REPO_NAME=myrepo
+```
+
+Or invoke the CLI directly:
+
+```sh
+.venv/bin/python -m cli.index /path/to/your/repo --repo-name myrepo
+```
+
+Add `--init-schema` on first use (or just rely on `make db-setup` for the
+shared DB / `make index-isolated` which migrates per-repo DBs
+automatically). The walker honors per-language dependency directories so
+dependency caches (`node_modules/`, `lib/`, `.venv/`, etc.) stay unparsed;
+they will be visited only by the Phase 3 targeted resolver pass for files
+that are actually imported.
 
 ---
 
@@ -234,16 +262,23 @@ the make targets and the raw CLI both read the same vars.
 
 Parses sources, builds the call graph, assembles chunks. No API calls.
 
+**Mode A — shared `tsgrep` DB (multi-repo):**
+
 ```sh
-make index-python                                  # bundled fixture, repo-id 1
-make index-solidity                                # bundled fixture, repo-id 2
-make index REPO_PATH=/path/to/repo REPO_ID=42      # any other repo
+make index-python                                          # bundled fixture
+make index-solidity                                        # bundled fixture
+make index REPO_PATH=/path/to/repo REPO_NAME=myrepo        # any other repo
 ```
 
-`REPO_ID` is just a namespace integer — pick anything; the schema uses it
-to keep multiple repos in one Postgres without colliding (uniqueness is on
-`(repo_id, path)`). If you only ever index one repo, `REPO_ID=1` is fine
-forever.
+**Mode B — per-repo DB `tsgrep_<name>` (CI / isolation):**
+
+```sh
+make index-isolated REPO_PATH=/path/to/repo REPO_NAME=myrepo
+```
+
+`REPO_NAME` is the human-readable handle; the schema's `repos` table maps
+it to the internal id used by foreign keys. List what's in a DB at any
+time with `psql -d tsgrep -c "SELECT name FROM repos"`.
 
 ### 3. Embed (Tier 3b)
 
@@ -252,15 +287,16 @@ the gateway, writes vectors to `chunk_embeddings`. Re-runs are cheap:
 unchanged chunks are skipped via `LEFT JOIN ... WHERE ce.id IS NULL`.
 
 ```sh
-make embed-python                                  # bundled fixture, secrets via pass-cli
+make embed-python                                          # bundled fixture, shared DB
 make embed-solidity
-make embed REPO_PATH=/path/to/repo REPO_ID=42      # any other repo
+make embed REPO_PATH=/path/to/repo REPO_NAME=myrepo        # any repo, shared DB
+make embed-isolated REPO_PATH=/path/to/repo REPO_NAME=myrepo  # any repo, per-repo DB
 
-make embed-python-fake                             # stub embedder, no API key needed
+make embed-python-fake                                     # stub embedder, no API key
 ```
 
-The generic `make embed` target re-runs Tier 1-3a (idempotent / cheap if
-unchanged) and then embeds — same as the fixture-specific targets.
+The `embed` / `embed-isolated` targets re-run Tier 1-3a (idempotent /
+cheap if unchanged) and then embed — same as the fixture-specific targets.
 
 ### 4. Query
 
@@ -269,13 +305,16 @@ index:
 
 ```sh
 # Semantic: pure cosine NN over chunk_embeddings.
-make query-semantic QUERY="how does the call graph link cross-module" REPO=1
+make query-semantic QUERY="how does the call graph link cross-module" REPO_NAME=myrepo
 
 # Hybrid: semantic seeds + 1-hop call-graph expansion (best general default).
-make query-hybrid   QUERY="reentrancy guard usage" REPO=2
+make query-hybrid   QUERY="reentrancy guard usage" REPO_NAME=solidity_fixture
+
+# Per-repo DB variants:
+make query-isolated-hybrid QUERY="..." REPO_NAME=myrepo
 
 # Structural: graph walk from a known definition name, no embedding needed.
-.venv/bin/python -m cli.query --repo-id 2 --structural deposit --depth 2
+.venv/bin/python -m cli.query --repo-name solidity_fixture --structural deposit --depth 2
 ```
 
 Add `--show-content` to print chunk bodies, `--top-k N` to change result
@@ -288,13 +327,15 @@ suitable for pasting into an LLM prompt.
 a single string ready to drop into a system or user message. From Python:
 
 ```python
+from cli._repo import resolve_repo_id
 from db.connection import pool_ctx
 from core.embedder import EmbedderConfig, OpenAICompatibleEmbedder
 from core.retrieval import hybrid_query, assemble_context
 
-async def get_context(repo_id: int, question: str, budget: int = 8000) -> str:
+async def get_context(repo_name: str, question: str, budget: int = 8000) -> str:
     embed_fn = OpenAICompatibleEmbedder(EmbedderConfig.from_env()).embed
     async with pool_ctx() as pool:
+        repo_id = await resolve_repo_id(pool, name=repo_name, create=False)
         chunks = await hybrid_query(pool, repo_id, question, embed_fn, top_k=10)
     return assemble_context(chunks, token_budget=budget)
 ```
@@ -322,21 +363,27 @@ make db-setup        # db-start + db-create + db-migrate
 make db-reset        # db-drop + db-create + db-migrate
 make db-psql         # interactive psql shell on tsgrep
 
-make index-python                              # index the Python fixture
-make index-solidity                            # index the Solidity fixture
-make index REPO_PATH=/path REPO_ID=N           # index any repo
+# Mode A — into the shared `tsgrep` DB
+make index-python                                       # bundled Python fixture
+make index-solidity                                     # bundled Solidity fixture
+make index REPO_PATH=/path REPO_NAME=name               # any repo
+make embed-python                                       # real embedder via pass-cli
+make embed-solidity
+make embed-python-fake                                  # deterministic stub embedder
+make embed-solidity-fake
+make embed REPO_PATH=/path REPO_NAME=name               # index + embed any repo
+make query-semantic QUERY="..." REPO_NAME=name [DB=...] # cosine NN
+make query-hybrid   QUERY="..." REPO_NAME=name [DB=...] # semantic + 1-hop graph expand
 
-make embed-python-fake                         # embed Python fixture, deterministic stub
-make embed-solidity-fake                       # ditto Solidity
-make embed-python                              # embed Python fixture, real embedder + pass-cli
-make embed-solidity                            # ditto Solidity
-make embed REPO_PATH=/path REPO_ID=N           # index + embed any repo
+# Mode B — into a per-repo DB tsgrep_<name> (auto-created and migrated)
+make index-isolated REPO_PATH=/path REPO_NAME=name
+make embed-isolated REPO_PATH=/path REPO_NAME=name
+make query-isolated-semantic QUERY="..." REPO_NAME=name
+make query-isolated-hybrid   QUERY="..." REPO_NAME=name
 
-make query-semantic QUERY="..." [REPO=N]       # cosine NN over chunk_embeddings
-make query-hybrid   QUERY="..." [REPO=N]       # semantic seeds + 1-hop graph expand
-
-make diagnose-python                           # resolution stats for repo_id 1
-make diagnose-solidity                         # resolution stats for repo_id 2
+# Diagnostics
+make diagnose-python                                    # stats for python_fixture
+make diagnose-solidity                                  # stats for solidity_fixture
 ```
 
 Override `PG_SERVICE` or `PG_DB` as `make` variables if your local setup

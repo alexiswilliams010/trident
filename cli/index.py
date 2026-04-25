@@ -1,8 +1,8 @@
 """CLI: index a repository (Tier 1 extractor + Tier 2 semantic resolver).
 
 Usage:
-    python -m cli.index <repo_path> --repo-id 1 [--dsn postgresql://...] [--init-schema]
-                        [--no-resolve]
+    python -m cli.index <repo_path> --repo-name myrepo [--dsn postgresql://...]
+                        [--init-schema] [--no-resolve]
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import asyncio
 import sys
 from pathlib import Path
 
+from cli._repo import resolve_repo_id
 from core.chunk_assembler import assemble_chunks
 from core.embedder import EmbedderConfig, OpenAICompatibleEmbedder, embed_repo_chunks, make_fake_embedder
 from core.extractor import index_repo
@@ -22,7 +23,7 @@ from db.connection import apply_migrations, pool_ctx
 
 async def _run(
     repo_path: Path,
-    repo_id: int,
+    repo_name: str,
     dsn: str | None,
     init_schema: bool,
     do_resolve: bool,
@@ -36,6 +37,11 @@ async def _run(
                 applied = await apply_migrations(conn)
                 if applied:
                     print(f"Applied migrations: {', '.join(applied)}")
+
+        repo_id = await resolve_repo_id(
+            pool, name=repo_name, root_path=str(repo_path.resolve()), create=True,
+        )
+        print(f"[repo] {repo_name} → repo_id={repo_id}")
 
         extract_result = await index_repo(pool, repo_id, repo_path)
         print(
@@ -96,7 +102,8 @@ async def _run(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="tsgrep — index a repo (Tier 1 + Tier 2)")
     parser.add_argument("repo_path", type=Path, help="Path to the repo to index")
-    parser.add_argument("--repo-id", type=int, required=True)
+    parser.add_argument("--repo-name", type=str, required=True,
+                        help="Human-readable repo name (created on first use)")
     parser.add_argument("--dsn", type=str, default=None, help="Postgres DSN (defaults to DATABASE_URL env)")
     parser.add_argument("--init-schema", action="store_true", help="Apply migrations before indexing (idempotent)")
     parser.add_argument("--no-resolve", action="store_true", help="Skip Tier 2 semantic resolution")
@@ -113,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
     return asyncio.run(
         _run(
             args.repo_path,
-            args.repo_id,
+            args.repo_name,
             args.dsn,
             args.init_schema,
             not args.no_resolve,

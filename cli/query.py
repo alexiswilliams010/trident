@@ -1,9 +1,9 @@
 """CLI: retrieve chunks from an indexed repo.
 
-    python -m cli.query --repo-id 1 --semantic "how does helper resolve?"
-    python -m cli.query --repo-id 1 --structural withdraw --depth 2
-    python -m cli.query --repo-id 1 --hybrid "reentrancy guard usage"
-    python -m cli.query --repo-id 1 --semantic "..." --fake   # uses deterministic stub embedder
+    python -m cli.query --repo-name myrepo --semantic "how does helper resolve?"
+    python -m cli.query --repo-name myrepo --structural withdraw --depth 2
+    python -m cli.query --repo-name myrepo --hybrid "reentrancy guard usage"
+    python -m cli.query --repo-name myrepo --semantic "..." --fake   # deterministic stub
 
 By default the semantic / hybrid modes use the OpenAI-compatible gateway
 configured by EMBEDDING_BASE_URL / EMBEDDING_API_KEY / EMBEDDING_MODEL.
@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import sys
 
+from cli._repo import resolve_repo_id
 from core.embedder import EmbedderConfig, OpenAICompatibleEmbedder, make_fake_embedder
 from core.retrieval import (
     RetrievedChunk,
@@ -53,21 +54,22 @@ async def _run(args: argparse.Namespace) -> int:
         embed_fn = None
 
     async with pool_ctx(args.dsn) as pool:
+        repo_id = await resolve_repo_id(pool, name=args.repo_name, create=False)
         if args.structural:
             chunks = await structural_query(
-                pool, args.repo_id, args.structural,
+                pool, repo_id, args.structural,
                 depth=args.depth, granularity=args.granularity,
             )
         elif args.semantic:
             assert embed_fn is not None
             chunks = await semantic_query(
-                pool, args.repo_id, args.semantic, embed_fn,
+                pool, repo_id, args.semantic, embed_fn,
                 top_k=args.top_k,
                 granularities=tuple(args.granularity.split(",")) if args.granularity else None,
             )
         elif args.hybrid:
             assert embed_fn is not None
-            chunks = await hybrid_query(pool, args.repo_id, args.hybrid, embed_fn, top_k=args.top_k)
+            chunks = await hybrid_query(pool, repo_id, args.hybrid, embed_fn, top_k=args.top_k)
         else:
             print("error: must pass one of --semantic / --structural / --hybrid", file=sys.stderr)
             return 2
@@ -90,7 +92,8 @@ async def _run(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="tsgrep — retrieve chunks")
-    parser.add_argument("--repo-id", type=int, required=True)
+    parser.add_argument("--repo-name", type=str, required=True,
+                        help="Repo name (must already be indexed; see `make index`)")
     parser.add_argument("--dsn", type=str, default=None)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--semantic", type=str, help="natural-language query")
