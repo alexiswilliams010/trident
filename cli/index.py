@@ -3,6 +3,14 @@
 Usage:
     python -m cli.index <repo_path> --repo-name myrepo [--dsn postgresql://...]
                         [--init-schema] [--no-resolve]
+                        [--exclude PATTERN ...] [--no-tsgrepignore]
+
+Exclusion patterns combine `.tsgrepignore` (auto-loaded from repo root) with
+any `--exclude` flags. Patterns without `/` match any path component;
+patterns with `/` match the full repo-relative path. Examples:
+    --exclude '*.t.sol'     # Foundry test files anywhere
+    --exclude test          # any directory or file named `test`
+    --exclude src/legacy    # exact relative path
 """
 
 from __future__ import annotations
@@ -16,6 +24,7 @@ from cli._repo import resolve_repo_id
 from core.chunk_assembler import assemble_chunks
 from core.embedder import EmbedderConfig, OpenAICompatibleEmbedder, embed_repo_chunks, make_fake_embedder
 from core.extractor import index_repo
+from core.file_walker import WalkConfig, read_tsgrepignore
 from core.heuristic_resolver import resolve_repo_imports
 from core.semantic_resolver import resolve_repo
 from db.connection import apply_migrations, pool_ctx
@@ -30,6 +39,8 @@ async def _run(
     do_imports: bool,
     do_chunks: bool,
     do_embed: str | None,
+    exclude_patterns: tuple[str, ...],
+    use_tsgrepignore: bool,
 ) -> int:
     async with pool_ctx(dsn) as pool:
         if init_schema:
@@ -43,7 +54,20 @@ async def _run(
         )
         print(f"[repo] {repo_name} → repo_id={repo_id}")
 
-        extract_result = await index_repo(pool, repo_id, repo_path)
+        # Build the walk config: defaults + .tsgrepignore (if present) + --exclude flags.
+        walk_cfg = WalkConfig.with_defaults(repo_path)
+        all_excludes: list[str] = []
+        if use_tsgrepignore:
+            ignore_patterns = read_tsgrepignore(repo_path)
+            if ignore_patterns:
+                all_excludes.extend(ignore_patterns)
+                print(f"[walk] loaded {len(ignore_patterns)} pattern(s) from .tsgrepignore")
+        all_excludes.extend(exclude_patterns)
+        if all_excludes:
+            walk_cfg.exclude_patterns = tuple(all_excludes)
+            print(f"[walk] excluding: {', '.join(all_excludes)}")
+
+        extract_result = await index_repo(pool, repo_id, repo_path, walk_config=walk_cfg)
         print(
             f"[Tier 1] Indexed {len(extract_result.indexed)} files "
             f"({extract_result.total_nodes} nodes); skipped {len(extract_result.skipped)} unchanged"
@@ -113,6 +137,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-chunks", action="store_true", help="Skip Tier 3 chunk assembly")
     parser.add_argument("--embed", choices=["real", "fake"], default=None,
                         help="Run embedding step. 'real' uses EMBEDDING_BASE_URL/API_KEY/MODEL; 'fake' is the deterministic stub.")
+    parser.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
+                        type=lambda s: [p.strip() for p in s.split(",") if p.strip()],
+                        help="Glob(s) to skip. Repeatable; comma-separates also fine. "
+                             "No-slash patterns match any path component; "
+                             "with-slash patterns match the full repo-relative path.")
+    parser.add_argument("--no-tsgrepignore", action="store_true",
+                        help="Don't auto-load .tsgrepignore from the repo root.")
     args = parser.parse_args(argv)
 
     if not args.repo_path.is_dir():
@@ -129,6 +160,8 @@ def main(argv: list[str] | None = None) -> int:
             not args.no_imports,
             not args.no_chunks,
             args.embed,
+            tuple(p for group in args.exclude for p in group),
+            not args.no_tsgrepignore,
         )
     )
 

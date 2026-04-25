@@ -5,14 +5,26 @@ Yields source files for indexing while skipping dependency directories
 and is loaded from YAML configs in Phase 3. For Phase 1 we provide sensible
 hard-coded defaults so the walker is usable before YAML configs exist.
 
+User-defined exclusions are supported via two channels: a `.tsgrepignore`
+file at the repo root and per-invocation `--exclude` CLI flags. Patterns are
+fnmatch-style globs:
+
+  - Patterns containing `/` match against the full repo-relative path
+    (e.g. `src/test/*` matches files under that exact directory).
+  - Patterns without `/` match against any path component (e.g. `test`
+    matches every directory or file named `test` at any depth; `*.t.sol`
+    matches every Foundry test file anywhere).
+
 A second method, `walk_dependency_files`, is used by Phase 3's targeted
 dependency pass to read explicitly-named files inside dep dirs (e.g. an
 import resolver tells us "we need lib/forge-std/src/Test.sol" — that file
-gets yielded even though `lib/` is otherwise pruned).
+gets yielded even though `lib/` is otherwise pruned). Exclusion patterns
+do not apply to that pass.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +50,8 @@ DEFAULT_DEP_PATHS: dict[str, tuple[str, ...]] = {
     "solidity": ("lib", "node_modules", "out", "cache", "artifacts"),
 }
 
+TSGREP_IGNORE_FILE = ".tsgrepignore"
+
 
 @dataclass
 class WalkConfig:
@@ -46,6 +60,8 @@ class WalkConfig:
     dep_paths: dict[str, set[str]] = field(default_factory=dict)
     # If True, also skip dotfile dirs (e.g. .next, .cache).
     skip_hidden: bool = True
+    # User-defined exclusion patterns (from .tsgrepignore + --exclude flags).
+    exclude_patterns: tuple[str, ...] = ()
 
     @classmethod
     def with_defaults(cls, repo_root: str | Path) -> "WalkConfig":
@@ -61,6 +77,47 @@ class WalkConfig:
         return merged
 
 
+def read_tsgrepignore(repo_root: str | Path) -> tuple[str, ...]:
+    """Return the list of patterns from `.tsgrepignore` at the repo root.
+
+    Empty lines and lines starting with `#` are skipped. Trailing slashes are
+    stripped (the directory-vs-file distinction is handled by the caller).
+    Returns an empty tuple if the file is absent.
+    """
+    path = Path(repo_root) / TSGREP_IGNORE_FILE
+    if not path.is_file():
+        return ()
+    out: list[str] = []
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.endswith("/"):
+            line = line[:-1]
+        out.append(line)
+    return tuple(out)
+
+
+def _matches_excludes(rel_path: str, patterns: tuple[str, ...]) -> bool:
+    """True if any pattern matches `rel_path` (forward-slash separated).
+
+    Convention:
+      - Pattern with `/` → match against full rel_path (fnmatch).
+      - Pattern without `/` → match against any path component (basename match).
+    """
+    if not patterns:
+        return False
+    components = rel_path.split("/")
+    for pat in patterns:
+        if "/" in pat:
+            if fnmatch.fnmatchcase(rel_path, pat):
+                return True
+        else:
+            if any(fnmatch.fnmatchcase(c, pat) for c in components):
+                return True
+    return False
+
+
 @dataclass
 class DiscoveredFile:
     path: Path           # absolute path
@@ -69,20 +126,29 @@ class DiscoveredFile:
 
 
 def walk_repo(config: WalkConfig) -> Iterator[DiscoveredFile]:
-    """Yield source files in `config.repo_root`, pruning dep + ignored dirs."""
+    """Yield source files in `config.repo_root`, pruning dep + ignored dirs
+    and applying any user `exclude_patterns`."""
     root = config.repo_root
     if not root.is_dir():
         raise ValueError(f"repo_root not a directory: {root}")
 
     skip_dirs = ALWAYS_IGNORED | config.all_dep_dirs()
+    excludes = config.exclude_patterns
 
     for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = Path(dirpath).relative_to(root).as_posix()
+        if rel_dir == ".":
+            rel_dir = ""
+
         # Prune in-place so os.walk does not descend.
         pruned: list[str] = []
         for d in list(dirnames):
             if d in skip_dirs:
                 continue
             if config.skip_hidden and d.startswith("."):
+                continue
+            sub_rel = f"{rel_dir}/{d}" if rel_dir else d
+            if _matches_excludes(sub_rel, excludes):
                 continue
             pruned.append(d)
         dirnames[:] = pruned
@@ -93,6 +159,8 @@ def walk_repo(config: WalkConfig) -> Iterator[DiscoveredFile]:
             if lang is None:
                 continue
             rel = full.relative_to(root).as_posix()
+            if _matches_excludes(rel, excludes):
+                continue
             yield DiscoveredFile(path=full, rel_path=rel, language=lang)
 
 
@@ -135,7 +203,9 @@ __all__ = [
     "ALWAYS_IGNORED",
     "DEFAULT_DEP_PATHS",
     "DiscoveredFile",
+    "TSGREP_IGNORE_FILE",
     "WalkConfig",
+    "read_tsgrepignore",
     "walk_dependency_files",
     "walk_repo",
     "LANGUAGES",

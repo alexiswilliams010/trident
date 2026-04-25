@@ -119,6 +119,11 @@ SOLIDITY_REPO_NAME ?= solidity_fixture
 REPO_PATH ?=
 REPO_NAME ?=
 QUERY     ?=
+EXCLUDE   ?=
+
+# When EXCLUDE is set, expand to a single --exclude flag carrying the
+# comma-separated value (argparse splits on comma).
+EXCLUDE_FLAG := $(if $(EXCLUDE),--exclude '$(EXCLUDE)',)
 
 index-python: ## Index the Python test fixture into the shared DB.
 	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.index $(PYTHON_FIXTURE) --repo-name $(PYTHON_REPO_NAME)
@@ -140,17 +145,17 @@ embed-solidity: ## Embed Solidity fixture chunks (real embedder, secrets via pas
 
 # Generic targets — any repo into $(DB) (default `tsgrep`).
 #   make index REPO_PATH=/path REPO_NAME=name [DB=tsgrep_other]
-index: ## Index any repo into $(DB). REPO_PATH=/path REPO_NAME=name
+index: ## Index any repo into $(DB). REPO_PATH=/path REPO_NAME=name [EXCLUDE='pat1,pat2']
 	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
-		echo 'usage: make index REPO_PATH=/path REPO_NAME=name'; exit 2; \
+		echo 'usage: make index REPO_PATH=/path REPO_NAME=name [EXCLUDE=...]'; exit 2; \
 	fi
-	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME)
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) $(EXCLUDE_FLAG)
 
-embed: ## Index + embed any repo into $(DB) (real embedder, secrets via pass-cli). REPO_PATH=/path REPO_NAME=name
+embed: ## Index + embed any repo into $(DB) (real embedder, secrets via pass-cli). REPO_PATH=/path REPO_NAME=name [EXCLUDE='pat1,pat2']
 	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
-		echo 'usage: make embed REPO_PATH=/path REPO_NAME=name'; exit 2; \
+		echo 'usage: make embed REPO_PATH=/path REPO_NAME=name [EXCLUDE=...]'; exit 2; \
 	fi
-	$(call inject_and_run,$(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) --embed real)
+	$(call inject_and_run,$(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) --embed real $(EXCLUDE_FLAG))
 
 query-semantic: ## Semantic query. QUERY="..." REPO_NAME=name [DB=...]
 	@if [ -z "$(QUERY)" ] || [ -z "$(REPO_NAME)" ]; then \
@@ -184,19 +189,19 @@ db-ensure-isolated: ## Create (idempotent) and migrate tsgrep_$(REPO_NAME).
 	@createdb tsgrep_$(REPO_NAME) 2>/dev/null || true
 	@$(MAKE) --no-print-directory db-migrate PG_DB=tsgrep_$(REPO_NAME)
 
-index-isolated: ## Index any repo into its own DB tsgrep_$(REPO_NAME). REPO_PATH=/path REPO_NAME=name
+index-isolated: ## Index any repo into its own DB tsgrep_$(REPO_NAME). REPO_PATH=/path REPO_NAME=name [EXCLUDE=...]
 	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
-		echo 'usage: make index-isolated REPO_PATH=/path REPO_NAME=name'; exit 2; \
+		echo 'usage: make index-isolated REPO_PATH=/path REPO_NAME=name [EXCLUDE=...]'; exit 2; \
 	fi
 	@$(MAKE) --no-print-directory db-ensure-isolated REPO_NAME=$(REPO_NAME)
-	@$(MAKE) --no-print-directory index REPO_PATH=$(REPO_PATH) REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME)
+	@$(MAKE) --no-print-directory index REPO_PATH=$(REPO_PATH) REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME) EXCLUDE='$(EXCLUDE)'
 
-embed-isolated: ## Index + embed any repo into its own DB. REPO_PATH=/path REPO_NAME=name
+embed-isolated: ## Index + embed any repo into its own DB. REPO_PATH=/path REPO_NAME=name [EXCLUDE=...]
 	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
-		echo 'usage: make embed-isolated REPO_PATH=/path REPO_NAME=name'; exit 2; \
+		echo 'usage: make embed-isolated REPO_PATH=/path REPO_NAME=name [EXCLUDE=...]'; exit 2; \
 	fi
 	@$(MAKE) --no-print-directory db-ensure-isolated REPO_NAME=$(REPO_NAME)
-	@$(MAKE) --no-print-directory embed REPO_PATH=$(REPO_PATH) REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME)
+	@$(MAKE) --no-print-directory embed REPO_PATH=$(REPO_PATH) REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME) EXCLUDE='$(EXCLUDE)'
 
 query-isolated-semantic: ## Semantic query against per-repo DB. QUERY="..." REPO_NAME=name
 	@$(MAKE) --no-print-directory query-semantic QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME)
