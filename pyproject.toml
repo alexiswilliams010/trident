@@ -1,0 +1,38 @@
+[project]
+name = "tsgrep"
+version = "0.1.0"
+description = "Tree-sitter semantic code graph + vector embedding pipeline"
+requires-python = ">=3.12"
+dependencies = [
+    "tree-sitter>=0.22",
+    "tree-sitter-python>=0.21",
+    "tree-sitter-solidity>=1.2",
+    "asyncpg>=0.29",
+    "pgvector>=0.2.5",
+    "pyyaml>=6.0",
+    "jsonschema>=4.21",
+    "tiktoken>=0.6",
+    "openai>=1.12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.3",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["core*", "cli*", "db*"]
