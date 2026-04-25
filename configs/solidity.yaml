@@ -1,0 +1,97 @@
+language: solidity
+
+dependency_paths:
+  - lib              # Foundry convention
+  - node_modules     # Hardhat / npm-published Solidity packages
+  - out              # Foundry build output
+  - cache
+  - artifacts
+
+module_node_type: source_file
+
+definitions:
+  - node_type: contract_declaration
+    kind: contract
+    name_field: name
+    scope_boundary: true
+
+  - node_type: interface_declaration
+    kind: interface
+    name_field: name
+    scope_boundary: true
+
+  - node_type: library_declaration
+    kind: library
+    name_field: name
+    scope_boundary: true
+
+  - node_type: function_definition
+    kind: function
+    name_field: name
+    scope_boundary: true
+    visibility_field: visibility
+
+  - node_type: constructor_definition
+    kind: constructor
+    scope_boundary: true
+
+  - node_type: modifier_definition
+    kind: modifier
+    name_field: name
+    scope_boundary: true
+
+  - node_type: state_variable_declaration
+    kind: state_variable
+    name_field: name
+
+  - node_type: event_definition
+    kind: event
+    name_field: name
+
+  - node_type: error_declaration
+    kind: error
+    name_field: name
+
+  - node_type: struct_declaration
+    kind: struct
+    name_field: name
+
+  - node_type: enum_declaration
+    kind: enum
+    name_field: name
+
+references:
+  - node_type: identifier
+    exclude_parent_field:
+      - contract_declaration.name
+      - interface_declaration.name
+      - library_declaration.name
+      - function_definition.name
+      - modifier_definition.name
+      - state_variable_declaration.name
+      - event_definition.name
+      - error_declaration.name
+      - struct_declaration.name
+      - enum_declaration.name
+      - parameter.name
+      - member_expression.property
+    confidence: certain
+
+  - node_type: member_expression
+    name_field: property
+    confidence: inferred
+
+calls:
+  # Plain calls: `transfer(...)`, `token.transfer(...)`
+  - node_type: call_expression
+    function_field: function
+
+  # `emit Foo(...)` — `name` field on the emit_statement holds the event name expression.
+  - node_type: emit_statement
+    function_field: name
+
+data_access:
+  target_kinds: [state_variable]
+  write_when_parent_field:
+    - assignment_expression.left
+    - augmented_assignment_expression.left

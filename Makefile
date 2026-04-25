@@ -31,6 +31,9 @@ test: ## Run all pytest tests.
 test-extractor: ## Run only Phase 1 extractor tests.
 	@$(PYTHON) -m pytest -v tests/test_extractor.py
 
+test-resolver: ## Run only Phase 2 semantic resolver tests.
+	@$(PYTHON) -m pytest -v tests/test_semantic_resolver.py
+
 # ------------------------------------------------------------------------------
 # Local PostgreSQL (Homebrew). Override PG_SERVICE / PG_DB as needed.
 # ------------------------------------------------------------------------------

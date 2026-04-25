@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "tsgrep language config",
+  "type": "object",
+  "required": ["language", "module_node_type", "definitions", "references"],
+  "additionalProperties": false,
+  "properties": {
+    "language": { "type": "string" },
+    "module_node_type": {
+      "type": "string",
+      "description": "Tree-sitter root node type (e.g. 'module' for Python, 'source_file' for Solidity)."
+    },
+    "dependency_paths": {
+      "type": "array",
+      "description": "Directory names pruned during the initial repo walk (Phase 3 uses these too).",
+      "items": { "type": "string" }
+    },
+    "definitions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["node_type", "kind"],
+        "additionalProperties": false,
+        "properties": {
+          "node_type": { "type": "string" },
+          "kind": { "type": "string" },
+          "name_field": { "type": "string" },
+          "scope_boundary": { "type": "boolean", "default": false },
+          "visibility_field": { "type": "string" },
+          "require_enclosing_scope_kind": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
+    "references": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["node_type"],
+        "additionalProperties": false,
+        "properties": {
+          "node_type": { "type": "string" },
+          "name_field": { "type": "string" },
+          "exclude_parent_field": {
+            "type": "array",
+            "description": "Skip when this node sits in the named field of a given parent type (e.g. 'function_definition.name').",
+            "items": { "type": "string", "pattern": "^[a-z_]+\\.[a-z_]+$" }
+          },
+          "confidence": {
+            "type": "string",
+            "enum": ["certain", "inferred", "uncertain"],
+            "default": "certain"
+          }
+        }
+      }
+    },
+    "calls": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["node_type", "function_field"],
+        "additionalProperties": false,
+        "properties": {
+          "node_type": { "type": "string" },
+          "function_field": { "type": "string" },
+          "name_field": {
+            "type": "string",
+            "description": "If the function expression has its own name field (e.g. emit_statement.name), use that instead."
+          }
+        }
+      }
+    },
+    "data_access": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target_kinds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "write_when_parent_field": {
+          "type": "array",
+          "description": "Reference is a write when the node sits in this parent field (e.g. 'assignment.left').",
+          "items": { "type": "string", "pattern": "^[a-z_]+\\.[a-z_]+$" }
+        }
+      }
+    },
+    "imports": {
+      "type": "object",
+      "description": "Reserved for Phase 3. Tier 2 ignores this block.",
+      "additionalProperties": true
+    }
+  }
+}

@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS definitions (
     kind            TEXT NOT NULL,
     name            TEXT NOT NULL,
     qualified_name  TEXT,
-    scope_id        BIGINT REFERENCES definitions(id),
+    scope_id        BIGINT REFERENCES definitions(id) ON DELETE SET NULL,
     visibility      TEXT
 );
 
@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS "references" (
     id                    BIGSERIAL PRIMARY KEY,
     node_id               BIGINT REFERENCES nodes(id) ON DELETE CASCADE,
     file_id               BIGINT REFERENCES files(id) ON DELETE CASCADE,
-    target_def_id         BIGINT REFERENCES definitions(id),
+    target_def_id         BIGINT REFERENCES definitions(id) ON DELETE SET NULL,
     name                  TEXT NOT NULL,
     resolution_confidence FLOAT DEFAULT 1.0
 );
@@ -92,11 +92,11 @@ CREATE TABLE IF NOT EXISTS imports (
     file_id          BIGINT REFERENCES files(id) ON DELETE CASCADE,
     node_id          BIGINT REFERENCES nodes(id) ON DELETE CASCADE,
     import_path      TEXT NOT NULL,
-    resolved_file_id BIGINT REFERENCES files(id),
+    resolved_file_id BIGINT REFERENCES files(id) ON DELETE SET NULL,
     imported_names   TEXT[],
     dep_class        TEXT NOT NULL DEFAULT 'unknown'
                      CHECK (dep_class IN ('intra_repo', 'external', 'unresolved')),
-    external_dep_id  BIGINT REFERENCES external_dependencies(id)
+    external_dep_id  BIGINT REFERENCES external_dependencies(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_imports_file       ON imports(file_id);
@@ -106,8 +106,8 @@ CREATE INDEX IF NOT EXISTS idx_imports_dep_class  ON imports(dep_class);
 CREATE TABLE IF NOT EXISTS call_edges (
     id               BIGSERIAL PRIMARY KEY,
     callsite_node_id BIGINT REFERENCES nodes(id) ON DELETE CASCADE,
-    caller_def_id    BIGINT REFERENCES definitions(id),
-    callee_def_id    BIGINT REFERENCES definitions(id),
+    caller_def_id    BIGINT REFERENCES definitions(id) ON DELETE CASCADE,
+    callee_def_id    BIGINT REFERENCES definitions(id) ON DELETE SET NULL,
     confidence       TEXT NOT NULL DEFAULT 'certain'
                      CHECK (confidence IN ('certain', 'inferred', 'uncertain'))
 );
@@ -118,10 +118,10 @@ CREATE INDEX IF NOT EXISTS idx_call_edges_confidence ON call_edges(confidence);
 
 CREATE TABLE IF NOT EXISTS data_access (
     id              BIGSERIAL PRIMARY KEY,
-    accessor_def_id BIGINT REFERENCES definitions(id),
-    target_def_id   BIGINT REFERENCES definitions(id),
+    accessor_def_id BIGINT REFERENCES definitions(id) ON DELETE CASCADE,
+    target_def_id   BIGINT REFERENCES definitions(id) ON DELETE CASCADE,
     access_type     TEXT NOT NULL CHECK (access_type IN ('read', 'write', 'readwrite')),
-    node_id         BIGINT REFERENCES nodes(id)
+    node_id         BIGINT REFERENCES nodes(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_data_access_accessor ON data_access(accessor_def_id);
@@ -134,7 +134,7 @@ CREATE INDEX IF NOT EXISTS idx_data_access_target   ON data_access(target_def_id
 CREATE TABLE IF NOT EXISTS chunks (
     id            BIGSERIAL PRIMARY KEY,
     file_id       BIGINT REFERENCES files(id) ON DELETE CASCADE,
-    anchor_def_id BIGINT REFERENCES definitions(id),
+    anchor_def_id BIGINT REFERENCES definitions(id) ON DELETE CASCADE,
     granularity   TEXT NOT NULL,
     content       TEXT NOT NULL,
     token_count   INT,

@@ -5,9 +5,6 @@ repository into a relational graph (Tier 1 syntactic CST → Tier 2 semantic
 edges → Tier 3 chunks + embeddings) so an LLM can retrieve coherent
 multi-file context instead of token-window slop.
 
-See `Architecture.md` for the full design. Currently **Phase 1 (Tier 1
-extractor) is implemented**; Phases 2–4 are next.
-
 ---
 
 ## Prerequisites
@@ -47,6 +44,7 @@ the `DATABASE_URL` env var if needed.
 ```sh
 make test            # full pytest suite
 make test-extractor  # Phase 1 extractor tests only
+make test-resolver   # Phase 2 semantic resolver tests only
 ```
 
 Tests that need Postgres connect via the same DSN; they auto-skip with a
@@ -75,12 +73,24 @@ SELECT repo_id, language, COUNT(*) FROM files GROUP BY repo_id, language;
 SELECT f.repo_id, COUNT(n.id) FROM nodes n
 JOIN files f ON f.id = n.file_id GROUP BY f.repo_id;
 
--- function/class definitions in main.py
-SELECT n.node_type, n.start_row
-FROM nodes n JOIN files f ON f.id = n.file_id
-WHERE f.path = 'mypackage/main.py'
-  AND n.node_type IN ('class_definition','function_definition')
-ORDER BY n.start_byte;
+-- definitions with qualified names (Phase 2)
+SELECT d.kind, d.qualified_name FROM definitions d
+JOIN files f ON f.id = d.file_id
+WHERE f.repo_id = 1 ORDER BY d.id;
+
+-- call graph (Phase 2): caller → callee with confidence
+SELECT caller.qualified_name, callee.qualified_name, ce.confidence
+FROM call_edges ce
+JOIN definitions caller ON caller.id = ce.caller_def_id
+LEFT JOIN definitions callee ON callee.id = ce.callee_def_id
+ORDER BY caller.qualified_name;
+
+-- data access (Phase 2): function reads/writes of state vars
+SELECT accessor.qualified_name AS by, target.qualified_name AS field, da.access_type
+FROM data_access da
+JOIN definitions accessor ON accessor.id = da.accessor_def_id
+JOIN definitions target   ON target.id   = da.target_def_id
+ORDER BY by, field;
 ```
 
 Re-running `make index-python` after no source changes prints
@@ -138,10 +148,17 @@ tsgrep/
 ├── Makefile                 # uv + Postgres + index helpers
 ├── Architecture.md          # full design doc (8 phases)
 │
+├── configs/
+│   ├── _schema.json         # JSON Schema validating language YAMLs
+│   ├── python.yaml          # Phase 2 rules for Python
+│   └── solidity.yaml        # Phase 2 rules for Solidity
+│
 ├── core/
 │   ├── extractor.py         # Phase 1: Tree-sitter -> nodes table
 │   ├── file_walker.py       # Phase 1: dep-aware repo walker
-│   └── grammar_meta.py      # Language registry (Python, Solidity)
+│   ├── grammar_meta.py      # Language registry (Python, Solidity)
+│   ├── config_loader.py     # Phase 2: YAML loader + validation
+│   └── semantic_resolver.py # Phase 2: defs / refs / calls / data_access
 │
 ├── db/
 │   ├── connection.py        # asyncpg pool + migration runner
@@ -154,6 +171,7 @@ tsgrep/
 └── tests/
     ├── conftest.py
     ├── test_extractor.py
+    ├── test_semantic_resolver.py
     └── fixtures/
         ├── python_fixture/             # multi-file package + .venv decoy
         └── solidity_foundry_fixture/   # foundry layout + lib/ decoy
@@ -166,8 +184,8 @@ tsgrep/
 | Phase | Description | Status |
 |---|---|---|
 | 1 | Tier 1 extractor + DB schema | done |
-| 2 | YAML-driven semantic resolver (definitions, references, scopes, calls) | next |
-| 3 | Heuristic cross-file import resolution | pending |
+| 2 | YAML-driven semantic resolver (definitions, references, scopes, calls, data access) | done |
+| 3 | Heuristic cross-file import resolution | next |
 | 4 | Graph-informed chunk assembly + embeddings + retrieval | pending |
 
 Phase 5+ (eval harness, Deno resolver sandbox, additional languages) are

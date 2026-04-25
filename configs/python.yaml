@@ -1,0 +1,59 @@
+language: python
+
+# Phase 3 will use this; declared here so file_walker can pull it from one place.
+dependency_paths:
+  - venv
+  - .venv
+  - env
+  - .env
+  - site-packages
+
+# Tree-sitter root node type. The resolver creates a synthetic "module"
+# definition anchored on this node and uses it as the global scope owner.
+module_node_type: module
+
+definitions:
+  - node_type: function_definition
+    kind: function
+    name_field: name
+    scope_boundary: true
+
+  - node_type: class_definition
+    kind: class
+    name_field: name
+    scope_boundary: true
+
+  # Top-level / class-level assignments only — assignments inside a function
+  # body are local variables and are not promoted to definitions.
+  - node_type: assignment
+    kind: variable
+    name_field: left
+    require_enclosing_scope_kind: [module, class]
+
+references:
+  - node_type: identifier
+    exclude_parent_field:
+      - function_definition.name
+      - class_definition.name
+      - parameter.name
+      - default_parameter.name
+      - typed_parameter.name
+      - keyword_argument.name
+      - assignment.left
+      - augmented_assignment.left
+      - attribute.attribute   # x.y → resolved by the attribute rule below
+    confidence: certain
+
+  - node_type: attribute
+    name_field: attribute
+    confidence: inferred
+
+calls:
+  - node_type: call
+    function_field: function
+
+data_access:
+  target_kinds: [variable, state_variable]
+  write_when_parent_field:
+    - assignment.left
+    - augmented_assignment.left

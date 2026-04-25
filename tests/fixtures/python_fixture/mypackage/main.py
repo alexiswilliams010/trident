@@ -22,3 +22,8 @@ class Calculator:
 def run() -> int:
     calc = Calculator(10)
     return calc.add(5)
+
+
+def greet() -> str:
+    # Reads top-level GREETING — should produce a data_access row (read).
+    return GREETING + "!"
