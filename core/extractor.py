@@ -129,8 +129,9 @@ async def index_file(
         from_dependency,
     )
 
-    # Parse with the language's grammar.
-    parser = LANGUAGES[discovered.language].parser()
+    # Parse with the language's grammar. Pass the file extension so multi-grammar
+    # languages (TypeScript: .ts vs .tsx) pick the right sub-grammar.
+    parser = LANGUAGES[discovered.language].parser(Path(discovered.rel_path).suffix.lower())
     tree = parser.parse(raw)
 
     walk = _walk_tree(tree.root_node)

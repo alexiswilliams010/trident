@@ -27,12 +27,26 @@ class LanguageSpec:
     extensions: tuple[str, ...]
     module_name: str  # e.g. "tree_sitter_python"
     language_attr: str = "language"  # function in the module returning the language ptr
+    # Optional per-extension override. Used for TypeScript, where the same
+    # `tree_sitter_typescript` package ships two grammars: language_typescript()
+    # for `.ts` and language_tsx() for `.tsx`. Keys must include a leading dot.
+    extension_to_language_attr: tuple[tuple[str, str], ...] = ()
 
-    def language(self) -> Language:
-        return _load_language(self)
+    def language(self, extension: str | None = None) -> Language:
+        attr = self._attr_for_extension(extension)
+        return _load_language_attr(self.module_name, attr)
 
-    def parser(self) -> Parser:
-        return Parser(self.language())
+    def parser(self, extension: str | None = None) -> Parser:
+        return Parser(self.language(extension))
+
+    def _attr_for_extension(self, extension: str | None) -> str:
+        if extension is None or not self.extension_to_language_attr:
+            return self.language_attr
+        ext = extension.lower()
+        for k, v in self.extension_to_language_attr:
+            if k == ext:
+                return v
+        return self.language_attr
 
 
 # Module-level registry. Adding a language = one entry here + a YAML config.
@@ -52,6 +66,21 @@ LANGUAGES: dict[str, LanguageSpec] = {
         extensions=(".go",),
         module_name="tree_sitter_go",
     ),
+    "javascript": LanguageSpec(
+        name="javascript",
+        extensions=(".js", ".jsx", ".mjs", ".cjs"),
+        module_name="tree_sitter_javascript",
+    ),
+    "typescript": LanguageSpec(
+        name="typescript",
+        extensions=(".ts", ".tsx"),
+        module_name="tree_sitter_typescript",
+        language_attr="language_typescript",
+        extension_to_language_attr=(
+            (".ts", "language_typescript"),
+            (".tsx", "language_tsx"),
+        ),
+    ),
 }
 
 
@@ -66,10 +95,21 @@ def language_for_path(path: str | Path) -> str | None:
     return _EXT_TO_LANG.get(suffix)
 
 
+def parser_for_path(path: str | Path) -> Parser | None:
+    """Return a tree-sitter Parser configured with the right grammar for `path`,
+    honoring per-extension grammar selection (e.g. `.tsx` vs `.ts`).
+    Returns None if the path's language is unsupported."""
+    suffix = Path(path).suffix.lower()
+    lang = _EXT_TO_LANG.get(suffix)
+    if lang is None:
+        return None
+    return LANGUAGES[lang].parser(suffix)
+
+
 @cache
-def _load_language(spec: LanguageSpec) -> Language:
-    mod = import_module(spec.module_name)
-    fn: Callable[[], object] = getattr(mod, spec.language_attr)
+def _load_language_attr(module_name: str, attr: str) -> Language:
+    mod = import_module(module_name)
+    fn: Callable[[], object] = getattr(mod, attr)
     return Language(fn())
 
 

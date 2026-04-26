@@ -49,6 +49,8 @@ DEFAULT_DEP_PATHS: dict[str, tuple[str, ...]] = {
     "python": ("venv", ".venv", "site-packages", "env", ".env"),
     "solidity": ("lib", "node_modules", "out", "cache", "artifacts"),
     "go": ("vendor",),
+    "javascript": ("node_modules", "dist", "build", "out", "coverage", ".next", ".nuxt"),
+    "typescript": ("node_modules", "dist", "build", "out", "coverage", ".next", ".nuxt"),
 }
 
 TSGREP_IGNORE_FILE = ".tsgrepignore"

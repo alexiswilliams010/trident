@@ -77,6 +77,10 @@ class InheritanceConfig:
     # Go embedded struct fields, which are `field_declaration` nodes lacking a
     # `name` field — distinguishing them from regular named fields.
     child_only_when_field_absent: str | None = None
+    # When true, after a `child_node_type` match, iterate ITS named children and
+    # emit one base per child. Used for TS `implements_clause` and
+    # `extends_type_clause`, which wrap multiple identifiers under one node.
+    child_iterate_identifiers: bool = False
 
 
 @dataclass(frozen=True)
@@ -184,6 +188,7 @@ def load_language_config(language: str, configs_dir: Path | None = None) -> Lang
                 child_via_field=r.get("child_via_field"),
                 child_via_node_type=r.get("child_via_node_type"),
                 child_only_when_field_absent=r.get("child_only_when_field_absent"),
+                child_iterate_identifiers=r.get("child_iterate_identifiers", False),
             )
         )
 

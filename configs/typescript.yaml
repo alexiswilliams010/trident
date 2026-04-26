@@ -1,0 +1,145 @@
+language: typescript
+
+dependency_paths:
+  - node_modules
+  - dist
+  - build
+  - out
+  - coverage
+  - .next
+  - .nuxt
+
+module_node_type: program
+
+definitions:
+  - node_type: function_declaration
+    kind: function
+    name_field: name
+    scope_boundary: true
+
+  - node_type: generator_function_declaration
+    kind: function
+    name_field: name
+    scope_boundary: true
+
+  - node_type: class_declaration
+    kind: class
+    name_field: name
+    scope_boundary: true
+
+  # `abstract class Foo { ... }` — distinct node type in TS. Same shape as
+  # class_declaration with the extra `abstract` keyword child.
+  - node_type: abstract_class_declaration
+    kind: class
+    name_field: name
+    scope_boundary: true
+
+  - node_type: method_definition
+    kind: method
+    name_field: name
+    scope_boundary: true
+
+  # Interface methods: `interface Greeter { greet(name: string): string; }`.
+  # Same kind=method as concrete `method_definition` so override generation
+  # (which matches by name+kind across child→ancestors) connects an
+  # implementing class's method to the interface's signature.
+  - node_type: method_signature
+    kind: method
+    name_field: name
+
+  # TS-only: interfaces, type aliases, enums.
+  - node_type: interface_declaration
+    kind: interface
+    name_field: name
+    scope_boundary: true
+
+  - node_type: type_alias_declaration
+    kind: type
+    name_field: name
+
+  - node_type: enum_declaration
+    kind: enum
+    name_field: name
+    scope_boundary: true
+
+  - node_type: variable_declarator
+    kind: variable
+    name_field: name
+    require_enclosing_scope_kind: [module]
+
+references:
+  - node_type: identifier
+    exclude_parent_field:
+      - function_declaration.name
+      - generator_function_declaration.name
+      - class_declaration.name
+      - abstract_class_declaration.name
+      - enum_declaration.name
+      - variable_declarator.name
+      - import_specifier.name
+      - import_specifier.alias
+      - namespace_import.name
+      - namespace_export.name
+      - export_specifier.name
+      - export_specifier.alias
+    confidence: certain
+
+  # TS uses `type_identifier` for class names, interface names, type
+  # parameters, and most type positions. Excluding the binding sites leaves
+  # only the use sites — including those inside `extends_type_clause` /
+  # `implements_clause`, which is exactly the cross-file refs we want
+  # populated for inheritance linking.
+  - node_type: type_identifier
+    exclude_parent_field:
+      - class_declaration.name
+      - abstract_class_declaration.name
+      - interface_declaration.name
+      - type_alias_declaration.name
+    confidence: certain
+
+  - node_type: member_expression
+    name_field: property
+    confidence: inferred
+
+  - node_type: property_identifier
+    exclude_parent_field:
+      - method_definition.name
+      - field_definition.name
+      - public_field_definition.name
+      - method_signature.name
+      - property_signature.name
+      - pair.key
+      - member_expression.property
+    confidence: inferred
+
+calls:
+  - node_type: call_expression
+    function_field: function
+
+imports:
+  node_types:
+    - import_statement
+    - export_statement
+    - call_expression
+
+inheritance:
+  # 1) class extends X — same shape as JS. _terminal_identifier handles both
+  # the JS form (direct identifier child) and the TS form (extends_clause
+  # wrapper with `value` field).
+  - parent_node_types: [class_declaration, abstract_class_declaration]
+    child_node_type: class_heritage
+
+  # 2) class implements I, J — sibling of extends_clause inside class_heritage.
+  # Drill into class_heritage non-field child, find implements_clause among
+  # its children, then iterate ITS children for type_identifier names.
+  - parent_node_types: [class_declaration, abstract_class_declaration]
+    child_via_node_type: class_heritage
+    child_node_type: implements_clause
+    child_iterate_identifiers: true
+
+  # 3) interface X extends A, B — extends_type_clause is a direct child of
+  # interface_declaration with N type_identifier children (each in field
+  # `type`). Iterate them.
+  - parent_node_types: [interface_declaration]
+    child_node_type: extends_type_clause
+    child_iterate_identifiers: true

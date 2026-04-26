@@ -1,0 +1,96 @@
+language: javascript
+
+dependency_paths:
+  - node_modules
+  - dist
+  - build
+  - out
+  - coverage
+  - .next
+  - .nuxt
+
+module_node_type: program
+
+definitions:
+  - node_type: function_declaration
+    kind: function
+    name_field: name
+    scope_boundary: true
+
+  - node_type: generator_function_declaration
+    kind: function
+    name_field: name
+    scope_boundary: true
+
+  - node_type: class_declaration
+    kind: class
+    name_field: name
+    scope_boundary: true
+
+  # Methods declared inside a `class_body`. The name field is a
+  # `property_identifier` (handled by the extended _extract_name_from_field).
+  # Marking scope_boundary=true keeps nested function bodies anchored to the
+  # method def.
+  - node_type: method_definition
+    kind: method
+    name_field: name
+    scope_boundary: true
+
+  # Top-level `const`/`let`/`var` only — `require_enclosing_scope_kind` keeps
+  # block-scoped or function-scoped declarations out of the def graph.
+  - node_type: variable_declarator
+    kind: variable
+    name_field: name
+    require_enclosing_scope_kind: [module]
+
+references:
+  - node_type: identifier
+    exclude_parent_field:
+      - function_declaration.name
+      - generator_function_declaration.name
+      - class_declaration.name
+      - variable_declarator.name
+      - import_specifier.name
+      - import_specifier.alias
+      - namespace_import.name
+      - namespace_export.name
+      - export_specifier.name
+      - export_specifier.alias
+    confidence: certain
+
+  # `obj.method` — extract the right-hand `property` (a property_identifier).
+  # Confidence inferred since the receiver is dynamic in JS.
+  - node_type: member_expression
+    name_field: property
+    confidence: inferred
+
+  # Method-name appearances in object/class literal positions where they're
+  # being USED rather than DEFINED (e.g. shorthand pair keys, computed
+  # accessors). Excludes the binding sites covered by definitions above.
+  - node_type: property_identifier
+    exclude_parent_field:
+      - method_definition.name
+      - field_definition.name
+      - public_field_definition.name
+      - pair.key
+      - member_expression.property
+    confidence: inferred
+
+calls:
+  - node_type: call_expression
+    function_field: function
+
+imports:
+  # The actual extraction logic lives in core.heuristic_resolver._extract_imports_node;
+  # these listings activate the language for Phase 3.
+  node_types:
+    - import_statement
+    - export_statement
+    - call_expression
+
+inheritance:
+  # `class Dog extends Animal { ... }` — class_heritage is a direct child of
+  # class_declaration. _terminal_identifier on class_heritage peels the JS
+  # shape (direct identifier) so a single base name comes out.
+  parent_node_types: [class_declaration]
+  child_node_type: class_heritage

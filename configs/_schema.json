@@ -155,6 +155,11 @@
         "child_only_when_field_absent": {
           "type": "string",
           "description": "Optional. When iterating `child_node_type`, skip children that have a value for this named field. Used to filter Go struct's embedded fields (which lack a `name`) from regular named fields."
+        },
+        "child_iterate_identifiers": {
+          "type": "boolean",
+          "default": false,
+          "description": "Optional. When true, after locating each `child_node_type` match, iterate ITS named children and emit one base per child. Used for multi-identifier wrappers like TS `implements_clause` (`implements I, J`) and `extends_type_clause` (`interface X extends A, B`)."
         }
       }
     }

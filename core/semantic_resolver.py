@@ -156,7 +156,15 @@ def _extract_name_from_field(ts_node, field_name: str | None) -> str | None:
     target = _peel_expression(target)
     if target is None:
         return None
-    if target.type in ("identifier", "type_identifier", "field_identifier", "package_identifier"):
+    if target.type in (
+        "identifier",
+        "type_identifier",
+        "field_identifier",
+        "package_identifier",
+        # JS/TS: `method_definition.name` is a `property_identifier`. Same for
+        # most object-literal-style member names.
+        "property_identifier",
+    ):
         return _text(target)
     if target.type == "attribute":
         prop = target.child_by_field_name("attribute")
@@ -206,6 +214,19 @@ def _terminal_identifier(ts_node) -> str | None:
         for c in node.children:
             if c.is_named:
                 return _terminal_identifier(c)
+        return None
+    if node.type == "class_heritage":
+        # JS: `class Dog extends Animal` — class_heritage holds an `extends`
+        # keyword and an `identifier` directly. TS: the same shape but the
+        # identifier is wrapped in `extends_clause` (with field `value`); a
+        # sibling `implements_clause` may also be present and is handled by a
+        # separate inheritance rule. Here we surface only the extends side.
+        for c in node.children:
+            if c.type == "identifier":
+                return _text(c)
+            if c.type == "extends_clause":
+                v = c.child_by_field_name("value")
+                return _text(v) if v is not None else None
         return None
     if node.type == "attribute":
         prop = node.child_by_field_name("attribute")
@@ -266,6 +287,18 @@ def _extract_bases(ts_node, cfg) -> list[str]:
                 # must be skipped.
                 if c.child_by_field_name(cfg.child_only_when_field_absent) is not None:
                     continue
+            if cfg.child_iterate_identifiers:
+                # Multi-identifier wrapper: iterate this node's named children
+                # and emit one base per child. TS: `implements_clause` carries
+                # multiple type_identifiers; `extends_type_clause` ditto under
+                # interface declarations.
+                for inner in c.children:
+                    if not inner.is_named:
+                        continue
+                    name = _terminal_identifier(inner)
+                    if name:
+                        out.append(name)
+                continue
             target = c.child_by_field_name(cfg.child_name_field) if cfg.child_name_field else c
             name = _terminal_identifier(target)
             if name:
@@ -338,7 +371,7 @@ async def resolve_file(
         )
 
     source = (row["raw_content"] or "").encode("utf-8")
-    parser = LANGUAGES[config.language].parser()
+    parser = LANGUAGES[config.language].parser(PurePosixPath(row["path"]).suffix.lower())
     tree = parser.parse(source)
 
     # Pair ts_nodes to DB ids (same DFS preorder as Tier 1).

@@ -22,6 +22,14 @@ import asyncpg
 
 from .config_loader import LanguageConfig, load_language_config
 from .grammar_meta import LANGUAGES
+from .node_resolution import (
+    TsconfigPaths,
+    is_relative_specifier,
+    load_tsconfig_paths,
+    package_name_for_specifier,
+    resolve_relative as _resolve_relative_node,
+    resolve_tsconfig_alias as _resolve_tsconfig_alias,
+)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -90,6 +98,9 @@ class RepoIndex:
     files_by_id: dict[int, str]                         # file_id → rel_path
     file_languages: dict[int, str]                      # file_id → language
     repo_id: int
+    # JS/TS only: parsed `compilerOptions.paths` from tsconfig.json (None if no
+    # tsconfig present or no JS/TS files in the repo).
+    node_tsconfig: TsconfigPaths | None = None
 
 
 @dataclass
@@ -234,10 +245,140 @@ def _extract_imports_solidity(file_id: int, source_rel_path: str, ts_root, db_id
     return out
 
 
+def _collect_node_import_clause_names(import_stmt) -> list[str]:
+    """Names bound by an `import_statement`. We capture the ORIGINAL exported
+    name (matching against the target file's defs in Tier-A) rather than the
+    local alias — same pattern as the Python extractor.
+
+    - `import { foo, bar as baz } from "x"` → ["foo", "bar"]
+    - `import defaultExport from "x"`      → ["defaultExport"]
+    - `import * as ns from "x"`            → ["ns"]   (best-effort; member
+       access via `ns.foo()` is linked by Tier-B fuzzy matching)
+    - `import "side-effect"`               → []
+    """
+    names: list[str] = []
+    clause = None
+    for c in import_stmt.children:
+        if c.type == "import_clause":
+            clause = c
+            break
+    if clause is None:
+        return names
+    for c in clause.children:
+        if c.type == "identifier":
+            # Default import — the bound name in the importing scope.
+            names.append(_text(c))
+        elif c.type == "namespace_import":
+            # `* as ns` — record the alias (won't link Tier-A but flags the import).
+            for cc in c.children:
+                if cc.type == "identifier":
+                    names.append(_text(cc))
+        elif c.type == "named_imports":
+            for spec in c.children:
+                if spec.type != "import_specifier":
+                    continue
+                name_node = spec.child_by_field_name("name")
+                if name_node is not None:
+                    names.append(_text(name_node))
+    return names
+
+
+def _collect_node_export_names(export_stmt) -> list[str]:
+    """Names re-exported by `export { x, y } from "m"`. `export * from "m"`
+    yields no specific names."""
+    names: list[str] = []
+    for c in export_stmt.children:
+        if c.type != "export_clause":
+            continue
+        for spec in c.children:
+            if spec.type != "export_specifier":
+                continue
+            name_node = spec.child_by_field_name("name")
+            if name_node is not None:
+                names.append(_text(name_node))
+    return names
+
+
+def _make_node_extractor(language: str):
+    """Return an extractor closure tagged with the right language string.
+    JS and TS share parsing logic; the per-call language tag is what
+    `_resolve_one` keys off."""
+
+    def extract(file_id: int, source_rel_path: str, ts_root, db_id_for) -> list[ImportEntry]:
+        out: list[ImportEntry] = []
+        for ts in _dfs(ts_root):
+            if ts.type == "import_statement":
+                src_node = ts.child_by_field_name("source")
+                if src_node is None:
+                    continue
+                raw = _strip_quotes(_text(src_node))
+                names = _collect_node_import_clause_names(ts)
+                out.append(
+                    ImportEntry(
+                        file_id=file_id,
+                        node_id=db_id_for[ts.id],
+                        language=language,
+                        source_rel_path=source_rel_path,
+                        import_path=raw,
+                        imported_names=names,
+                        is_relative=is_relative_specifier(raw),
+                    )
+                )
+            elif ts.type == "export_statement":
+                # Only re-exports (those with a `source` field) are imports.
+                src_node = ts.child_by_field_name("source")
+                if src_node is None:
+                    continue
+                raw = _strip_quotes(_text(src_node))
+                names = _collect_node_export_names(ts)
+                out.append(
+                    ImportEntry(
+                        file_id=file_id,
+                        node_id=db_id_for[ts.id],
+                        language=language,
+                        source_rel_path=source_rel_path,
+                        import_path=raw,
+                        imported_names=names,
+                        is_relative=is_relative_specifier(raw),
+                    )
+                )
+            elif ts.type == "call_expression":
+                # `require("…")` — CommonJS import. Other call_expressions are
+                # ignored. `imported_names` is left empty since CommonJS
+                # exports are anonymous (Tier-B fuzzy matching links member
+                # accesses against the resolved file).
+                fexpr = ts.child_by_field_name("function")
+                if fexpr is None or fexpr.type != "identifier" or _text(fexpr) != "require":
+                    continue
+                args = ts.child_by_field_name("arguments")
+                if args is None:
+                    continue
+                str_node = next((c for c in args.children if c.type == "string"), None)
+                if str_node is None:
+                    continue
+                raw = _strip_quotes(_text(str_node))
+                out.append(
+                    ImportEntry(
+                        file_id=file_id,
+                        node_id=db_id_for[ts.id],
+                        language=language,
+                        source_rel_path=source_rel_path,
+                        import_path=raw,
+                        imported_names=[],
+                        is_relative=is_relative_specifier(raw),
+                    )
+                )
+        return out
+
+    return extract
+
+
 _EXTRACTORS = {
     "python": _extract_imports_python,
     "solidity": _extract_imports_solidity,
     "go": _extract_imports_go,
+    "javascript": _make_node_extractor("javascript"),
+    "typescript": _make_node_extractor("typescript"),
 }
 
 
@@ -285,6 +426,7 @@ async def build_repo_index(conn: asyncpg.Connection, repo_id: int) -> RepoIndex:
     pkg_index_go: dict[str, int] = {}
     pkg_files_go: dict[str, list[int]] = {}
     has_go = False
+    has_node = False
     for f in files:
         fid = f["id"]
         file_index[f["path"]] = fid
@@ -303,6 +445,8 @@ async def build_repo_index(conn: asyncpg.Connection, repo_id: int) -> RepoIndex:
             pkg_dir = "/".join(f["path"].split("/")[:-1])
             pkg_index_go.setdefault(pkg_dir, fid)
             pkg_files_go.setdefault(pkg_dir, []).append(fid)
+        elif f["language"] in ("javascript", "typescript"):
+            has_node = True
 
     # Read go.mod once if any Go file is present and a root_path is known.
     go_module_path: str | None = None
@@ -314,6 +458,12 @@ async def build_repo_index(conn: asyncpg.Connection, repo_id: int) -> RepoIndex:
                 if stripped.startswith("module "):
                     go_module_path = stripped.split(None, 1)[1].strip().strip('"')
                     break
+
+    # Read tsconfig.json once if any JS/TS file is present. The same parsed
+    # paths config applies to both javascript.yaml and typescript.yaml.
+    node_tsconfig: TsconfigPaths | None = None
+    if has_node and repo_root:
+        node_tsconfig = load_tsconfig_paths(Path(repo_root))
 
     name_index: dict[str, list[tuple[int, int]]] = {}
     qualified_to_def: dict[tuple[int, str], int] = {}
@@ -332,6 +482,7 @@ async def build_repo_index(conn: asyncpg.Connection, repo_id: int) -> RepoIndex:
         files_by_id=files_by_id,
         file_languages=file_languages,
         repo_id=repo_id,
+        node_tsconfig=node_tsconfig,
     )
 
 
@@ -474,6 +625,38 @@ def _resolve_go(entry: ImportEntry, idx: RepoIndex) -> ResolvedImport:
     return ResolvedImport(entry, "external", package_name=pkg)
 
 
+def _resolve_node_import(entry: ImportEntry, idx: RepoIndex) -> ResolvedImport:
+    """Classify a JS/TS import.
+
+    Order:
+      1. tsconfig `paths` alias — `@app/*` style; intra_repo when the rewritten
+         path lands on a known file.
+      2. Relative path — Node-style extension probe (.ts → .tsx → .js → .jsx
+         → .mjs → .cjs, then `index.<ext>`); intra_repo on hit.
+      3. Bare specifier — external. The package name is rolled up so
+         `react/jsx-runtime`, `react/server`, and `react` all share one
+         external_dependencies row.
+
+    Note: `node_modules/` contents are not indexed in v1, so vendored
+    packages still classify as external (matches existing Solidity behavior).
+    """
+    raw = entry.import_path
+
+    if idx.node_tsconfig is not None:
+        target = _resolve_tsconfig_alias(raw, idx.node_tsconfig, idx.file_index)
+        if target is not None:
+            return ResolvedImport(entry, "intra_repo", resolved_file_id=target)
+
+    if entry.is_relative:
+        target = _resolve_relative_node(entry.source_rel_path, raw, idx.file_index)
+        if target is not None:
+            return ResolvedImport(entry, "intra_repo", resolved_file_id=target)
+        return ResolvedImport(entry, "unresolved")
+
+    pkg = package_name_for_specifier(raw)
+    return ResolvedImport(entry, "external", package_name=pkg)
+
+
 def _resolve_one(entry: ImportEntry, idx: RepoIndex, cfg: LanguageConfig) -> ResolvedImport:
     if entry.language == "python":
         return _resolve_python(entry, idx)
@@ -481,6 +664,8 @@ def _resolve_one(entry: ImportEntry, idx: RepoIndex, cfg: LanguageConfig) -> Res
         return _resolve_solidity(entry, idx, cfg)
     if entry.language == "go":
         return _resolve_go(entry, idx)
+    if entry.language in ("javascript", "typescript"):
+        return _resolve_node_import(entry, idx)
     return ResolvedImport(entry, "unresolved")
 
 
@@ -914,7 +1099,7 @@ async def resolve_repo_imports(pool: asyncpg.Pool, repo_id: int) -> ResolutionSt
                 continue
 
             source = (f["raw_content"] or "").encode("utf-8")
-            parser = LANGUAGES[lang].parser()
+            parser = LANGUAGES[lang].parser(PurePosixPath(f["path"]).suffix.lower())
             tree = parser.parse(source)
 
             # Pair ts_nodes to DB ids via the same DFS preorder used by Tier 1.
