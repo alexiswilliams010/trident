@@ -95,10 +95,27 @@ imports:
   node_types: [import_declaration]
 
 inheritance:
-  # `type Foo interface { io.Reader; Bar; ... }`. Drilling: parent (type_spec)
-  # → `type` field → interface_type → children of type type_elem → an inner
-  # _type that resolves via _terminal_identifier. Non-interface type_specs
-  # (struct, named types) drop out because their inner node has no type_elem.
-  parent_node_types: [type_spec]
-  child_via_field: type
-  child_node_type: type_elem
+  # Two rules under the same `type_spec` parent — one for each Go shape that
+  # behaves like inheritance. The shapes diverge inside `type_spec.type`:
+  # interface_type for the first rule, struct_type for the second.
+  - # Interface embedding: `type Foo interface { io.Reader; Bar; ... }`.
+    # Path: type_spec.type → interface_type → type_elem children. Each
+    # type_elem's only named child is a type_identifier (same-package) or
+    # qualified_type (cross-package), unwrapped by _terminal_identifier.
+    # Non-interface type_specs drop out because struct_type has no type_elem.
+    parent_node_types: [type_spec]
+    child_via_field: type
+    child_node_type: type_elem
+
+  - # Struct embedding: `type Dog struct { *Animal; Owner; Name string }`.
+    # Path: type_spec.type → struct_type → field_declaration_list →
+    # field_declaration children where `name` is absent (regular named fields
+    # have `name` populated and are skipped). The embedded type lives in the
+    # `type` field, which can be a type_identifier, qualified_type, or
+    # pointer_type — all peeled by _terminal_identifier.
+    parent_node_types: [type_spec]
+    child_via_field: type
+    child_via_node_type: field_declaration_list
+    child_node_type: field_declaration
+    child_only_when_field_absent: name
+    child_name_field: type

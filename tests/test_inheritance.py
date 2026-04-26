@@ -221,6 +221,40 @@ async def test_go_cross_file_interface_embedding(clean_repo, go_fixture_root: Pa
         assert base_to_qname.get("Closer") == "basic.Closer"
 
 
+async def test_go_struct_embedding(clean_repo, go_fixture_root: Path):
+    """`type Dog struct { Animal; *iface.Closer; Breed string }` produces
+    inherits_edges for the two embedded types and skips the regular `Breed`
+    field. Animal lives in the same file (intra-file resolution); Closer
+    lives in pkg/iface (cross-file).
+    """
+    pool, repo_id = clean_repo
+    await _seed(pool, repo_id, go_fixture_root)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT ie.base_name, base.qualified_name AS base_qname, ie.confidence
+            FROM inherits_edges ie
+            JOIN definitions child ON child.id = ie.child_def_id
+            LEFT JOIN definitions base  ON base.id  = ie.base_def_id
+            JOIN files f ON f.id = child.file_id
+            WHERE f.repo_id = $1
+              AND child.qualified_name = 'main.Dog'
+            ORDER BY ie.ord
+            """,
+            repo_id,
+        )
+        base_to_qname = {r["base_name"]: r["base_qname"] for r in rows}
+        # Both embedded types should be present; `Breed` (a regular named
+        # field) must not appear.
+        assert "Animal" in base_to_qname
+        assert "Closer" in base_to_qname
+        assert "Breed" not in base_to_qname
+        # Animal is in the same file → resolves intra-file to main.Animal.
+        assert base_to_qname["Animal"] == "main.Animal"
+        # Closer is in pkg/iface/basic.go → cross-file resolution to basic.Closer.
+        assert base_to_qname["Closer"] == "basic.Closer"
+
+
 async def test_go_interface_method_overrides(clean_repo, go_fixture_root: Path):
     """`type FullIO interface { ReadWriter; Closer; Read(...) }` redeclares
     Read, which is also declared in Reader (an ancestor of FullIO via

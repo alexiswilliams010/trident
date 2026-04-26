@@ -114,8 +114,16 @@
       }
     },
     "inheritance": {
+      "description": "How class/contract/interface/struct inheritance is shaped in the AST. May be a single rule object (Python, Solidity) or an array of rules when one parent node type has multiple inheritance shapes (Go: same `type_spec` parent for both interface embedding and struct embedding).",
+      "oneOf": [
+        { "$ref": "#/$defs/inheritanceRule" },
+        { "type": "array", "items": { "$ref": "#/$defs/inheritanceRule" } }
+      ]
+    }
+  },
+  "$defs": {
+    "inheritanceRule": {
       "type": "object",
-      "description": "How contract/class inheritance is shaped in the AST. Two variants supported: Solidity-style (multiple specifier children) and Python-style (single field pointing at a list-like node).",
       "additionalProperties": false,
       "required": ["parent_node_types"],
       "properties": {
@@ -138,7 +146,15 @@
         },
         "child_via_field": {
           "type": "string",
-          "description": "Optional intermediate field on the parent. When set, the resolver descends parent → field → that node's children before applying child_node_type. Used for AST shapes where bases live one node deeper than the parent (Go: type_spec.type → interface_type.type_elem)."
+          "description": "Optional intermediate field on the parent. When set, the resolver descends parent → field → that node's children before applying child_node_type. Used for AST shapes where bases live one node deeper than the parent (Go interface embedding: type_spec.type → interface_type.type_elem)."
+        },
+        "child_via_node_type": {
+          "type": "string",
+          "description": "Optional. After `child_via_field`, descend into the first child whose type matches this. Used when there are TWO levels of indirection between the parent and the iteration target (Go struct embedding: type_spec.type → struct_type → field_declaration_list → field_declaration)."
+        },
+        "child_only_when_field_absent": {
+          "type": "string",
+          "description": "Optional. When iterating `child_node_type`, skip children that have a value for this named field. Used to filter Go struct's embedded fields (which lack a `name`) from regular named fields."
         }
       }
     }

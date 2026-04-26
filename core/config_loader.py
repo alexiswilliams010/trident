@@ -65,9 +65,18 @@ class InheritanceConfig:
     # Python-style: the parent has a `bases_field` pointing at a list-like node
     # whose identifier children are the bases.
     bases_field: str | None = None
-    # Go-style: drill through one named field on the parent before iterating children.
-    # `type_spec.type` → `interface_type` whose `type_elem` children carry the bases.
+    # Go-style (interface embedding): drill through one named field on the parent
+    # before iterating children. `type_spec.type` → `interface_type` whose
+    # `type_elem` children carry the bases.
     child_via_field: str | None = None
+    # Go-style (struct embedding): after `child_via_field` lands on a wrapper
+    # node, descend into the first child of this type before iterating. Used to
+    # bridge `struct_type` → `field_declaration_list` for embedded struct fields.
+    child_via_node_type: str | None = None
+    # Filter: only iterate children where this named field is absent. Captures
+    # Go embedded struct fields, which are `field_declaration` nodes lacking a
+    # `name` field — distinguishing them from regular named fields.
+    child_only_when_field_absent: str | None = None
 
 
 @dataclass(frozen=True)
@@ -80,7 +89,9 @@ class LanguageConfig:
     calls: tuple[CallRule, ...]
     data_access: DataAccessConfig | None = None
     imports: ImportsConfig | None = None
-    inheritance: InheritanceConfig | None = None
+    # Empty tuple = no inheritance modeled. Each rule can target a distinct
+    # AST shape (e.g. Go: one rule for interface embedding, one for struct).
+    inheritance: tuple[InheritanceConfig, ...] = ()
     raw: dict = field(default_factory=dict)  # full parsed YAML
 
     def definition_rule_for(self, node_type: str) -> DefinitionRule | None:
@@ -152,14 +163,28 @@ def load_language_config(language: str, configs_dir: Path | None = None) -> Lang
         )
 
     inh_raw = raw.get("inheritance")
-    inh: InheritanceConfig | None = None
-    if inh_raw:
-        inh = InheritanceConfig(
-            parent_node_types=tuple(inh_raw["parent_node_types"]),
-            child_node_type=inh_raw.get("child_node_type"),
-            child_name_field=inh_raw.get("child_name_field"),
-            bases_field=inh_raw.get("bases_field"),
-            child_via_field=inh_raw.get("child_via_field"),
+    inh_rules: list[InheritanceConfig] = []
+    # Accept both single-rule (object) and multi-rule (array) forms — Python and
+    # Solidity stay as single rules; Go uses an array to model interface vs.
+    # struct embedding under the same `type_spec` parent.
+    inh_iter: list[dict]
+    if inh_raw is None:
+        inh_iter = []
+    elif isinstance(inh_raw, list):
+        inh_iter = inh_raw
+    else:
+        inh_iter = [inh_raw]
+    for r in inh_iter:
+        inh_rules.append(
+            InheritanceConfig(
+                parent_node_types=tuple(r["parent_node_types"]),
+                child_node_type=r.get("child_node_type"),
+                child_name_field=r.get("child_name_field"),
+                bases_field=r.get("bases_field"),
+                child_via_field=r.get("child_via_field"),
+                child_via_node_type=r.get("child_via_node_type"),
+                child_only_when_field_absent=r.get("child_only_when_field_absent"),
+            )
         )
 
     return LanguageConfig(
@@ -171,6 +196,6 @@ def load_language_config(language: str, configs_dir: Path | None = None) -> Lang
         calls=calls,
         data_access=da,
         imports=imp,
-        inheritance=inh,
+        inheritance=tuple(inh_rules),
         raw=raw,
     )

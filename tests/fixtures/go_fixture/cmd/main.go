@@ -4,11 +4,27 @@ import (
 	"fmt"
 
 	"github.com/example/myapp/internal/utils"
+	"github.com/example/myapp/pkg/iface"
 	"github.com/pkg/errors"
 )
 
 type Calculator struct {
 	Base int
+}
+
+// Animal is a base struct used to test struct embedding (intra-file).
+type Animal struct {
+	Name string
+}
+
+// Dog embeds Animal by value (intra-file embedding) and a pointer to a
+// type defined in another package (cross-file/cross-package: pkg/iface.Closer).
+// The trailing `Breed` is a regular named field and must NOT be modeled as
+// embedding.
+type Dog struct {
+	Animal
+	*iface.Closer
+	Breed string
 }
 
 // Method on Calculator — qualified_name should be "<file>.Calculator.Add"

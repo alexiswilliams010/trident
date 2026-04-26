@@ -200,6 +200,13 @@ def _terminal_identifier(ts_node) -> str | None:
                 name_node = c.child_by_field_name("name")
                 return _text(name_node) if name_node is not None else None
         return None
+    if node.type == "pointer_type":
+        # Go embedded fields can be `*Header` — peel the pointer and recurse so
+        # the inner type_identifier / qualified_type lookup applies uniformly.
+        for c in node.children:
+            if c.is_named:
+                return _terminal_identifier(c)
+        return None
     if node.type == "attribute":
         prop = node.child_by_field_name("attribute")
         return _text(prop) if prop is not None else None
@@ -229,17 +236,36 @@ def _extract_bases(ts_node, cfg) -> list[str]:
     out: list[str] = []
     iter_node = ts_node
     if cfg.child_via_field:
-        # Go: `type Foo interface { ... }` — drill type_spec.type → interface_type
-        # before iterating type_elem children. Non-interface type_specs (struct,
-        # alias) drop out here because the inner node has no type_elem children.
+        # Go interface: drill type_spec.type → interface_type before iterating
+        # type_elem children. Non-interface type_specs drop out at the next
+        # filter because the inner node has no type_elem children.
         intermediate = ts_node.child_by_field_name(cfg.child_via_field)
         if intermediate is None:
             return out
         iter_node = intermediate
+    if cfg.child_via_node_type:
+        # Go struct: after drilling .type onto a struct_type, descend into the
+        # first child of type field_declaration_list. Two-step indirection
+        # because field_declaration_list is the only un-named-field child of
+        # struct_type and holds the field_declarations we want to iterate.
+        descended = None
+        for c in iter_node.children:
+            if c.type == cfg.child_via_node_type:
+                descended = c
+                break
+        if descended is None:
+            return out
+        iter_node = descended
     if cfg.child_node_type:
         for c in iter_node.children:
             if c.type != cfg.child_node_type:
                 continue
+            if cfg.child_only_when_field_absent:
+                # Embedded struct fields are field_declarations whose `name`
+                # field is absent; regular fields have `name` populated and
+                # must be skipped.
+                if c.child_by_field_name(cfg.child_only_when_field_absent) is not None:
+                    continue
             target = c.child_by_field_name(cfg.child_name_field) if cfg.child_name_field else c
             name = _terminal_identifier(target)
             if name:
@@ -468,16 +494,23 @@ async def resolve_file(
             file_def_ids.append(new_def_id)
 
     # ── P2.5: inheritance edges (intra-file resolution) ──
+    # `config.inheritance` is a tuple of rules. A single parent node may match
+    # more than one rule (Go: `type_spec` is the parent for both interface
+    # embedding and struct embedding). Bases from each rule are concatenated
+    # in declaration order so the `ord` column reflects a stable ranking.
     inh_records: list[tuple[int, str, int, int | None]] = []  # (child, base_name, ord, base_def_id)
-    if config.inheritance is not None:
-        parent_types = set(config.inheritance.parent_node_types)
-        for ts in ts_walk:
-            if ts.type not in parent_types:
+    for ts in ts_walk:
+        child_def_id: int | None = None
+        ordinal = 0
+        for rule in config.inheritance:
+            if ts.type not in rule.parent_node_types:
                 continue
-            child_def_id = scope_def_id_by_ts.get(ts.id)
             if child_def_id is None:
-                continue
-            for ordinal, base_name in enumerate(_extract_bases(ts, config.inheritance), start=1):
+                child_def_id = scope_def_id_by_ts.get(ts.id)
+                if child_def_id is None:
+                    break
+            for base_name in _extract_bases(ts, rule):
+                ordinal += 1
                 # Try intra-file resolution: does any module-scope def in this file
                 # match the base name? (Cross-file matches go through Phase 3.)
                 base_def_id = defs_by_scope_and_name.get((module_def_id, base_name))
