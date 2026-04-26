@@ -54,6 +54,17 @@ def test_walk_dependency_files_rejects_path_escape(solidity_fixture_root: Path) 
     assert found == []
 
 
+def test_walker_yields_go_files(go_fixture_root: Path) -> None:
+    cfg = WalkConfig.with_defaults(go_fixture_root)
+    found = sorted(d.rel_path for d in walk_repo(cfg))
+    assert "cmd/main.go" in found
+    assert "internal/utils/utils.go" in found
+    assert "pkg/iface/composed.go" in found
+    # vendor/ would be pruned if present; go.mod is not a .go file and is
+    # ignored by the walker (resolver reads it directly via repos.root_path).
+    assert all(p.endswith(".go") for p in found)
+
+
 # ────────────────────────────────────────────────────────────────────
 # Extractor tests (require Postgres)
 # ────────────────────────────────────────────────────────────────────
@@ -143,6 +154,42 @@ async def test_index_solidity_fixture(clean_repo, solidity_fixture_root: Path) -
             vault_id,
         )
         assert functions >= 2
+
+
+async def test_index_go_fixture(clean_repo, go_fixture_root: Path) -> None:
+    pool, repo_id = clean_repo
+    result = await index_repo(pool, repo_id, go_fixture_root)
+
+    rel_paths = {r.rel_path for r in result.indexed}
+    assert "cmd/main.go" in rel_paths
+    assert "internal/utils/utils.go" in rel_paths
+    assert "pkg/iface/composed.go" in rel_paths
+
+    async with pool.acquire() as conn:
+        # index_repo records repo_root so Phase 3 can find go.mod.
+        root_path = await conn.fetchval(
+            "SELECT root_path FROM repos WHERE id=$1", repo_id,
+        )
+        assert root_path is not None
+        assert root_path.endswith("go_fixture")
+
+        composed_id = await conn.fetchval(
+            "SELECT id FROM files WHERE repo_id=$1 AND path=$2",
+            repo_id, "pkg/iface/composed.go",
+        )
+        # interface_type wraps two embedded names + one method_elem in FullIO,
+        # plus the two type_elem in ReadWriter — so at least 4 type_elem total.
+        type_elems = await conn.fetchval(
+            "SELECT COUNT(*) FROM nodes "
+            "WHERE file_id=$1 AND node_type='type_elem'", composed_id,
+        )
+        assert type_elems >= 4
+
+        method_elems = await conn.fetchval(
+            "SELECT COUNT(*) FROM nodes "
+            "WHERE file_id=$1 AND node_type='method_elem'", composed_id,
+        )
+        assert method_elems >= 1
 
 
 async def test_incremental_indexing_skips_unchanged(clean_repo, python_fixture_root: Path) -> None:

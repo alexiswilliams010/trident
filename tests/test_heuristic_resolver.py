@@ -185,3 +185,111 @@ async def test_solidity_cross_file_call_edges(clean_repo, solidity_fixture_root:
         assert rows
         assert rows[0]["callee"] == "Token.Token.transfer"
         assert rows[0]["confidence"] == "inferred"
+
+
+# ────────────────────────────────────────────────────────────────────
+# Go
+# ────────────────────────────────────────────────────────────────────
+
+
+async def test_go_imports_classified(clean_repo, go_fixture_root: Path):
+    pool, repo_id = clean_repo
+    await _full_pipeline(pool, repo_id, go_fixture_root)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT f.path, i.import_path, i.dep_class, i.resolved_file_id "
+            "FROM imports i JOIN files f ON f.id=i.file_id "
+            "WHERE f.repo_id=$1 ORDER BY f.path, i.id",
+            repo_id,
+        )
+        cls = {(r["path"], r["import_path"]): r for r in rows}
+
+        # Intra-repo: cmd/main.go imports github.com/example/myapp/internal/utils.
+        intra = cls[("cmd/main.go", "github.com/example/myapp/internal/utils")]
+        assert intra["dep_class"] == "intra_repo"
+        utils_files = {r["path"] for r in await conn.fetch(
+            "SELECT path FROM files WHERE repo_id=$1 AND path LIKE 'internal/utils/%'",
+            repo_id,
+        )}
+        resolved = await conn.fetchval(
+            "SELECT path FROM files WHERE id=$1", intra["resolved_file_id"],
+        )
+        assert resolved in utils_files
+
+        # Stdlib: fmt → external, package_name=fmt.
+        assert cls[("cmd/main.go", "fmt")]["dep_class"] == "external"
+
+        # Third-party: github.com/pkg/errors → external, package_name=github.com/pkg/errors.
+        assert cls[("cmd/main.go", "github.com/pkg/errors")]["dep_class"] == "external"
+
+        deps = await conn.fetch(
+            "SELECT package_name FROM external_dependencies WHERE repo_id=$1 AND language='go'",
+            repo_id,
+        )
+        names = {r["package_name"] for r in deps}
+        assert "fmt" in names
+        assert "github.com/pkg/errors" in names
+
+
+async def test_go_cross_file_call_edges_upgraded(clean_repo, go_fixture_root: Path):
+    """Calculator.DoubleIt calls utils.Double — the selector resolves cross-file
+    via the imported `utils` package and lands as a certain edge.
+    """
+    pool, repo_id = clean_repo
+    await _full_pipeline(pool, repo_id, go_fixture_root)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT caller.qualified_name AS caller,
+                   callee.qualified_name AS callee,
+                   ce.confidence, ce.callee_name
+            FROM call_edges ce
+            JOIN definitions caller ON caller.id=ce.caller_def_id
+            LEFT JOIN definitions callee ON callee.id=ce.callee_def_id
+            JOIN files f ON f.id=caller.file_id
+            WHERE f.repo_id=$1
+              AND caller.qualified_name='main.Calculator.DoubleIt'
+              AND ce.callee_name='Double'
+            """,
+            repo_id,
+        )
+        assert rows, "expected DoubleIt → Double edge"
+        assert rows[0]["callee"] == "utils.Double"
+
+
+async def test_go_method_qualified_name_uses_receiver(clean_repo, go_fixture_root: Path):
+    """`func (c *Calculator) Add(...)` should produce qualified_name
+    `<file>.Calculator.Add`, not `<file>.Add`."""
+    pool, repo_id = clean_repo
+    await _full_pipeline(pool, repo_id, go_fixture_root)
+
+    async with pool.acquire() as conn:
+        names = await conn.fetch(
+            """
+            SELECT qualified_name FROM definitions d
+            JOIN files f ON f.id=d.file_id
+            WHERE f.repo_id=$1 AND d.kind='method' AND d.name='Add'
+            """,
+            repo_id,
+        )
+        assert any(r["qualified_name"] == "main.Calculator.Add" for r in names), [r["qualified_name"] for r in names]
+
+
+async def test_go_multi_name_var_emits_two_defs(clean_repo, go_fixture_root: Path):
+    """`var X, Y int` in utils.go should produce two `var` definitions."""
+    pool, repo_id = clean_repo
+    await _full_pipeline(pool, repo_id, go_fixture_root)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT d.name FROM definitions d
+            JOIN files f ON f.id=d.file_id
+            WHERE f.repo_id=$1 AND d.kind='var' AND f.path='internal/utils/utils.go'
+            """,
+            repo_id,
+        )
+        names = {r["name"] for r in rows}
+        assert {"X", "Y"} <= names, names

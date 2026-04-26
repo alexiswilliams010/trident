@@ -162,6 +162,90 @@ async def test_python_intra_file_inheritance_and_override(
 
 
 # ────────────────────────────────────────────────────────────────────
+# Go
+# ────────────────────────────────────────────────────────────────────
+
+
+async def test_go_intra_file_interface_embedding(clean_repo, go_fixture_root: Path):
+    """`type ReadWriter interface { Reader; Writer }` produces two
+    inherits_edges rows. Reader and Writer are declared in basic.go (a
+    sibling), so the actual base resolution is cross-file — but the embedding
+    edges themselves are written during semantic resolution from composed.go.
+    """
+    pool, repo_id = clean_repo
+    await _seed(pool, repo_id, go_fixture_root)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT ie.base_name, base.qualified_name AS base_qname
+            FROM inherits_edges ie
+            JOIN definitions child ON child.id = ie.child_def_id
+            LEFT JOIN definitions base  ON base.id  = ie.base_def_id
+            JOIN files f ON f.id = child.file_id
+            WHERE f.repo_id = $1
+              AND child.qualified_name LIKE 'composed.ReadWriter%'
+            ORDER BY ie.base_name
+            """,
+            repo_id,
+        )
+        base_names = [r["base_name"] for r in rows]
+        assert base_names == ["Reader", "Writer"], base_names
+        # After Phase 3, both should resolve cross-file to basic.go's defs.
+        resolved_qnames = {r["base_qname"] for r in rows if r["base_qname"]}
+        assert "basic.Reader" in resolved_qnames
+        assert "basic.Writer" in resolved_qnames
+
+
+async def test_go_cross_file_interface_embedding(clean_repo, go_fixture_root: Path):
+    """FullIO embeds Closer, declared in basic.go (cross-file)."""
+    pool, repo_id = clean_repo
+    await _seed(pool, repo_id, go_fixture_root)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT ie.base_name, base.qualified_name AS base_qname
+            FROM inherits_edges ie
+            JOIN definitions child ON child.id = ie.child_def_id
+            LEFT JOIN definitions base  ON base.id  = ie.base_def_id
+            JOIN files f ON f.id = child.file_id
+            WHERE f.repo_id = $1
+              AND child.qualified_name LIKE 'composed.FullIO%'
+            """,
+            repo_id,
+        )
+        base_to_qname = {r["base_name"]: r["base_qname"] for r in rows}
+        # Intra-package: ReadWriter is defined in composed.go itself, so this
+        # one resolves intra-file.
+        assert base_to_qname.get("ReadWriter") == "composed.ReadWriter"
+        # Cross-file: Closer lives in basic.go and resolves via Phase 3.
+        assert base_to_qname.get("Closer") == "basic.Closer"
+
+
+async def test_go_interface_method_overrides(clean_repo, go_fixture_root: Path):
+    """`type FullIO interface { ReadWriter; Closer; Read(...) }` redeclares
+    Read, which is also declared in Reader (an ancestor of FullIO via
+    ReadWriter). Override generation should connect the two.
+    """
+    pool, repo_id = clean_repo
+    await _seed(pool, repo_id, go_fixture_root)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT base.qualified_name AS base_qname
+            FROM overrides_edges oe
+            JOIN definitions child ON child.id = oe.child_def_id
+            JOIN definitions base  ON base.id  = oe.base_def_id
+            JOIN files f ON f.id = child.file_id
+            WHERE f.repo_id = $1
+              AND child.qualified_name = 'composed.FullIO.Read'
+            """,
+            repo_id,
+        )
+        assert row is not None, "expected FullIO.Read → Reader.Read override edge"
+        assert row["base_qname"] == "basic.Reader.Read"
+
+
+# ────────────────────────────────────────────────────────────────────
 # Retrieval: bidirectional expansion pulls in overrides
 # ────────────────────────────────────────────────────────────────────
 

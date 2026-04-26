@@ -19,6 +19,7 @@ from db.connection import apply_migrations, create_pool, get_dsn
 FIXTURES = Path(__file__).parent / "fixtures"
 PYTHON_FIXTURE = FIXTURES / "python_fixture"
 SOLIDITY_FIXTURE = FIXTURES / "solidity_foundry_fixture"
+GO_FIXTURE = FIXTURES / "go_fixture"
 
 
 async def _can_connect(dsn: str) -> bool:
@@ -67,3 +68,8 @@ def python_fixture_root() -> Path:
 @pytest.fixture
 def solidity_fixture_root() -> Path:
     return SOLIDITY_FIXTURE
+
+
+@pytest.fixture
+def go_fixture_root() -> Path:
+    return GO_FIXTURE
