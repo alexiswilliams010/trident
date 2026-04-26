@@ -85,7 +85,7 @@ scores will be subtly off. Cleanest: drop and re-embed.
 
 ```
 psql -d tsgrep -c "DELETE FROM chunk_embeddings;"
-make embed-python    # or whichever fixture / repo
+make embed REPO_PATH=tests/fixtures/python_fixture REPO_NAME=python_fixture    # or whichever repo
 ```
 
 ## Quality / cost trade-off

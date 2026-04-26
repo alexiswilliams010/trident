@@ -74,15 +74,22 @@ and create + migrate the per-repo DB on first use.
 
 ## Indexing the bundled fixtures
 
+The bundled fixtures live under `tests/fixtures/`. Use the generic `index`
+/ `embed` / `diagnose` targets with `REPO_PATH` + `REPO_NAME` to address
+them — there are no language-specific shortcuts.
+
 ```sh
-make index-python                # repo name `python_fixture` in shared DB
-make index-solidity              # repo name `solidity_fixture` in shared DB
+# index into shared DB
+make index REPO_PATH=tests/fixtures/python_fixture            REPO_NAME=python_fixture
+make index REPO_PATH=tests/fixtures/solidity_foundry_fixture  REPO_NAME=solidity_fixture
 
-make diagnose-python             # resolution stats for python_fixture
-make diagnose-solidity           # resolution stats for solidity_fixture
+# resolution stats
+make diagnose REPO_NAME=python_fixture
+make diagnose REPO_NAME=solidity_fixture
 
-make embed-python-fake           # embed Python fixture chunks with the deterministic stub
-make embed-solidity-fake         # ditto for Solidity
+# embed with the deterministic stub (no API key needed)
+.venv/bin/python -m cli.index tests/fixtures/python_fixture           --repo-name python_fixture   --embed fake
+.venv/bin/python -m cli.index tests/fixtures/solidity_foundry_fixture --repo-name solidity_fixture --embed fake
 ```
 
 Retrieval queries (use `--fake` for the stub embedder; otherwise set
@@ -124,7 +131,7 @@ LEFT JOIN definitions callee ON callee.id = ce.callee_def_id
 ORDER BY caller.qualified_name;
 ```
 
-Re-running `make index-python` after no source changes prints
+Re-running `make index` after no source changes prints
 `Skipped N unchanged files` — incremental indexing is keyed off SHA-256 of
 each file's contents.
 
@@ -202,7 +209,8 @@ EMBEDDING_MODEL=text-embedding-3-large \
 
 # or stash them in an out-of-tree file and source it:
 set -a; source ~/.config/tsgrep/env; set +a
-make index-python   # then pass --embed real to the underlying CLI as needed
+make index REPO_PATH=tests/fixtures/python_fixture REPO_NAME=python_fixture
+# then pass --embed real to the underlying CLI as needed
 ```
 
 **Schema constraint** — `chunk_embeddings.embedding` is `vector(4096)`,
@@ -265,9 +273,9 @@ Parses sources, builds the call graph, assembles chunks. No API calls.
 **Mode A — shared `tsgrep` DB (multi-repo):**
 
 ```sh
-make index-python                                          # bundled fixture
-make index-solidity                                        # bundled fixture
-make index REPO_PATH=/path/to/repo REPO_NAME=myrepo        # any other repo
+make index REPO_PATH=tests/fixtures/python_fixture           REPO_NAME=python_fixture
+make index REPO_PATH=tests/fixtures/solidity_foundry_fixture REPO_NAME=solidity_fixture
+make index REPO_PATH=/path/to/repo                           REPO_NAME=myrepo
 ```
 
 **Mode B — per-repo DB `tsgrep_<name>` (CI / isolation):**
@@ -287,16 +295,17 @@ the gateway, writes vectors to `chunk_embeddings`. Re-runs are cheap:
 unchanged chunks are skipped via `LEFT JOIN ... WHERE ce.id IS NULL`.
 
 ```sh
-make embed-python                                          # bundled fixture, shared DB
-make embed-solidity
-make embed REPO_PATH=/path/to/repo REPO_NAME=myrepo        # any repo, shared DB
-make embed-isolated REPO_PATH=/path/to/repo REPO_NAME=myrepo  # any repo, per-repo DB
+make embed REPO_PATH=tests/fixtures/python_fixture           REPO_NAME=python_fixture       # bundled fixture, shared DB
+make embed REPO_PATH=tests/fixtures/solidity_foundry_fixture REPO_NAME=solidity_fixture
+make embed REPO_PATH=/path/to/repo                           REPO_NAME=myrepo               # any repo, shared DB
+make embed-isolated REPO_PATH=/path/to/repo REPO_NAME=myrepo                                # any repo, per-repo DB
 
-make embed-python-fake                                     # stub embedder, no API key
+# stub embedder, no API key — call the CLI directly with --embed fake
+.venv/bin/python -m cli.index tests/fixtures/python_fixture --repo-name python_fixture --embed fake
 ```
 
 The `embed` / `embed-isolated` targets re-run Tier 1-3a (idempotent /
-cheap if unchanged) and then embed — same as the fixture-specific targets.
+cheap if unchanged) and then embed against the real gateway via pass-cli.
 
 ### 4. Query
 
@@ -364,14 +373,8 @@ make db-reset        # db-drop + db-create + db-migrate
 make db-psql         # interactive psql shell on tsgrep
 
 # Mode A — into the shared `tsgrep` DB
-make index-python                                       # bundled Python fixture
-make index-solidity                                     # bundled Solidity fixture
-make index REPO_PATH=/path REPO_NAME=name               # any repo
-make embed-python                                       # real embedder via pass-cli
-make embed-solidity
-make embed-python-fake                                  # deterministic stub embedder
-make embed-solidity-fake
-make embed REPO_PATH=/path REPO_NAME=name               # index + embed any repo
+make index REPO_PATH=/path REPO_NAME=name               # any repo (incl. fixtures under tests/fixtures/)
+make embed REPO_PATH=/path REPO_NAME=name               # index + embed (real embedder via pass-cli)
 make query-semantic QUERY="..." REPO_NAME=name [DB=...] # cosine NN
 make query-hybrid   QUERY="..." REPO_NAME=name [DB=...] # semantic + 1-hop graph expand
 
@@ -382,8 +385,10 @@ make query-isolated-semantic QUERY="..." REPO_NAME=name
 make query-isolated-hybrid   QUERY="..." REPO_NAME=name
 
 # Diagnostics
-make diagnose-python                                    # stats for python_fixture
-make diagnose-solidity                                  # stats for solidity_fixture
+make diagnose REPO_NAME=name [DB=...]                   # resolution stats for any repo
+
+# Stub embedder (no API key) — invoke the CLI directly:
+.venv/bin/python -m cli.index /path --repo-name name --embed fake
 ```
 
 Override `PG_SERVICE` or `PG_DB` as `make` variables if your local setup

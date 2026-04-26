@@ -1,7 +1,7 @@
 .PHONY: help install lint test test-extractor \
         db-start db-stop db-create db-drop db-migrate db-setup db-teardown db-reset db-psql \
-        index-python index-solidity diagnose diagnose-isolated \
-        embed-python embed-solidity query-semantic query-hybrid \
+        diagnose diagnose-isolated \
+        query-semantic query-hybrid \
         index embed \
         index-isolated embed-isolated query-isolated-semantic query-isolated-hybrid \
         db-ensure-isolated
@@ -12,9 +12,6 @@ PYTHON := .venv/bin/python
 PG_SERVICE ?= postgresql@18
 PG_DB ?= tsgrep
 MIGRATIONS_DIR := db/migrations
-
-PYTHON_FIXTURE := tests/fixtures/python_fixture
-SOLIDITY_FIXTURE := tests/fixtures/solidity_foundry_fixture
 
 PASS_CLI ?= pass-cli
 ENV_TEMPLATE ?= .env.template
@@ -113,9 +110,6 @@ db-psql: ## Open a psql shell on $(PG_DB).
 # Mode A — multi-repo into one shared DB (default `tsgrep`).
 # Repos are addressed by name; cross-repo queries are possible.
 # ------------------------------------------------------------------------------
-PYTHON_REPO_NAME   ?= python_fixture
-SOLIDITY_REPO_NAME ?= solidity_fixture
-
 REPO_PATH ?=
 REPO_NAME ?=
 QUERY     ?=
@@ -124,24 +118,6 @@ EXCLUDE   ?=
 # When EXCLUDE is set, expand to a single --exclude flag carrying the
 # comma-separated value (argparse splits on comma).
 EXCLUDE_FLAG := $(if $(EXCLUDE),--exclude '$(EXCLUDE)',)
-
-index-python: ## Index the Python test fixture into the shared DB.
-	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.index $(PYTHON_FIXTURE) --repo-name $(PYTHON_REPO_NAME)
-
-index-solidity: ## Index the Solidity test fixture into the shared DB.
-	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.index $(SOLIDITY_FIXTURE) --repo-name $(SOLIDITY_REPO_NAME)
-
-embed-python-fake: ## Embed Python fixture chunks with the deterministic stub.
-	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.index $(PYTHON_FIXTURE) --repo-name $(PYTHON_REPO_NAME) --embed fake
-
-embed-solidity-fake: ## Embed Solidity fixture chunks with the deterministic stub.
-	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.index $(SOLIDITY_FIXTURE) --repo-name $(SOLIDITY_REPO_NAME) --embed fake
-
-embed-python: ## Embed Python fixture chunks (real embedder, secrets via pass-cli).
-	$(call inject_and_run,$(PYTHON) -m cli.index $(PYTHON_FIXTURE) --repo-name $(PYTHON_REPO_NAME) --embed real)
-
-embed-solidity: ## Embed Solidity fixture chunks (real embedder, secrets via pass-cli).
-	$(call inject_and_run,$(PYTHON) -m cli.index $(SOLIDITY_FIXTURE) --repo-name $(SOLIDITY_REPO_NAME) --embed real)
 
 # Generic targets — any repo into $(DB) (default `tsgrep`).
 #   make index REPO_PATH=/path REPO_NAME=name [DB=tsgrep_other]
@@ -168,12 +144,6 @@ query-hybrid: ## Hybrid query. QUERY="..." REPO_NAME=name [DB=...]
 		echo 'usage: make query-hybrid QUERY="..." REPO_NAME=name'; exit 2; \
 	fi
 	$(call inject_and_run,$(PYTHON) -m cli.query --repo-name $(REPO_NAME) --hybrid "$(QUERY)")
-
-diagnose-python: ## Print resolution stats for the Python fixture.
-	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.diagnose --repo-name $(PYTHON_REPO_NAME) --unresolved
-
-diagnose-solidity: ## Print resolution stats for the Solidity fixture.
-	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.diagnose --repo-name $(SOLIDITY_REPO_NAME) --unresolved
 
 diagnose: ## Print resolution stats for any repo in $(DB). REPO_NAME=name [DB=...]
 	@if [ -z "$(REPO_NAME)" ]; then echo 'usage: make diagnose REPO_NAME=name [DB=...]'; exit 2; fi
