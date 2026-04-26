@@ -30,6 +30,15 @@
           "require_enclosing_scope_kind": {
             "type": "array",
             "items": { "type": "string" }
+          },
+          "name_field_multiple": {
+            "type": "boolean",
+            "default": false,
+            "description": "If true, treat name_field as multi-valued: emit one definition per identifier child of that field. Used for Go's `var a, b int` / `const x, y = 1, 2`."
+          },
+          "qualified_name_prefix_from_field": {
+            "type": "string",
+            "description": "Optional. Descend the named field on the def node looking for the first type_identifier and insert it as a prefix segment immediately before the def's own name. Used for Go method receivers: `func (d *Dog) Bark()` → `<file>.Dog.Bark`."
           }
         }
       }
@@ -126,6 +135,10 @@
         "bases_field": {
           "type": "string",
           "description": "Python-style: field on `parent_node_type` pointing at a list-like node whose identifier children are the bases."
+        },
+        "child_via_field": {
+          "type": "string",
+          "description": "Optional intermediate field on the parent. When set, the resolver descends parent → field → that node's children before applying child_node_type. Used for AST shapes where bases live one node deeper than the parent (Go: type_spec.type → interface_type.type_elem)."
         }
       }
     }

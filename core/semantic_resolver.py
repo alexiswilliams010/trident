@@ -156,7 +156,7 @@ def _extract_name_from_field(ts_node, field_name: str | None) -> str | None:
     target = _peel_expression(target)
     if target is None:
         return None
-    if target.type in ("identifier", "type_identifier"):
+    if target.type in ("identifier", "type_identifier", "field_identifier", "package_identifier"):
         return _text(target)
     if target.type == "attribute":
         prop = target.child_by_field_name("attribute")
@@ -185,6 +185,21 @@ def _terminal_identifier(ts_node) -> str | None:
             if c.type in ("identifier", "type_identifier"):
                 last_ident = _text(c)
         return last_ident
+    if node.type == "qualified_type":
+        # Go: `pkg.Foo` — the type-side identifier is what we resolve against.
+        name_node = node.child_by_field_name("name")
+        return _text(name_node) if name_node is not None else None
+    if node.type == "type_elem":
+        # Go interface embedding: a type_elem wraps either a bare
+        # type_identifier (same-package embed) or a qualified_type
+        # (cross-package embed). Both are unwrapped here.
+        for c in node.children:
+            if c.type == "type_identifier":
+                return _text(c)
+            if c.type == "qualified_type":
+                name_node = c.child_by_field_name("name")
+                return _text(name_node) if name_node is not None else None
+        return None
     if node.type == "attribute":
         prop = node.child_by_field_name("attribute")
         return _text(prop) if prop is not None else None
@@ -212,8 +227,17 @@ def _extract_bases(ts_node, cfg) -> list[str]:
           ↳ class_definition.superclasses → argument_list → identifier "Bar", "Baz"
     """
     out: list[str] = []
+    iter_node = ts_node
+    if cfg.child_via_field:
+        # Go: `type Foo interface { ... }` — drill type_spec.type → interface_type
+        # before iterating type_elem children. Non-interface type_specs (struct,
+        # alias) drop out here because the inner node has no type_elem children.
+        intermediate = ts_node.child_by_field_name(cfg.child_via_field)
+        if intermediate is None:
+            return out
+        iter_node = intermediate
     if cfg.child_node_type:
-        for c in ts_node.children:
+        for c in iter_node.children:
             if c.type != cfg.child_node_type:
                 continue
             target = c.child_by_field_name(cfg.child_name_field) if cfg.child_name_field else c
@@ -221,7 +245,7 @@ def _extract_bases(ts_node, cfg) -> list[str]:
             if name:
                 out.append(name)
     elif cfg.bases_field:
-        list_node = ts_node.child_by_field_name(cfg.bases_field)
+        list_node = iter_node.child_by_field_name(cfg.bases_field)
         if list_node is not None:
             for c in list_node.children:
                 name = _terminal_identifier(c)
@@ -357,25 +381,48 @@ async def resolve_file(
             if scope_kind not in allowed:
                 continue
 
-        if rule.name_field is not None or ts.type == "constructor_definition":
-            name = _extract_name_from_field(ts, rule.name_field)
+        # One def node usually emits one definition row, but Go's `var a, b int`
+        # / `const x, y = …` is a single var_spec/const_spec with multiple
+        # identifier children in the `name` field. `definitions.node_id` is
+        # UNIQUE, so each name gets its own identifier-child node_id rather
+        # than reusing the spec's.
+        named_targets: list[tuple[str, int]] = []  # (name, db_node_id)
+        if rule.name_field_multiple and rule.name_field is not None:
+            for i in range(ts.child_count):
+                if ts.field_name_for_child(i) != rule.name_field:
+                    continue
+                child = ts.children[i]
+                if child.type in ("identifier", "type_identifier", "field_identifier"):
+                    named_targets.append((_text(child), db_id_for[child.id]))
         else:
-            name = None
-        if name is None and rule.kind == "constructor":
-            # Constructors carry their contract's name implicitly.
-            owner = def_meta_by_id.get(scope_id) if scope_id is not None else None
-            name = owner[0] if owner else "constructor"
-        if name is None:
+            if rule.name_field is not None or ts.type == "constructor_definition":
+                name = _extract_name_from_field(ts, rule.name_field)
+            else:
+                name = None
+            if name is None and rule.kind == "constructor":
+                # Constructors carry their contract's name implicitly.
+                owner = def_meta_by_id.get(scope_id) if scope_id is not None else None
+                name = owner[0] if owner else "constructor"
+            if name is not None:
+                named_targets.append((name, db_id_for[ts.id]))
+        if not named_targets:
             continue
 
-        # Build qualified name by walking up scope chain via def_meta_by_id.
-        parts = [name]
-        cur = scope_id
-        while cur is not None:
-            parent_name, parent_scope = def_meta_by_id[cur]
-            parts.append(parent_name)
-            cur = parent_scope
-        qualified_name = ".".join(reversed(parts))
+        # qualified_name prefix from a field on the def node — Go method
+        # receivers: `func (d *Dog) Bark()` → segment `Dog` inserted before
+        # the method name so qualified_name becomes `<file>.Dog.Bark`.
+        prefix_segment: str | None = None
+        if rule.qualified_name_prefix_from_field:
+            field_node = ts.child_by_field_name(rule.qualified_name_prefix_from_field)
+            if field_node is not None:
+                stack = [field_node]
+                while stack:
+                    n = stack.pop()
+                    if n.type == "type_identifier":
+                        prefix_segment = _text(n)
+                        break
+                    for i in range(n.child_count - 1, -1, -1):
+                        stack.append(n.children[i])
 
         visibility: str | None = None
         if rule.visibility_field:
@@ -383,27 +430,42 @@ async def resolve_file(
             if vnode is not None:
                 visibility = _text(vnode)
 
-        new_def_id = await conn.fetchval(
-            """
-            INSERT INTO definitions (node_id, file_id, kind, name, qualified_name, scope_id, visibility)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING id
-            """,
-            db_id_for[ts.id],
-            file_id,
-            rule.kind,
-            name,
-            qualified_name,
-            scope_id,
-            visibility,
-        )
-        def_kind_by_id[new_def_id] = rule.kind
-        def_meta_by_id[new_def_id] = (name, scope_id)
-        if scope_id is not None:
-            defs_by_scope_and_name[(scope_id, name)] = new_def_id
-        if rule.scope_boundary:
-            scope_def_id_by_ts[ts.id] = new_def_id
-        file_def_ids.append(new_def_id)
+        for name, name_node_id in named_targets:
+            # Build qualified name by walking up scope chain via def_meta_by_id.
+            parts = [name]
+            if prefix_segment is not None:
+                parts.append(prefix_segment)
+            cur = scope_id
+            while cur is not None:
+                parent_name, parent_scope = def_meta_by_id[cur]
+                parts.append(parent_name)
+                cur = parent_scope
+            qualified_name = ".".join(reversed(parts))
+
+            new_def_id = await conn.fetchval(
+                """
+                INSERT INTO definitions (node_id, file_id, kind, name, qualified_name, scope_id, visibility)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id
+                """,
+                name_node_id,
+                file_id,
+                rule.kind,
+                name,
+                qualified_name,
+                scope_id,
+                visibility,
+            )
+            def_kind_by_id[new_def_id] = rule.kind
+            def_meta_by_id[new_def_id] = (name, scope_id)
+            if scope_id is not None:
+                defs_by_scope_and_name[(scope_id, name)] = new_def_id
+            if rule.scope_boundary:
+                # Multi-name + scope_boundary doesn't make sense; `var_spec` and
+                # `const_spec` have scope_boundary=False so this maps cleanly to
+                # the single-name case where ts.id is the spec node.
+                scope_def_id_by_ts[ts.id] = new_def_id
+            file_def_ids.append(new_def_id)
 
     # ── P2.5: inheritance edges (intra-file resolution) ──
     inh_records: list[tuple[int, str, int, int | None]] = []  # (child, base_name, ord, base_def_id)
@@ -534,8 +596,15 @@ async def resolve_file(
             callee_name = _text(fexpr)
             target = _resolve_in_scope(callee_name, ts)
             confidence = "certain" if target is not None else "uncertain"
-        elif fexpr.type in ("attribute", "member_expression"):
-            prop_field = "attribute" if fexpr.type == "attribute" else "property"
+        elif fexpr.type in ("attribute", "member_expression", "selector_expression"):
+            # Python: attribute.attribute. Solidity: member_expression.property.
+            # Go: selector_expression.field. All three carry the right-hand
+            # callee identifier in a node-type-specific field name.
+            prop_field = {
+                "attribute": "attribute",
+                "member_expression": "property",
+                "selector_expression": "field",
+            }[fexpr.type]
             prop = fexpr.child_by_field_name(prop_field)
             callee_name = _text(prop) if prop is not None else None
             cands = file_name_index.get(callee_name, []) if callee_name else []

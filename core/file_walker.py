@@ -48,6 +48,7 @@ ALWAYS_IGNORED: frozenset[str] = frozenset({
 DEFAULT_DEP_PATHS: dict[str, tuple[str, ...]] = {
     "python": ("venv", ".venv", "site-packages", "env", ".env"),
     "solidity": ("lib", "node_modules", "out", "cache", "artifacts"),
+    "go": ("vendor",),
 }
 
 TSGREP_IGNORE_FILE = ".tsgrepignore"

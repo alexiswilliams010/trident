@@ -47,6 +47,11 @@ LANGUAGES: dict[str, LanguageSpec] = {
         extensions=(".sol",),
         module_name="tree_sitter_solidity",
     ),
+    "go": LanguageSpec(
+        name="go",
+        extensions=(".go",),
+        module_name="tree_sitter_go",
+    ),
 }
 
 

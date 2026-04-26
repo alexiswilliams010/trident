@@ -22,6 +22,10 @@ class DefinitionRule:
     scope_boundary: bool = False
     visibility_field: str | None = None
     require_enclosing_scope_kind: tuple[str, ...] = ()
+    # Multi-name shapes: e.g. Go's `var a, b int` — one var_spec yields two defs.
+    name_field_multiple: bool = False
+    # Prepend a segment derived from a field on the def node (e.g. method receiver).
+    qualified_name_prefix_from_field: str | None = None
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,9 @@ class InheritanceConfig:
     # Python-style: the parent has a `bases_field` pointing at a list-like node
     # whose identifier children are the bases.
     bases_field: str | None = None
+    # Go-style: drill through one named field on the parent before iterating children.
+    # `type_spec.type` → `interface_type` whose `type_elem` children carry the bases.
+    child_via_field: str | None = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +113,8 @@ def load_language_config(language: str, configs_dir: Path | None = None) -> Lang
             scope_boundary=d.get("scope_boundary", False),
             visibility_field=d.get("visibility_field"),
             require_enclosing_scope_kind=tuple(d.get("require_enclosing_scope_kind", [])),
+            name_field_multiple=d.get("name_field_multiple", False),
+            qualified_name_prefix_from_field=d.get("qualified_name_prefix_from_field"),
         )
         for d in raw.get("definitions", [])
     )
@@ -150,6 +159,7 @@ def load_language_config(language: str, configs_dir: Path | None = None) -> Lang
             child_node_type=inh_raw.get("child_node_type"),
             child_name_field=inh_raw.get("child_name_field"),
             bases_field=inh_raw.get("bases_field"),
+            child_via_field=inh_raw.get("child_via_field"),
         )
 
     return LanguageConfig(

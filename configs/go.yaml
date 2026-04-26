@@ -1,0 +1,104 @@
+language: go
+
+dependency_paths:
+  - vendor
+
+module_node_type: source_file
+
+definitions:
+  - node_type: function_declaration
+    kind: function
+    name_field: name
+    scope_boundary: true
+
+  # `func (d *Dog) Bark()` — `receiver` field carries the receiver type, which
+  # we hoist into the qualified_name via qualified_name_prefix_from_field.
+  - node_type: method_declaration
+    kind: method
+    name_field: name
+    scope_boundary: true
+    qualified_name_prefix_from_field: receiver
+
+  # `type Foo …` — the per-name node inside a `type_declaration` block.
+  # Covers struct, interface, and named-type declarations alike. The kind is
+  # 'type'; cross-file inheritance widens the `interface` filter to include
+  # 'type' so Go interfaces participate in inherits_edges resolution.
+  - node_type: type_spec
+    kind: type
+    name_field: name
+    scope_boundary: true     # so embedded method_elem children scope upward
+
+  - node_type: type_alias
+    kind: type
+    name_field: name
+
+  # Method specifications inside an `interface_type` body. Their enclosing
+  # scope (via the AST walk) is the surrounding type_spec — so an interface's
+  # method_elem rows have scope_id = that interface's def_id, which is what
+  # the existing override-generation pass keys on.
+  - node_type: method_elem
+    kind: method
+    name_field: name
+
+  # Top-level constants only — `require_enclosing_scope_kind: [module]` keeps
+  # locally-declared `const` blocks inside functions out.
+  - node_type: const_spec
+    kind: const
+    name_field: name
+    name_field_multiple: true
+    require_enclosing_scope_kind: [module]
+
+  # Top-level vars only. Same scope-restriction reasoning.
+  - node_type: var_spec
+    kind: var
+    name_field: name
+    name_field_multiple: true
+    require_enclosing_scope_kind: [module]
+
+references:
+  - node_type: identifier
+    exclude_parent_field:
+      - function_declaration.name
+      - method_declaration.name
+      - type_spec.name
+      - type_alias.name
+      - const_spec.name
+      - var_spec.name
+      - parameter_declaration.name
+      - import_spec.name
+      - selector_expression.field   # handled by selector_expression rule below
+    confidence: certain
+
+  - node_type: type_identifier
+    exclude_parent_field:
+      - type_spec.name
+      - type_alias.name
+    confidence: certain
+
+  # `pkg.Foo` / `obj.Method` — extract the right-hand `field`. Go's analog to
+  # Python `attribute` and Solidity `member_expression`.
+  - node_type: selector_expression
+    name_field: field
+    confidence: inferred
+
+calls:
+  - node_type: call_expression
+    function_field: function
+
+data_access:
+  target_kinds: [var, const]
+  write_when_parent_field:
+    - assignment_statement.left
+    - short_var_declaration.left
+
+imports:
+  node_types: [import_declaration]
+
+inheritance:
+  # `type Foo interface { io.Reader; Bar; ... }`. Drilling: parent (type_spec)
+  # → `type` field → interface_type → children of type type_elem → an inner
+  # _type that resolves via _terminal_identifier. Non-interface type_specs
+  # (struct, named types) drop out because their inner node has no type_elem.
+  parent_node_types: [type_spec]
+  child_via_field: type
+  child_node_type: type_elem

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Iterable
 
 import asyncpg
@@ -84,6 +84,9 @@ class RepoIndex:
     name_index: dict[str, list[tuple[int, int]]]        # def_name → [(file_id, def_id), ...]
     qualified_to_def: dict[tuple[int, str], int]        # (file_id, def_name) → def_id
     package_index_python: dict[str, int]                # dotted module path → file_id
+    package_index_go: dict[str, int]                    # module-relative pkg dir → representative file_id
+    go_pkg_files: dict[str, list[int]]                  # module-relative pkg dir → every file_id in that pkg
+    go_module_path: str | None                          # value from `module …` line in go.mod, if present
     files_by_id: dict[int, str]                         # file_id → rel_path
     file_languages: dict[int, str]                      # file_id → language
     repo_id: int
@@ -163,6 +166,44 @@ def _extract_imports_python(file_id: int, source_rel_path: str, ts_root, db_id_f
     return out
 
 
+def _extract_imports_go(file_id: int, source_rel_path: str, ts_root, db_id_for) -> list[ImportEntry]:
+    """Pull import_spec nodes (one per imported path) from a Go CST.
+
+    Both `import "fmt"` and grouped `import ( "fmt"; alias "x/y" )` produce
+    import_spec nodes; the latter wraps them in an import_spec_list. The DFS
+    walks both shapes uniformly. Each spec carries one path; we attach the row
+    to the spec's node_id (not the enclosing import_declaration) so each
+    imported path has its own row.
+    """
+    out: list[ImportEntry] = []
+    for ts in _dfs(ts_root):
+        if ts.type != "import_spec":
+            continue
+        path_node = ts.child_by_field_name("path")
+        if path_node is None:
+            continue
+        raw = _strip_quotes(_text(path_node))
+        # Optional `alias "x/y"` form. Skip blank-import (`_`) and dot-import (`.`)
+        # — they don't bind a name we can resolve references against.
+        alias_node = ts.child_by_field_name("name")
+        if alias_node is not None and alias_node.type == "package_identifier":
+            imported = _text(alias_node)
+        else:
+            imported = raw.rsplit("/", 1)[-1]
+        out.append(
+            ImportEntry(
+                file_id=file_id,
+                node_id=db_id_for[ts.id],
+                language="go",
+                source_rel_path=source_rel_path,
+                import_path=raw,
+                imported_names=[imported],
+                is_relative=False,
+            )
+        )
+    return out
+
+
 def _extract_imports_solidity(file_id: int, source_rel_path: str, ts_root, db_id_for) -> list[ImportEntry]:
     """Pull import_directive nodes from a Solidity CST."""
     out: list[ImportEntry] = []
@@ -196,6 +237,7 @@ def _extract_imports_solidity(file_id: int, source_rel_path: str, ts_root, db_id
 _EXTRACTORS = {
     "python": _extract_imports_python,
     "solidity": _extract_imports_solidity,
+    "go": _extract_imports_go,
 }
 
 
@@ -231,11 +273,18 @@ async def build_repo_index(conn: asyncpg.Connection, repo_id: int) -> RepoIndex:
         """,
         repo_id,
     )
+    repo_row = await conn.fetchrow(
+        "SELECT root_path FROM repos WHERE id=$1", repo_id,
+    )
+    repo_root = repo_row["root_path"] if repo_row else None
 
     file_index: dict[str, int] = {}
     files_by_id: dict[int, str] = {}
     file_languages: dict[int, str] = {}
     pkg_index: dict[str, int] = {}
+    pkg_index_go: dict[str, int] = {}
+    pkg_files_go: dict[str, list[int]] = {}
+    has_go = False
     for f in files:
         fid = f["id"]
         file_index[f["path"]] = fid
@@ -245,6 +294,26 @@ async def build_repo_index(conn: asyncpg.Connection, repo_id: int) -> RepoIndex:
             dotted = _python_dotted_for(f["path"])
             if dotted:
                 pkg_index[dotted] = fid
+        elif f["language"] == "go":
+            has_go = True
+            # Package dir = parent directory. `pkg_index_go` maps to one
+            # representative for the imports.resolved_file_id FK (which is
+            # singular); `pkg_files_go` keeps the full list so Phase 3's
+            # cross-file linker can fuzzy-match across the whole package.
+            pkg_dir = "/".join(f["path"].split("/")[:-1])
+            pkg_index_go.setdefault(pkg_dir, fid)
+            pkg_files_go.setdefault(pkg_dir, []).append(fid)
+
+    # Read go.mod once if any Go file is present and a root_path is known.
+    go_module_path: str | None = None
+    if has_go and repo_root:
+        gomod = Path(repo_root) / "go.mod"
+        if gomod.is_file():
+            for line in gomod.read_text().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("module "):
+                    go_module_path = stripped.split(None, 1)[1].strip().strip('"')
+                    break
 
     name_index: dict[str, list[tuple[int, int]]] = {}
     qualified_to_def: dict[tuple[int, str], int] = {}
@@ -257,6 +326,9 @@ async def build_repo_index(conn: asyncpg.Connection, repo_id: int) -> RepoIndex:
         name_index=name_index,
         qualified_to_def=qualified_to_def,
         package_index_python=pkg_index,
+        package_index_go=pkg_index_go,
+        go_pkg_files=pkg_files_go,
+        go_module_path=go_module_path,
         files_by_id=files_by_id,
         file_languages=file_languages,
         repo_id=repo_id,
@@ -370,11 +442,45 @@ def _normalize_relative_posix(path: str) -> str:
     return "/".join(parts)
 
 
+def _resolve_go(entry: ImportEntry, idx: RepoIndex) -> ResolvedImport:
+    """Classify a Go import path.
+
+    Three buckets, in priority order:
+      - intra_repo: matches the module path declared in go.mod, suffix maps
+        to a known package directory.
+      - external (stdlib): first segment has no dot ("fmt", "net/http", …).
+      - external (third-party): everything else, e.g. github.com/x/y. The
+        package_name keeps the org/repo prefix so the same dependency rolls
+        up across multiple subpackage imports.
+    """
+    raw = entry.import_path
+    mod = idx.go_module_path
+    if mod and (raw == mod or raw.startswith(mod + "/")):
+        suffix = "" if raw == mod else raw[len(mod) + 1 :]
+        target = idx.package_index_go.get(suffix)
+        if target is not None:
+            return ResolvedImport(entry, "intra_repo", resolved_file_id=target)
+        return ResolvedImport(entry, "unresolved")
+
+    first = raw.split("/", 1)[0]
+    if "." not in first:
+        return ResolvedImport(entry, "external", package_name=raw)
+
+    parts = raw.split("/")
+    if first in {"github.com", "gitlab.com", "bitbucket.org"} and len(parts) >= 3:
+        pkg = "/".join(parts[:3])
+    else:
+        pkg = parts[0]
+    return ResolvedImport(entry, "external", package_name=pkg)
+
+
 def _resolve_one(entry: ImportEntry, idx: RepoIndex, cfg: LanguageConfig) -> ResolvedImport:
     if entry.language == "python":
         return _resolve_python(entry, idx)
     if entry.language == "solidity":
         return _resolve_solidity(entry, idx, cfg)
+    if entry.language == "go":
+        return _resolve_go(entry, idx)
     return ResolvedImport(entry, "unresolved")
 
 
@@ -484,12 +590,30 @@ async def _link_cross_file(
 
     # importer_file_id → set(imported_file_ids)
     imported_files_by: dict[int, set[int]] = {}
+
+    # Go: files in the same package share scope without an explicit import. Seed
+    # every Go file with its package peers so cross-file ref/call/inheritance
+    # linking can find symbols declared by a sibling file.
+    for pkg_dir, peers in idx.go_pkg_files.items():
+        peer_set = set(peers)
+        for fid in peers:
+            imported_files_by.setdefault(fid, set()).update(peer_set - {fid})
+
     # importer_file_id → name → target_def_id (Tier A direct hits)
     direct_by: dict[int, dict[str, int]] = {}
     for row in intra_imports:
         importer = row["file_id"]
         target_file = row["resolved_file_id"]
-        imported_files_by.setdefault(importer, set()).add(target_file)
+        # Go: an `import "x/y/z"` references a package, not a single file.
+        # Expand to every sibling .go file so Tier-B fuzzy matching can find
+        # symbols defined in any peer file of the imported package.
+        target_files: set[int] = {target_file}
+        if idx.file_languages.get(target_file) == "go":
+            target_path = idx.files_by_id.get(target_file, "")
+            pkg_dir = "/".join(target_path.split("/")[:-1])
+            peers = idx.go_pkg_files.get(pkg_dir, [])
+            target_files.update(peers)
+        imported_files_by.setdefault(importer, set()).update(target_files)
         for name in (row["imported_names"] or []):
             target_def_id = idx.qualified_to_def.get((target_file, name))
             if target_def_id is not None:
@@ -615,7 +739,7 @@ async def _link_cross_file_inheritance(
         """
         SELECT d.id, d.file_id, d.name
         FROM definitions d JOIN files f ON f.id = d.file_id
-        WHERE f.repo_id = $1 AND d.kind IN ('contract', 'interface', 'class')
+        WHERE f.repo_id = $1 AND d.kind IN ('contract', 'interface', 'class', 'type')
         """,
         repo_id,
     )

@@ -195,6 +195,13 @@ async def index_repo(
     indexed: list[IndexFileResult] = []
     skipped: list[IndexFileResult] = []
     async with pool.acquire() as conn:
+        # Record the on-disk root so Phase 3 resolvers (e.g. Go's go.mod parse)
+        # can find files outside the DB. Idempotent; overwrites if changed.
+        await conn.execute(
+            "UPDATE repos SET root_path=$2 WHERE id=$1",
+            repo_id,
+            str(Path(repo_root).resolve()),
+        )
         for discovered in walk_repo(cfg):
             async with conn.transaction():
                 result = await index_file(conn, repo_id, discovered)
