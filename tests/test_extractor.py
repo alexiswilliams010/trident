@@ -65,6 +65,23 @@ def test_walker_yields_go_files(go_fixture_root: Path) -> None:
     assert all(p.endswith(".go") for p in found)
 
 
+def test_walker_yields_node_files(node_fixture_root: Path) -> None:
+    """JS, JSX, TS, and TSX files all surface from the walker with the right
+    language tag. node_modules/ must be pruned."""
+    cfg = WalkConfig.with_defaults(node_fixture_root)
+    found = {d.rel_path: d.language for d in walk_repo(cfg)}
+    assert found["src/index.js"] == "javascript"
+    assert found["src/components/App.jsx"] == "javascript"
+    assert found["src/lib.ts"] == "typescript"
+    assert found["src/components/Button.tsx"] == "typescript"
+    assert found["src/utils/helpers.ts"] == "typescript"
+    # node_modules/ is in DEFAULT_DEP_PATHS for both languages.
+    assert all("node_modules/" not in p for p in found), sorted(found)
+    # package.json / tsconfig.json are not .js/.ts and should not be yielded.
+    assert "package.json" not in found
+    assert "tsconfig.json" not in found
+
+
 # ────────────────────────────────────────────────────────────────────
 # Extractor tests (require Postgres)
 # ────────────────────────────────────────────────────────────────────
@@ -190,6 +207,48 @@ async def test_index_go_fixture(clean_repo, go_fixture_root: Path) -> None:
             "WHERE file_id=$1 AND node_type='method_elem'", composed_id,
         )
         assert method_elems >= 1
+
+
+async def test_index_node_fixture(clean_repo, node_fixture_root: Path) -> None:
+    pool, repo_id = clean_repo
+    result = await index_repo(pool, repo_id, node_fixture_root)
+
+    rel_paths = {r.rel_path for r in result.indexed}
+    assert "src/index.js" in rel_paths
+    assert "src/lib.ts" in rel_paths
+    assert "src/pets.ts" in rel_paths
+    assert "src/components/App.jsx" in rel_paths
+    assert "src/components/Button.tsx" in rel_paths
+    # node_modules/ stays out.
+    assert all("node_modules" not in p for p in rel_paths), rel_paths
+
+    async with pool.acquire() as conn:
+        # `.tsx` parses via the tsx sub-grammar — the JSX-specific node types
+        # should appear in Button.tsx's CST.
+        button_id = await conn.fetchval(
+            "SELECT id FROM files WHERE repo_id=$1 AND path=$2",
+            repo_id, "src/components/Button.tsx",
+        )
+        jsx_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM nodes WHERE file_id=$1 "
+            "AND node_type IN ('jsx_element', 'jsx_self_closing_element', "
+            "                  'jsx_opening_element', 'jsx_closing_element')",
+            button_id,
+        )
+        assert jsx_count >= 2, "expected JSX nodes in .tsx file"
+
+        # Same check for .jsx via the JS grammar.
+        app_id = await conn.fetchval(
+            "SELECT id FROM files WHERE repo_id=$1 AND path=$2",
+            repo_id, "src/components/App.jsx",
+        )
+        jsx_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM nodes WHERE file_id=$1 "
+            "AND node_type IN ('jsx_element', 'jsx_self_closing_element', "
+            "                  'jsx_opening_element', 'jsx_closing_element')",
+            app_id,
+        )
+        assert jsx_count >= 1, "expected JSX nodes in .jsx file"
 
 
 async def test_incremental_indexing_skips_unchanged(clean_repo, python_fixture_root: Path) -> None:

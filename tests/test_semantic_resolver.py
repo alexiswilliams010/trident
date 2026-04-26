@@ -36,6 +36,36 @@ def test_solidity_yaml_loads():
     assert any(r.node_type == "emit_statement" for r in cfg.calls)
 
 
+def test_javascript_yaml_loads():
+    cfg = load_language_config("javascript")
+    assert cfg.language == "javascript"
+    assert cfg.module_node_type == "program"
+    kinds = {r.kind for r in cfg.definitions}
+    assert {"function", "class", "method", "variable"} <= kinds
+    assert any(r.node_type == "call_expression" for r in cfg.calls)
+    # Single inheritance rule for `class extends`.
+    assert len(cfg.inheritance) == 1
+    assert "class_declaration" in cfg.inheritance[0].parent_node_types
+
+
+def test_typescript_yaml_loads():
+    cfg = load_language_config("typescript")
+    assert cfg.language == "typescript"
+    kinds = {r.kind for r in cfg.definitions}
+    # Superset of JS plus interface / type / enum.
+    assert {"function", "class", "method", "variable", "interface", "type", "enum"} <= kinds
+    # Three inheritance rules: extends, implements, interface-extends.
+    assert len(cfg.inheritance) == 3
+    impl_rule = next(
+        r for r in cfg.inheritance if r.child_node_type == "implements_clause"
+    )
+    assert impl_rule.child_iterate_identifiers is True
+    iface_rule = next(
+        r for r in cfg.inheritance if r.child_node_type == "extends_type_clause"
+    )
+    assert iface_rule.child_iterate_identifiers is True
+
+
 # ────────────────────────────────────────────────────────────────────
 # End-to-end: extractor + resolver on the Python fixture
 # ────────────────────────────────────────────────────────────────────
@@ -223,3 +253,94 @@ async def test_resolve_solidity_emit_call_edge(clean_repo, solidity_fixture_root
         )
         assert row is not None
         assert row["kind"] == "event"
+
+
+# ────────────────────────────────────────────────────────────────────
+# JavaScript / TypeScript
+# ────────────────────────────────────────────────────────────────────
+
+
+async def test_resolve_javascript_definitions(clean_repo, node_fixture_root: Path):
+    """Top-level JS definitions: class with methods, function, top-level
+    variable_declarator (require() bindings count as such)."""
+    pool, repo_id = clean_repo
+    await index_repo(pool, repo_id, node_fixture_root)
+    await resolve_repo(pool, repo_id)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT d.kind, d.qualified_name FROM definitions d
+            JOIN files f ON f.id=d.file_id
+            WHERE f.repo_id=$1 AND f.path='src/index.js' AND d.kind <> 'module'
+            ORDER BY d.qualified_name
+            """,
+            repo_id,
+        )
+        kinds_by_qn = {r["qualified_name"]: r["kind"] for r in rows}
+        assert kinds_by_qn["index.Calculator"] == "class"
+        assert kinds_by_qn["index.Calculator.constructor"] == "method"
+        assert kinds_by_qn["index.Calculator.describe"] == "method"
+        assert kinds_by_qn["index.run"] == "function"
+        # require() bound names are top-level lexical declarations and surface
+        # as `variable` definitions.
+        assert kinds_by_qn["index.leftpad"] == "variable"
+        assert kinds_by_qn["index.scoped"] == "variable"
+        # `const a = ...` inside Calculator.describe is INSIDE a method scope
+        # and must be filtered out by require_enclosing_scope_kind: [module].
+        assert "index.Calculator.describe.a" not in kinds_by_qn
+
+
+async def test_resolve_typescript_definitions(clean_repo, node_fixture_root: Path):
+    """TS-only constructs: interface, type alias, enum, and method_signature
+    inside an interface body."""
+    pool, repo_id = clean_repo
+    await index_repo(pool, repo_id, node_fixture_root)
+    await resolve_repo(pool, repo_id)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT d.kind, d.qualified_name FROM definitions d
+            JOIN files f ON f.id=d.file_id
+            WHERE f.repo_id=$1 AND d.kind IN ('interface','type','enum','method')
+            ORDER BY d.qualified_name
+            """,
+            repo_id,
+        )
+        kinds_by_qn = {r["qualified_name"]: r["kind"] for r in rows}
+        assert kinds_by_qn["lib.Greeter"] == "interface"
+        assert kinds_by_qn["lib.Bilingual"] == "interface"
+        assert kinds_by_qn["helpers.Closer"] == "interface"
+        assert kinds_by_qn["helpers.Pair"] == "type"
+        assert kinds_by_qn["helpers.Status"] == "enum"
+        # Interface methods (`method_signature`) become method defs so
+        # override generation can connect implementing classes to them.
+        assert kinds_by_qn["lib.Greeter.greet"] == "method"
+        assert kinds_by_qn["helpers.Closer.close"] == "method"
+
+
+async def test_resolve_node_intra_file_inheritance(clean_repo, node_fixture_root: Path):
+    """`interface Bilingual extends Greeter` is intra-file in lib.ts and must
+    resolve to Greeter via the `extends_type_clause` rule."""
+    pool, repo_id = clean_repo
+    await index_repo(pool, repo_id, node_fixture_root)
+    await resolve_repo(pool, repo_id)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT child.qualified_name AS child, ie.base_name,
+                   base.qualified_name AS base, ie.confidence
+            FROM inherits_edges ie
+            JOIN definitions child ON child.id=ie.child_def_id
+            LEFT JOIN definitions base ON base.id=ie.base_def_id
+            JOIN files f ON f.id=child.file_id
+            WHERE f.repo_id=$1 AND child.qualified_name='lib.Bilingual'
+            """,
+            repo_id,
+        )
+        assert len(rows) == 1
+        assert rows[0]["base_name"] == "Greeter"
+        assert rows[0]["base"] == "lib.Greeter"
+        assert rows[0]["confidence"] == "certain"

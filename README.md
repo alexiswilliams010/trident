@@ -5,6 +5,10 @@ repository into a relational graph (Tier 1 syntactic CST → Tier 2 semantic
 edges → Tier 3 chunks + embeddings) so an LLM can retrieve coherent
 multi-file context instead of token-window slop.
 
+**Supported languages:** Python, Solidity, Go, JavaScript (`.js`/`.jsx`/`.mjs`/`.cjs`),
+TypeScript (`.ts`/`.tsx`). Adding a new language is mostly a YAML config —
+see `configs/<language>.yaml` for examples.
+
 ---
 
 ## Prerequisites
@@ -82,15 +86,42 @@ them — there are no language-specific shortcuts.
 # index into shared DB
 make index REPO_PATH=tests/fixtures/python_fixture            REPO_NAME=python_fixture
 make index REPO_PATH=tests/fixtures/solidity_foundry_fixture  REPO_NAME=solidity_fixture
+make index REPO_PATH=tests/fixtures/go_fixture                REPO_NAME=go_fixture
+make index REPO_PATH=tests/fixtures/node_fixture              REPO_NAME=node_fixture
 
 # resolution stats
 make diagnose REPO_NAME=python_fixture
 make diagnose REPO_NAME=solidity_fixture
+make diagnose REPO_NAME=node_fixture
 
 # embed with the deterministic stub (no API key needed)
 .venv/bin/python -m cli.index tests/fixtures/python_fixture           --repo-name python_fixture   --embed fake
 .venv/bin/python -m cli.index tests/fixtures/solidity_foundry_fixture --repo-name solidity_fixture --embed fake
+.venv/bin/python -m cli.index tests/fixtures/node_fixture             --repo-name node_fixture     --embed fake
 ```
+
+The `node_fixture` is a mixed JS/TS/JSX/TSX project that exercises the
+language-specific bits of the resolver:
+
+- **Module resolution** — relative imports (`./lib`) probe `.ts/.tsx/.js/.jsx/.mjs/.cjs`
+  and `index.<ext>` in that order, matching what `bundler` / TS resolution does.
+- **tsconfig `paths`** — `compilerOptions.baseUrl` and `compilerOptions.paths`
+  are honored, so `import { x } from "@app/lib"` resolves through the alias
+  declared in `tsconfig.json`. The `extends` chain is followed up to 3 hops
+  and JSON-with-comments is tolerated.
+- **Bare specifiers** — `react`, `react/jsx-runtime`, `@scoped/pkg/sub` all
+  classify as external; package names roll up so subpath imports share one
+  `external_dependencies` row per package.
+- **CommonJS** — `require("…")` calls are extracted alongside ESM
+  `import` / `export` re-exports.
+- **Inheritance** — `class extends`, TS `class implements` (multi-base), and
+  TS `interface extends` (multi-base) all populate `inherits_edges`; concrete
+  methods on classes that `implements` an interface generate override edges
+  against that interface's `method_signature` declarations.
+
+`node_modules/` contents are not indexed in v1 — vendored packages still
+classify as external. The fixture vendors a tiny `leftpad` package to
+exercise the bare-specifier classification path under realistic conditions.
 
 Retrieval queries (use `--fake` for the stub embedder; otherwise set
 `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` or use a

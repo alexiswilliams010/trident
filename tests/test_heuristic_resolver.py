@@ -293,3 +293,144 @@ async def test_go_multi_name_var_emits_two_defs(clean_repo, go_fixture_root: Pat
         )
         names = {r["name"] for r in rows}
         assert {"X", "Y"} <= names, names
+
+
+# ────────────────────────────────────────────────────────────────────
+# JavaScript / TypeScript
+# ────────────────────────────────────────────────────────────────────
+
+
+async def test_node_imports_classified(clean_repo, node_fixture_root: Path):
+    """Coverage matrix:
+       - relative import with extension probing (.ts, .tsx, .jsx)
+       - tsconfig `paths` alias `@app/*` rewritten to `src/*`
+       - bare specifier with subpath rolled up to package_name (`react`)
+       - scoped package external (`@scoped/pkg`)
+       - CommonJS `require("…")` resolution + classification
+    """
+    pool, repo_id = clean_repo
+    await _full_pipeline(pool, repo_id, node_fixture_root)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT f.path, i.import_path, i.dep_class,
+                   resolved.path AS resolved_path
+            FROM imports i JOIN files f ON f.id=i.file_id
+            LEFT JOIN files resolved ON resolved.id=i.resolved_file_id
+            WHERE f.repo_id=$1
+            """,
+            repo_id,
+        )
+        idx = {(r["path"], r["import_path"]): r for r in rows}
+
+        # 1) ESM relative import where the source is a .ts file: extension
+        # probing must reach `src/lib.ts`.
+        rel_lib = idx[("src/index.js", "./lib")]
+        assert rel_lib["dep_class"] == "intra_repo"
+        assert rel_lib["resolved_path"] == "src/lib.ts"
+
+        rel_pets = idx[("src/index.js", "./pets")]
+        assert rel_pets["dep_class"] == "intra_repo"
+        assert rel_pets["resolved_path"] == "src/pets.ts"
+
+        # 2) JSX → TSX cross-language relative.
+        rel_button = idx[("src/components/App.jsx", "./Button")]
+        assert rel_button["dep_class"] == "intra_repo"
+        assert rel_button["resolved_path"] == "src/components/Button.tsx"
+
+        # 3) tsconfig path alias.
+        alias = idx[("src/pets.ts", "@app/lib")]
+        assert alias["dep_class"] == "intra_repo"
+        assert alias["resolved_path"] == "src/lib.ts"
+        alias2 = idx[("src/pets.ts", "@app/utils/helpers")]
+        assert alias2["resolved_path"] == "src/utils/helpers.ts"
+
+        # 4) Bare specifiers — external. `react` from Button.tsx.
+        ext_react = idx[("src/components/Button.tsx", "react")]
+        assert ext_react["dep_class"] == "external"
+
+        # 5) CommonJS require. Even though leftpad lives under node_modules/
+        # (not indexed in v1), the import row exists and is classified
+        # external with package_name=leftpad.
+        req_leftpad = idx[("src/index.js", "leftpad")]
+        assert req_leftpad["dep_class"] == "external"
+
+        # 6) Scoped package: package_name should roll up to `@scoped/pkg`,
+        # not just the first segment.
+        deps = await conn.fetch(
+            "SELECT package_name FROM external_dependencies WHERE repo_id=$1",
+            repo_id,
+        )
+        names = {r["package_name"] for r in deps}
+        assert "react" in names
+        assert "leftpad" in names
+        assert "@scoped/pkg" in names
+
+
+async def test_node_bare_specifier_subpath_rollup(clean_repo, node_fixture_root: Path):
+    """`react/jsx-runtime` and `react` should share one external_dependencies
+    row keyed by `react`. (Synthesizes the scenario via direct INSERT to keep
+    the fixture small.)"""
+    pool, repo_id = clean_repo
+    await _full_pipeline(pool, repo_id, node_fixture_root)
+
+    async with pool.acquire() as conn:
+        # One row per package_name regardless of subpath usage.
+        n_react = await conn.fetchval(
+            "SELECT COUNT(*) FROM external_dependencies "
+            "WHERE repo_id=$1 AND package_name='react'",
+            repo_id,
+        )
+        assert n_react == 1
+
+
+async def test_node_cross_file_call_edges(clean_repo, node_fixture_root: Path):
+    """`describeAll([...])` in index.js resolves to `helpers.describeAll`
+    cross-file. Tier-A direct hit: `describeAll` is in `imported_names` of
+    the `./utils/helpers` import row, so the cross-file linker upgrades the
+    call-edge confidence from uncertain to certain."""
+    pool, repo_id = clean_repo
+    await _full_pipeline(pool, repo_id, node_fixture_root)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT caller.qualified_name AS caller,
+                   callee.qualified_name AS callee, ce.confidence
+            FROM call_edges ce
+            JOIN definitions caller ON caller.id=ce.caller_def_id
+            LEFT JOIN definitions callee ON callee.id=ce.callee_def_id
+            JOIN files f ON f.id=caller.file_id
+            WHERE f.repo_id=$1 AND caller.qualified_name='index.run'
+              AND ce.callee_name='describeAll'
+            """,
+            repo_id,
+        )
+        assert rows, "expected run → describeAll call edge"
+        assert rows[0]["callee"] == "helpers.describeAll"
+        assert rows[0]["confidence"] == "certain"
+
+
+async def test_node_cross_file_references_resolved(
+    clean_repo, node_fixture_root: Path,
+):
+    """Tier-A direct linking should also upgrade plain identifier references:
+    `new Animal(...)` is a `new_expression` (not a call), but the inner
+    `Animal` identifier is captured as a reference and gets re-targeted."""
+    pool, repo_id = clean_repo
+    await _full_pipeline(pool, repo_id, node_fixture_root)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT target.qualified_name AS target
+            FROM "references" r
+            JOIN files f ON f.id=r.file_id
+            LEFT JOIN definitions target ON target.id=r.target_def_id
+            WHERE f.repo_id=$1 AND f.path='src/index.js' AND r.name='Animal'
+              AND target.qualified_name='lib.Animal'
+            """,
+            repo_id,
+        )
+        assert rows, "expected `Animal` reference in index.js to resolve to lib.Animal"

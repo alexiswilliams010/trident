@@ -284,6 +284,114 @@ async def test_go_interface_method_overrides(clean_repo, go_fixture_root: Path):
 # ────────────────────────────────────────────────────────────────────
 
 
+# ────────────────────────────────────────────────────────────────────
+# JavaScript / TypeScript
+# ────────────────────────────────────────────────────────────────────
+
+
+async def test_node_class_extends_resolves_cross_file(
+    clean_repo, node_fixture_root: Path,
+):
+    """`class Dog extends Animal` (pets.ts) → Animal lives in lib.ts. The
+    extends edge must surface and resolve cross-file."""
+    pool, repo_id = clean_repo
+    await _seed(pool, repo_id, node_fixture_root)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT ie.base_name, base.qualified_name AS base, ie.confidence
+            FROM inherits_edges ie
+            JOIN definitions child ON child.id = ie.child_def_id
+            LEFT JOIN definitions base ON base.id = ie.base_def_id
+            JOIN files f ON f.id = child.file_id
+            WHERE f.repo_id = $1 AND child.qualified_name = 'pets.Dog'
+            """,
+            repo_id,
+        )
+        # Expect both `extends Animal` and `implements Greeter` rows.
+        by_name = {r["base_name"]: r for r in rows}
+        assert "Animal" in by_name
+        assert by_name["Animal"]["base"] == "lib.Animal"
+        assert by_name["Animal"]["confidence"] == "certain"
+
+
+async def test_node_class_implements_multi_resolves_cross_file(
+    clean_repo, node_fixture_root: Path,
+):
+    """`class Cat extends Animal implements Greeter, Closer` produces three
+    inherits_edges rows (one extends + two implements). All resolve cross-file:
+    Animal/Greeter via lib.ts, Closer via utils/helpers.ts."""
+    pool, repo_id = clean_repo
+    await _seed(pool, repo_id, node_fixture_root)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT ie.base_name, base.qualified_name AS base
+            FROM inherits_edges ie
+            JOIN definitions child ON child.id = ie.child_def_id
+            LEFT JOIN definitions base ON base.id = ie.base_def_id
+            JOIN files f ON f.id = child.file_id
+            WHERE f.repo_id = $1 AND child.qualified_name = 'pets.Cat'
+            """,
+            repo_id,
+        )
+        by_name = {r["base_name"]: r["base"] for r in rows}
+        assert by_name == {
+            "Animal":  "lib.Animal",
+            "Greeter": "lib.Greeter",
+            "Closer":  "helpers.Closer",
+        }
+
+
+async def test_node_interface_extends_resolves_intra_file(
+    clean_repo, node_fixture_root: Path,
+):
+    """`interface Bilingual extends Greeter` — both live in lib.ts, so the
+    edge must resolve intra-file via `extends_type_clause`."""
+    pool, repo_id = clean_repo
+    await _seed(pool, repo_id, node_fixture_root)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT base.qualified_name AS base, ie.confidence
+            FROM inherits_edges ie
+            JOIN definitions child ON child.id = ie.child_def_id
+            JOIN definitions base  ON base.id  = ie.base_def_id
+            JOIN files f ON f.id = child.file_id
+            WHERE f.repo_id = $1 AND child.qualified_name = 'lib.Bilingual'
+            """,
+            repo_id,
+        )
+        assert row is not None
+        assert row["base"] == "lib.Greeter"
+        assert row["confidence"] == "certain"
+
+
+async def test_node_overrides_via_implements(clean_repo, node_fixture_root: Path):
+    """`Dog implements Greeter` plus a concrete `greet(...)` should produce an
+    override edge from `pets.Dog.greet` to `lib.Greeter.greet`. Same logic
+    drives `Cat.close → Closer.close`."""
+    pool, repo_id = clean_repo
+    await _seed(pool, repo_id, node_fixture_root)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT child.qualified_name AS child, base.qualified_name AS base
+            FROM overrides_edges oe
+            JOIN definitions child ON child.id = oe.child_def_id
+            JOIN definitions base  ON base.id  = oe.base_def_id
+            JOIN files f ON f.id = child.file_id
+            WHERE f.repo_id = $1
+            ORDER BY child.qualified_name, base.qualified_name
+            """,
+            repo_id,
+        )
+        pairs = {(r["child"], r["base"]) for r in rows}
+        assert ("pets.Dog.greet", "lib.Greeter.greet") in pairs
+        assert ("pets.Cat.greet", "lib.Greeter.greet") in pairs
+        assert ("pets.Cat.close", "helpers.Closer.close") in pairs
+
+
 async def test_chunk_enrichment_for_overriding_method(
     clean_repo, solidity_fixture_root: Path,
 ):
