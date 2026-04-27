@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -151,6 +152,55 @@ def _greedy_pack_section(
     return header + "\n" + "\n\n".join(accepted)
 
 
+# Beyond a few dozen entries the `dependencies` listing in metadata stops
+# being useful retrieval signal — and on pathological inputs (auto-generated
+# bindings, minified bundles) the JSON serialization of thousands of names
+# alone exceeded the chunk's token budget. Cap and tag.
+MAX_DEPS_IN_METADATA = 50
+
+# Defense-in-depth ceiling per granularity. Anything past this is replaced
+# with a minimal placeholder chunk before persistence — see
+# `_degrade_if_oversize`. The embedder's `DEFAULT_MAX_INPUT_TOKENS` (8000) is
+# the outermost guard; these caps catch things earlier so the `chunks` table
+# doesn't accumulate unembeddable rows.
+HARD_OUTPUT_CAP = {
+    GRANULARITY_FUNCTION:     1500,
+    GRANULARITY_MODULE:       2000,
+    GRANULARITY_CROSS_MODULE: 3000,
+}
+
+
+def _truncate_deps(deps: list[str]) -> tuple[list[str], int]:
+    """Cap the dependency list. Returns (capped, n_truncated)."""
+    if len(deps) <= MAX_DEPS_IN_METADATA:
+        return deps, 0
+    return deps[:MAX_DEPS_IN_METADATA], len(deps) - MAX_DEPS_IN_METADATA
+
+
+def _degrade_if_oversize(
+    granularity: str,
+    metadata: dict,
+    content: str,
+    anchor_label: str,
+    file_path: str,
+) -> tuple[dict, str, int]:
+    """If `content` exceeds the per-granularity hard cap, return a minimal
+    placeholder chunk instead. Keeps the chunks table free of garbage and
+    avoids wasting embedder calls on rows the gateway will reject.
+    """
+    tc = count_tokens(content)
+    cap = HARD_OUTPUT_CAP.get(granularity)
+    if cap is None or tc <= cap:
+        return metadata, content, tc
+    degraded = {**metadata, "degraded": "oversize", "original_token_count": tc}
+    # Minimal stub: preamble + one-line marker, no source / callees / etc.
+    # The original content was almost certainly generated/minified code that
+    # has no useful retrieval signal anyway.
+    stub = f"# {granularity} (degraded): {anchor_label} ({file_path})"
+    new_content = _md_preamble(degraded) + "\n\n" + stub
+    return degraded, new_content, count_tokens(new_content)
+
+
 # ────────────────────────────────────────────────────────────────────
 # Helpers
 # ────────────────────────────────────────────────────────────────────
@@ -215,11 +265,12 @@ def _hash_content(metadata: dict, content: str) -> str:
 
 
 async def _load_defs(conn: asyncpg.Connection, repo_id: int) -> list[_DefRow]:
-    # Pull raw_content once per file (261 rows for a mid-size repo) rather than
-    # once per definition. Joining `f.raw_content` into the per-def fetch made
-    # Postgres ship the whole file body N×defs-in-that-file times and asyncpg
-    # materialize a fresh Python string per row — for a large Solidity repo
-    # that grew into multi-GB and got the OOM killer's attention.
+    # Pull raw_content once per file (a few hundred rows for a mid-size repo)
+    # rather than once per definition. Joining `f.raw_content` into the per-def
+    # fetch made Postgres ship the whole file body N×defs-in-that-file times
+    # and asyncpg materialize a fresh string per row — on a large repo with
+    # tens of thousands of defs that grew into multi-GB and got the OOM
+    # killer's attention.
     file_rows = await conn.fetch(
         "SELECT id, raw_content, path, language FROM files WHERE repo_id = $1",
         repo_id,
@@ -529,12 +580,14 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
     soft_budget = TOKEN_BUDGETS[GRANULARITY_FUNCTION]
     hard_cap = int(soft_budget * HARD_CAP_MULTIPLIER)
 
+    deps_full = [s.split(": ", 1)[1] for s in da_lines]
+    deps_capped, deps_truncated = _truncate_deps(deps_full)
     metadata = {
         "anchor": d.qualified_name,
         "kind": d.kind,
         "language": d.language,
         "file": d.file_path,
-        "dependencies": [s.split(": ", 1)[1] for s in da_lines],
+        "dependencies": deps_capped,
         "callers": sorted({idx.defs_by_id[c].qualified_name for c in idx.callers_by_callee.get(d.id, []) if c in idx.defs_by_id}),
         "external_deps": ext,
         "overrides": override_base.qualified_name if override_base is not None else None,
@@ -543,6 +596,8 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
         ],
         "granularity": GRANULARITY_FUNCTION,
     }
+    if deps_truncated:
+        metadata["dependencies_truncated"] = deps_truncated
 
     def _join(extras: list[str] = []) -> str:
         return _md_preamble(metadata) + "\n\n".join(parts + extras)
@@ -608,13 +663,17 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
             _commit(block)
 
     content = _join(extras)
+    metadata, content, token_count = _degrade_if_oversize(
+        GRANULARITY_FUNCTION, metadata, content,
+        anchor_label=d.qualified_name, file_path=d.file_path,
+    )
     return _ChunkRow(
         file_id=d.file_id,
         anchor_def_id=d.id,
         granularity=GRANULARITY_FUNCTION,
         metadata=metadata,
         content=content,
-        token_count=count_tokens(content),
+        token_count=token_count,
         content_hash=_hash_content(metadata, content),
     )
 
@@ -630,15 +689,19 @@ def _build_module_chunk(module_def: _DefRow, idx: _GraphIndex) -> _ChunkRow:
     external = sorted({r["package_name"] or r["import_path"] for r in imports if r["dep_class"] == "external"})
     unresolved = [r["import_path"] for r in imports if r["dep_class"] == "unresolved"]
 
+    deps_full = [c.qualified_name for c in children]
+    deps_capped, deps_truncated = _truncate_deps(deps_full)
     metadata = {
         "anchor": module_def.qualified_name,
         "kind": "module",
         "language": module_def.language,
         "file": module_def.file_path,
-        "dependencies": [c.qualified_name for c in children],
+        "dependencies": deps_capped,
         "external_deps": external,
         "granularity": GRANULARITY_MODULE,
     }
+    if deps_truncated:
+        metadata["dependencies_truncated"] = deps_truncated
 
     parts: list[str] = []
     if intra or external or unresolved:
@@ -666,13 +729,17 @@ def _build_module_chunk(module_def: _DefRow, idx: _GraphIndex) -> _ChunkRow:
 
     parts.extend(accumulated)
     content = _md_preamble(metadata) + "\n\n".join(parts)
+    metadata, content, token_count = _degrade_if_oversize(
+        GRANULARITY_MODULE, metadata, content,
+        anchor_label=module_def.qualified_name, file_path=module_def.file_path,
+    )
     return _ChunkRow(
         file_id=file_id,
         anchor_def_id=module_def.id,
         granularity=GRANULARITY_MODULE,
         metadata=metadata,
         content=content,
-        token_count=count_tokens(content),
+        token_count=token_count,
         content_hash=_hash_content(metadata, content),
     )
 
@@ -715,16 +782,20 @@ def _build_cross_module_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
             if td:
                 shared_state.append(f"- {op}: {td.qualified_name}")
 
+    deps_full = [c.qualified_name for c in layer1] + [c.qualified_name for c in layer2]
+    deps_capped, deps_truncated = _truncate_deps(deps_full)
     metadata = {
         "anchor": d.qualified_name,
         "kind": d.kind,
         "language": d.language,
         "file": d.file_path,
-        "dependencies": [c.qualified_name for c in layer1] + [c.qualified_name for c in layer2],
+        "dependencies": deps_capped,
         "external_deps": _external_callees_for(idx, d.id),
         "granularity": GRANULARITY_CROSS_MODULE,
         "hops": 2,
     }
+    if deps_truncated:
+        metadata["dependencies_truncated"] = deps_truncated
 
     parts: list[str] = [_format_body(d, header=f"# anchor: {d.qualified_name}")]
     if shared_state:
@@ -766,13 +837,17 @@ def _build_cross_module_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
             _commit(block)
 
     content = _join(extras)
+    metadata, content, token_count = _degrade_if_oversize(
+        GRANULARITY_CROSS_MODULE, metadata, content,
+        anchor_label=d.qualified_name, file_path=d.file_path,
+    )
     return _ChunkRow(
         file_id=d.file_id,
         anchor_def_id=d.id,
         granularity=GRANULARITY_CROSS_MODULE,
         metadata=metadata,
         content=content,
-        token_count=count_tokens(content),
+        token_count=token_count,
         content_hash=_hash_content(metadata, content),
     )
 
@@ -796,6 +871,33 @@ class ChunkStats:
         return self.n_function + self.n_module + self.n_cross_module
 
 
+# Identifier boundary-splitter. Matches the transition lower/digit -> upper,
+# OR an ALLCAPS run followed by a Capitalized word (so `parseURL` becomes
+# `parse URL`, `URLParser` becomes `URL Parser`, `fooBar` becomes `foo Bar`).
+_CAMEL_BOUNDARY_RE = re.compile(r"([a-z\d])([A-Z])|([A-Z]+)([A-Z][a-z])")
+
+
+def _split_camel(s: str) -> str:
+    """`fooBar` → `foo Bar`; `XMLParser` → `XML Parser`. Used to fan out
+    compound identifiers into separate FTS tokens so a token query for one
+    component (e.g. `foo`) matches identifiers built from it (`fooBar`,
+    `MyFooThing`) — Postgres tsvector wouldn't normally split those into
+    multiple words."""
+    return _CAMEL_BOUNDARY_RE.sub(
+        lambda m: f"{m.group(1) or m.group(3)} {m.group(2) or m.group(4)}",
+        s,
+    )
+
+
+def _fts_text(qualified_name: str | None, content: str) -> str:
+    """Document text fed to `to_tsvector('english', ...)`. Includes the
+    qualified name twice — once raw (so identifier-equality queries match)
+    and once camelCase-split (so token queries match) — followed by chunk
+    content for natural-language matching of comments and strings."""
+    qn = qualified_name or ""
+    return f"{qn} {_split_camel(qn)} {content}"
+
+
 async def _upsert_chunk(conn: asyncpg.Connection, chunk: _ChunkRow) -> str:
     """Returns 'inserted' | 'updated' | 'unchanged'."""
     existing = await conn.fetchrow(
@@ -804,26 +906,31 @@ async def _upsert_chunk(conn: asyncpg.Connection, chunk: _ChunkRow) -> str:
     )
     if existing is not None and existing["content_hash"] == chunk.content_hash:
         return "unchanged"
+    fts_text = _fts_text(chunk.metadata.get("anchor"), chunk.content)
     if existing is not None:
         await conn.execute(
             """
             UPDATE chunks
-            SET file_id=$1, content=$2, token_count=$3, metadata=$4, content_hash=$5
-            WHERE id=$6
+            SET file_id=$1, content=$2, token_count=$3, metadata=$4, content_hash=$5,
+                fts_doc=to_tsvector('english', $6)
+            WHERE id=$7
             """,
             chunk.file_id, chunk.content, chunk.token_count,
-            json.dumps(chunk.metadata), chunk.content_hash, existing["id"],
+            json.dumps(chunk.metadata), chunk.content_hash, fts_text, existing["id"],
         )
         # Embedding for this chunk is invalid — drop it.
         await conn.execute("DELETE FROM chunk_embeddings WHERE chunk_id=$1", existing["id"])
         return "updated"
     await conn.execute(
         """
-        INSERT INTO chunks (file_id, anchor_def_id, granularity, content, token_count, metadata, content_hash)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO chunks
+            (file_id, anchor_def_id, granularity, content, token_count, metadata,
+             content_hash, fts_doc)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, to_tsvector('english', $8))
         """,
         chunk.file_id, chunk.anchor_def_id, chunk.granularity,
-        chunk.content, chunk.token_count, json.dumps(chunk.metadata), chunk.content_hash,
+        chunk.content, chunk.token_count, json.dumps(chunk.metadata),
+        chunk.content_hash, fts_text,
     )
     return "inserted"
 

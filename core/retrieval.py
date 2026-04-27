@@ -4,14 +4,20 @@
                                      call_edges outbound, return chunks.
     semantic_query(query, top_k)   — embed the query, pgvector cosine
                                      nearest-neighbour over chunk_embeddings.
-    hybrid_query(query, top_k)     — semantic candidates + 1-hop graph
-                                     expansion + simple weighted rerank.
+    lexical_query(query, top_k)    — Postgres full-text search (BM25 via
+                                     ts_rank_cd) over chunks.fts_doc.
+    hybrid_query(query, top_k)     — semantic + lexical candidates fused
+                                     via Reciprocal Rank Fusion, then 1-hop
+                                     graph expansion + simple weighted
+                                     rerank.
     assemble_context(chunks, budget) — dedupe overlapping byte ranges,
                                        greedy fit under token budget.
 """
 
 from __future__ import annotations
 
+import asyncio
+import re
 from dataclasses import dataclass
 
 import asyncpg
@@ -90,6 +96,63 @@ async def structural_query(
 # ────────────────────────────────────────────────────────────────────
 
 
+# Skeleton-penalty knobs. We deprioritize chunks whose anchor def has no
+# outgoing graph signal — declarations without bodies have zero rows in
+# `call_edges WHERE caller_def_id = anchor` and zero rows in
+# `data_access WHERE accessor_def_id = anchor`, while real implementations
+# accumulate at least a few. The check is purely structural: a def with no
+# outgoing graph edges *is* a skeleton by definition, regardless of how the
+# source language spells the construct.
+#
+# For module-granularity chunks (whose anchor is the synthetic module def —
+# file-level, no edges of its own), we use the SUM of all defs' outgoing
+# edges across the file. A file containing only declarations ends up at
+# zero; a normal implementation file has dozens. Same penalty applies.
+SKELETON_PENALTY_FLOOR = 0.3
+SKELETON_GRAPH_REF = 3       # def-level signal at which the factor reaches 1.0
+SKELETON_FILE_GRAPH_REF = 10 # file-level signal threshold for module chunks
+
+_GRAPH_SIGNAL_SQL = "(COALESCE(out_calls.n, 0) + COALESCE(out_data.n, 0))"
+_FILE_GRAPH_SIGNAL_SQL = "COALESCE(file_sig.n, 0)"
+_SKELETON_FACTOR_SQL = (
+    f"(CASE WHEN d.kind = 'module' "
+    f"      THEN GREATEST({SKELETON_PENALTY_FLOOR}, "
+    f"                    LEAST(1.0, {_FILE_GRAPH_SIGNAL_SQL}::float / {SKELETON_FILE_GRAPH_REF})) "
+    f"      ELSE GREATEST({SKELETON_PENALTY_FLOOR}, "
+    f"                    LEAST(1.0, {_GRAPH_SIGNAL_SQL}::float / {SKELETON_GRAPH_REF})) END)"
+)
+# JOIN block reused by every retriever that applies the skeleton factor.
+# `out_calls` / `out_data` give the per-anchor (def-level) signal; `file_sig`
+# gives the per-file signal used by the module branch above. The latter is
+# computed once per query as a UNION ALL aggregate over the two edge tables.
+_SKELETON_JOINS_SQL = """
+                LEFT JOIN (
+                    SELECT caller_def_id AS did, COUNT(*) AS n
+                    FROM call_edges
+                    WHERE caller_def_id IS NOT NULL
+                    GROUP BY caller_def_id
+                ) out_calls ON out_calls.did = d.id
+                LEFT JOIN (
+                    SELECT accessor_def_id AS did, COUNT(*) AS n
+                    FROM data_access
+                    GROUP BY accessor_def_id
+                ) out_data ON out_data.did = d.id
+                LEFT JOIN (
+                    SELECT defs.file_id, COUNT(*) AS n
+                    FROM (
+                        SELECT d.file_id FROM call_edges ce
+                        JOIN definitions d ON d.id = ce.caller_def_id
+                        WHERE ce.caller_def_id IS NOT NULL
+                        UNION ALL
+                        SELECT d.file_id FROM data_access da
+                        JOIN definitions d ON d.id = da.accessor_def_id
+                    ) AS defs
+                    GROUP BY defs.file_id
+                ) file_sig ON file_sig.file_id = c.file_id
+"""
+_SCORE_EXPR = f"(1.0 - (ce.embedding <=> $1::vector)) * {_SKELETON_FACTOR_SQL}"
+
+
 async def semantic_query(
     pool: asyncpg.Pool,
     repo_id: int,
@@ -99,7 +162,9 @@ async def semantic_query(
     top_k: int = 10,
     granularities: tuple[str, ...] | None = None,
 ) -> list[RetrievedChunk]:
-    """Embed `query` and return the top-k nearest chunks by cosine distance."""
+    """Embed `query` and return the top-k nearest chunks by cosine distance,
+    with a graph-signal penalty applied so signature-only defs don't crowd
+    out real implementations."""
     vectors = await embed_fn([query])
     if not vectors:
         return []
@@ -108,32 +173,34 @@ async def semantic_query(
     async with pool.acquire() as conn:
         if granularities:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
                        d.qualified_name, f.path AS file_path, f.id AS file_id,
-                       1.0 - (ce.embedding <=> $1::vector) AS score
+                       {_SCORE_EXPR} AS score
                 FROM chunks c
                 JOIN files f ON f.id = c.file_id
                 LEFT JOIN definitions d ON d.id = c.anchor_def_id
+                {_SKELETON_JOINS_SQL}
                 JOIN chunk_embeddings ce ON ce.chunk_id = c.id
                 WHERE f.repo_id = $2 AND c.granularity = ANY($3::text[])
-                ORDER BY ce.embedding <=> $1::vector
+                ORDER BY score DESC
                 LIMIT $4
                 """,
                 qvec, repo_id, list(granularities), top_k,
             )
         else:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
                        d.qualified_name, f.path AS file_path, f.id AS file_id,
-                       1.0 - (ce.embedding <=> $1::vector) AS score
+                       {_SCORE_EXPR} AS score
                 FROM chunks c
                 JOIN files f ON f.id = c.file_id
                 LEFT JOIN definitions d ON d.id = c.anchor_def_id
+                {_SKELETON_JOINS_SQL}
                 JOIN chunk_embeddings ce ON ce.chunk_id = c.id
                 WHERE f.repo_id = $2
-                ORDER BY ce.embedding <=> $1::vector
+                ORDER BY score DESC
                 LIMIT $3
                 """,
                 qvec, repo_id, top_k,
@@ -142,8 +209,139 @@ async def semantic_query(
 
 
 # ────────────────────────────────────────────────────────────────────
+# Lexical — Postgres FTS over chunks.fts_doc (BM25-style ranking)
+# ────────────────────────────────────────────────────────────────────
+
+
+_TSQUERY_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+_LEX_SCORE_EXPR = f"ts_rank_cd(c.fts_doc, to_tsquery('english', $1)) * {_SKELETON_FACTOR_SQL}"
+
+
+def _build_tsquery(query: str) -> str | None:
+    """Sanitize a free-text query into an OR'd `tsquery` string. Returns None
+    if no valid tokens.
+
+    Each token is suffixed with `:*` for prefix matching, so a query for
+    `parse` matches indexed lexemes `pars`, `parse`, `parser`, `parsing`
+    (after stemming). The OR'd form is fed to `to_tsquery('english', ...)`
+    in the SQL — without the explicit `english` config the parser would
+    NOT stem the query side, so a query token like `parsing` would never
+    match the `pars` lexeme that `to_tsvector('english', ...)` stored in
+    fts_doc.
+
+    OR semantics (rather than `plainto_tsquery`'s implicit AND) because
+    multi-word queries often mention several alternative terms — a query
+    like "user permission check" should still surface chunks that match
+    `permission` even without `user` or `check` present. The cover-density
+    rank function will rank chunks matching multiple terms above
+    single-term hits.
+
+    Tokens are constrained to `[A-Za-z0-9_]` so user-supplied content can't
+    inject tsquery operators (`!`, `&`, `|`, parens).
+    """
+    tokens = _TSQUERY_TOKEN_RE.findall(query)
+    if not tokens:
+        return None
+    return " | ".join(f"{t.lower()}:*" for t in tokens)
+
+
+async def lexical_query(
+    pool: asyncpg.Pool,
+    repo_id: int,
+    query: str,
+    *,
+    top_k: int = 10,
+    granularities: tuple[str, ...] | None = None,
+) -> list[RetrievedChunk]:
+    """Lexical retrieval via Postgres full-text search. Uses `ts_rank_cd`
+    (cover density — weights term-proximity highly) over the precomputed
+    `chunks.fts_doc` column. Same skeleton-penalty multiplier as
+    `semantic_query` so this path doesn't surface signature-only defs
+    either."""
+    tsq = _build_tsquery(query)
+    if tsq is None:
+        return []
+
+    async with pool.acquire() as conn:
+        if granularities:
+            rows = await conn.fetch(
+                f"""
+                SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
+                       d.qualified_name, f.path AS file_path, f.id AS file_id,
+                       {_LEX_SCORE_EXPR} AS score
+                FROM chunks c
+                JOIN files f ON f.id = c.file_id
+                LEFT JOIN definitions d ON d.id = c.anchor_def_id
+                {_SKELETON_JOINS_SQL}
+                WHERE f.repo_id = $2 AND c.granularity = ANY($3::text[])
+                  AND c.fts_doc @@ to_tsquery('english', $1)
+                ORDER BY score DESC
+                LIMIT $4
+                """,
+                tsq, repo_id, list(granularities), top_k,
+            )
+        else:
+            rows = await conn.fetch(
+                f"""
+                SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
+                       d.qualified_name, f.path AS file_path, f.id AS file_id,
+                       {_LEX_SCORE_EXPR} AS score
+                FROM chunks c
+                JOIN files f ON f.id = c.file_id
+                LEFT JOIN definitions d ON d.id = c.anchor_def_id
+                {_SKELETON_JOINS_SQL}
+                WHERE f.repo_id = $2 AND c.fts_doc @@ to_tsquery('english', $1)
+                ORDER BY score DESC
+                LIMIT $3
+                """,
+                tsq, repo_id, top_k,
+            )
+    return [_row_to_chunk(r) for r in rows]
+
+
+# ────────────────────────────────────────────────────────────────────
 # Hybrid — semantic + 1-hop graph expansion
 # ────────────────────────────────────────────────────────────────────
+
+
+SEM_WEIGHT = 0.3  # weight of the cosine retriever's normalized score in
+                  # the final fused score; lexical gets (1 - SEM_WEIGHT).
+                  # 0.5 = balanced; >0.5 favours embedding similarity, <0.5
+                  # favours lexical / keyword match.
+
+
+def _fuse_scores(
+    sem_results: list[RetrievedChunk],
+    lex_results: list[RetrievedChunk],
+) -> tuple[dict[int, RetrievedChunk], dict[int, float]]:
+    """Score-based weighted fusion. Each retriever's scores are normalized
+    to [0, 1] (divide by that retriever's top score), then combined with
+    `SEM_WEIGHT` and `1 - SEM_WEIGHT`. Chunks present in only one retriever
+    still receive that retriever's contribution; chunks in both add up.
+
+    Score-based (rather than rank-based RRF) preserves the *magnitude*
+    signal: a chunk that's a weak noise match in cosine doesn't get
+    artificially boosted just because it landed in the top-K. With the
+    deterministic test embedder this is critical — many candidates have
+    near-zero cosine but happen to occupy ranks 2..20; rank-based fusion
+    would treat them comparably to a real top hit.
+    """
+    by_id: dict[int, RetrievedChunk] = {}
+    score: dict[int, float] = {}
+
+    sem_max = max((c.score for c in sem_results), default=0.0)
+    if sem_max > 0:
+        for c in sem_results:
+            score[c.chunk_id] = score.get(c.chunk_id, 0.0) + SEM_WEIGHT * (c.score / sem_max)
+            by_id[c.chunk_id] = c
+
+    lex_max = max((c.score for c in lex_results), default=0.0)
+    if lex_max > 0:
+        for c in lex_results:
+            score[c.chunk_id] = score.get(c.chunk_id, 0.0) + (1 - SEM_WEIGHT) * (c.score / lex_max)
+            by_id.setdefault(c.chunk_id, c)
+
+    return by_id, score
 
 
 async def hybrid_query(
@@ -155,9 +353,11 @@ async def hybrid_query(
     top_k: int = 10,
     candidate_pool: int = 20,
     graph_weight: float = 0.3,
-    override_weight: float = 1.0,
+    override_weight: float = 0.5,
 ) -> list[RetrievedChunk]:
-    """Pull `candidate_pool` semantic candidates, expand each anchor via:
+    """Pull `candidate_pool` candidates from BOTH the semantic (cosine) and
+    lexical (BM25 / FTS) retrievers, fuse via Reciprocal Rank Fusion, then
+    expand each anchor via:
 
       - call_edges, 1 hop outbound (caller → callees);
       - inherits_edges, bidirectional (children of a high-ranking base, bases
@@ -167,27 +367,44 @@ async def hybrid_query(
         override IS the implementation of the base, not just structurally
         related.
 
-    Bonuses are blended additively, then results are re-ranked. Bidirectional
-    walking on inheritance is what surfaces `SingleExecutorPolicy.onExecute`
-    when the user's query happens to match `Policy.onExecute` first, and vice
-    versa.
+    The lexical layer fixes the case where rare domain identifiers don't
+    embed into recognizable neighbours but a plain keyword search nails
+    them. Bonuses are blended additively, then results are re-ranked.
+    Bidirectional walking on inheritance is what surfaces a child override
+    when the query happens to match the base first, and vice versa.
     """
-    candidates = await semantic_query(pool, repo_id, query, embed_fn, top_k=candidate_pool)
-    if not candidates:
+    # Run cosine + lexical concurrently — they hit different indexes and
+    # don't share state, so the second one is essentially free in wall time.
+    sem_results, lex_results = await asyncio.gather(
+        semantic_query(pool, repo_id, query, embed_fn, top_k=candidate_pool),
+        lexical_query(pool, repo_id, query, top_k=candidate_pool),
+    )
+    if not sem_results and not lex_results:
         return []
 
-    by_id: dict[int, RetrievedChunk] = {c.chunk_id: c for c in candidates}
-    scores: dict[int, float] = {c.chunk_id: c.score for c in candidates}
+    by_id, scores = _fuse_scores(sem_results, lex_results)
+    # `scores` is already in [0, 1] by construction (each retriever
+    # contributes ≤ its weight). Sort the candidate pool by fused score
+    # for the graph-expansion seeding step below.
+    candidates = sorted(by_id.values(), key=lambda c: scores[c.chunk_id], reverse=True)
+    for c in candidates:
+        c.score = scores[c.chunk_id]
 
-    # Take the MAX semantic score per anchor (a function chunk and its
-    # cross-module chunk share an anchor_def_id; we must not let the lower one
-    # win).
+    # Cosine score by chunk_id, default 0 for chunks the cosine path didn't
+    # surface. Used only for anchor_scores → bonus magnitudes; the final
+    # ranking still goes through fused (normalized RRF) + bonuses.
+    cosine_by_chunk: dict[int, float] = {c.chunk_id: c.score for c in sem_results}
+
+    # Take the MAX cosine score per anchor (a function chunk and its
+    # cross-module chunk share an anchor_def_id; we must not let the lower
+    # one win). Anchor_scores feeds bonus computation only.
     anchor_scores: dict[int, float] = {}
     for c in candidates:
         if c.anchor_def_id is None:
             continue
-        if c.score > anchor_scores.get(c.anchor_def_id, float("-inf")):
-            anchor_scores[c.anchor_def_id] = c.score
+        cs = cosine_by_chunk.get(c.chunk_id, 0.0)
+        if cs > anchor_scores.get(c.anchor_def_id, float("-inf")):
+            anchor_scores[c.anchor_def_id] = cs
 
     if not anchor_scores:
         ranked = sorted(by_id.values(), key=lambda c: scores[c.chunk_id], reverse=True)
