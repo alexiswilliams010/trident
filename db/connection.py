@@ -90,9 +90,25 @@ async def reserve_node_ids(conn: asyncpg.Connection, count: int) -> int:
 
     Returns the first id; the block is [first, first + count).
     """
+    return await _reserve_sequence_ids(conn, "nodes_id_seq", count)
+
+
+async def reserve_definition_ids(conn: asyncpg.Connection, count: int) -> int:
+    """Reserve a contiguous block of `count` ids from definitions_id_seq.
+
+    Returns the first id; the block is [first, first + count). Used by Tier 2
+    to insert all of a file's definitions in a single batch instead of
+    `INSERT ... RETURNING id` once per row.
+    """
+    return await _reserve_sequence_ids(conn, "definitions_id_seq", count)
+
+
+async def _reserve_sequence_ids(
+    conn: asyncpg.Connection, sequence: str, count: int,
+) -> int:
     if count <= 0:
         raise ValueError("count must be positive")
-    first = await conn.fetchval("SELECT nextval('nodes_id_seq')")
+    first = await conn.fetchval(f"SELECT nextval('{sequence}')")
     if count > 1:
-        await conn.fetchval("SELECT setval('nodes_id_seq', $1)", first + count - 1)
+        await conn.fetchval(f"SELECT setval('{sequence}', $1)", first + count - 1)
     return first

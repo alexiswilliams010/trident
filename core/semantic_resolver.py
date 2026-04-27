@@ -25,6 +25,8 @@ from typing import Iterator
 
 import asyncpg
 
+from db.connection import reserve_definition_ids
+
 from .config_loader import LanguageConfig, load_language_config
 from .grammar_meta import LANGUAGES
 
@@ -321,37 +323,34 @@ def _extract_bases(ts_node, cfg) -> list[str]:
 async def _clear_semantic_for_file(conn: asyncpg.Connection, file_id: int) -> None:
     """Idempotency: drop any prior Tier 2 rows tied to this file.
 
+    All six statements ship in a single multi-statement command (asyncpg's
+    simple-query protocol, used when no parameters are bound). Postgres still
+    processes them in order, so the `UPDATE definitions SET scope_id=NULL`
+    sequences correctly before the self-FK-bearing `DELETE FROM definitions`.
+
+    `file_id` is interpolated rather than parameterized because the extended
+    query protocol that handles `$1` only supports a single statement per
+    call. file_id is always an int from a DB fetch; the explicit `int(...)`
+    cast makes injection-safety obvious.
+
     Note: inherits_edges and overrides_edges cascade off definitions(id), so
     deleting definitions also drops them — no explicit DELETE needed here.
     """
-    await conn.execute(
-        "DELETE FROM call_edges WHERE callsite_node_id IN (SELECT id FROM nodes WHERE file_id=$1)",
-        file_id,
-    )
-    await conn.execute(
-        """
+    fid = int(file_id)
+    await conn.execute(f"""
         DELETE FROM call_edges
-        WHERE caller_def_id IN (SELECT id FROM definitions WHERE file_id=$1)
-           OR callee_def_id IN (SELECT id FROM definitions WHERE file_id=$1)
-        """,
-        file_id,
-    )
-    await conn.execute(
-        """
+          WHERE callsite_node_id IN (SELECT id FROM nodes WHERE file_id={fid});
+        DELETE FROM call_edges
+          WHERE caller_def_id IN (SELECT id FROM definitions WHERE file_id={fid})
+             OR callee_def_id IN (SELECT id FROM definitions WHERE file_id={fid});
         DELETE FROM data_access
-        WHERE accessor_def_id IN (SELECT id FROM definitions WHERE file_id=$1)
-           OR target_def_id IN (SELECT id FROM definitions WHERE file_id=$1)
-        """,
-        file_id,
-    )
-    await conn.execute('DELETE FROM "references" WHERE file_id=$1', file_id)
-    # Break definitions self-FK first.
-    await conn.execute(
-        "UPDATE definitions SET scope_id=NULL "
-        "WHERE scope_id IN (SELECT id FROM definitions WHERE file_id=$1)",
-        file_id,
-    )
-    await conn.execute("DELETE FROM definitions WHERE file_id=$1", file_id)
+          WHERE accessor_def_id IN (SELECT id FROM definitions WHERE file_id={fid})
+             OR target_def_id  IN (SELECT id FROM definitions WHERE file_id={fid});
+        DELETE FROM "references" WHERE file_id={fid};
+        UPDATE definitions SET scope_id=NULL
+          WHERE scope_id IN (SELECT id FROM definitions WHERE file_id={fid});
+        DELETE FROM definitions WHERE file_id={fid};
+    """)
 
 
 async def resolve_file(
@@ -390,22 +389,31 @@ async def resolve_file(
     await _clear_semantic_for_file(conn, file_id)
 
     # ── P1: definitions (synthetic module + matched rules) ──
+    #
+    # Performance: we reserve a contiguous block of definition IDs from the
+    # sequence and PREDICT each new def's id as we walk, instead of doing
+    # `INSERT … RETURNING id` per row. All in-memory lookup tables
+    # (scope_def_id_by_ts, def_meta_by_id, etc.) are populated with the
+    # predicted ids, which are guaranteed to match the rows we batch-insert
+    # at the end. A safe upper bound on the count is `len(ts_walk) + 1`
+    # (one def per ts_node plus the synthetic module). Wasted ids inside the
+    # reserved block become harmless sequence gaps.
     def_rules = {r.node_type: r for r in config.definitions}
-    scope_boundary_types = {r.node_type for r in config.definitions if r.scope_boundary}
+
+    reserved_first = await reserve_definition_ids(conn, len(ts_walk) + 1)
+    next_def_id = reserved_first
 
     # Module / source_file root definition.
     module_db_node_id = db_id_for[tree.root_node.id]
     module_name = _module_name(row["path"])
-    module_def_id = await conn.fetchval(
-        """
-        INSERT INTO definitions (node_id, file_id, kind, name, qualified_name, scope_id)
-        VALUES ($1, $2, 'module', $3, $3, NULL)
-        RETURNING id
-        """,
-        module_db_node_id,
-        file_id,
-        module_name,
-    )
+    module_def_id = next_def_id
+    next_def_id += 1
+
+    # Pending def rows. Each tuple matches the INSERT column order at the
+    # bottom of P1; one batched UNNEST flushes them all.
+    pending_defs: list[tuple[int, int, int, str, str, str, int | None, str | None]] = [
+        (module_def_id, module_db_node_id, file_id, "module", module_name, module_name, None, None),
+    ]
 
     # ts_node.id → def_id (only for scope-owning nodes: module + scope_boundary defs).
     scope_def_id_by_ts: dict[int, int] = {tree.root_node.id: module_def_id}
@@ -501,20 +509,12 @@ async def resolve_file(
                 cur = parent_scope
             qualified_name = ".".join(reversed(parts))
 
-            new_def_id = await conn.fetchval(
-                """
-                INSERT INTO definitions (node_id, file_id, kind, name, qualified_name, scope_id, visibility)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                RETURNING id
-                """,
-                name_node_id,
-                file_id,
-                rule.kind,
-                name,
-                qualified_name,
-                scope_id,
-                visibility,
-            )
+            new_def_id = next_def_id
+            next_def_id += 1
+            pending_defs.append((
+                new_def_id, name_node_id, file_id, rule.kind, name, qualified_name,
+                scope_id, visibility,
+            ))
             def_kind_by_id[new_def_id] = rule.kind
             def_meta_by_id[new_def_id] = (name, scope_id)
             if scope_id is not None:
@@ -525,6 +525,28 @@ async def resolve_file(
                 # the single-name case where ts.id is the spec node.
                 scope_def_id_by_ts[ts.id] = new_def_id
             file_def_ids.append(new_def_id)
+
+    # Flush all definitions for this file in a single round-trip. The UNNEST
+    # arrays must align with the column list and tuple shape used above.
+    if pending_defs:
+        await conn.execute(
+            """
+            INSERT INTO definitions
+                (id, node_id, file_id, kind, name, qualified_name, scope_id, visibility)
+            SELECT * FROM UNNEST(
+                $1::bigint[], $2::bigint[], $3::bigint[], $4::text[],
+                $5::text[],   $6::text[],   $7::bigint[], $8::text[]
+            )
+            """,
+            [d[0] for d in pending_defs],
+            [d[1] for d in pending_defs],
+            [d[2] for d in pending_defs],
+            [d[3] for d in pending_defs],
+            [d[4] for d in pending_defs],
+            [d[5] for d in pending_defs],
+            [d[6] for d in pending_defs],
+            [d[7] for d in pending_defs],
+        )
 
     # ── P2.5: inheritance edges (intra-file resolution) ──
     # `config.inheritance` is a tuple of rules. A single parent node may match

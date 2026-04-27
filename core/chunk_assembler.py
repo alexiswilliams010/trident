@@ -87,6 +87,70 @@ def count_tokens(text: str) -> int:
     return len(_enc().encode(text, disallowed_special=()))
 
 
+# Approximate token cost of joining two pieces with "\n\n". cl100k_base
+# encodes "\n\n" as a single token; the BPE may merge across boundaries with
+# slightly different totals, but the error is sub-1% and the budgets are soft
+# targets, so a small constant is good enough to avoid re-tokenizing.
+_JOIN_TOK = 1
+
+
+def _greedy_pack_pieces(
+    base_tokens: int,
+    candidates: Iterable[list[str]],
+    budget: int,
+) -> list[str]:
+    """Append-with-fallback pattern (used by `_build_module_chunk` for
+    children: try the body, fall back to the signature, skip if neither fits).
+
+    Each `candidates` element is an ordered list of fallbacks for one slot;
+    the first that fits is appended. Returns the accepted pieces in order.
+
+    Replaces an O(N²) re-tokenization with O(N): each piece is tokenized
+    exactly once and a running total is compared against the budget.
+    """
+    accepted: list[str] = []
+    used = 0
+    for fallbacks in candidates:
+        for piece in fallbacks:
+            cost = count_tokens(piece) + _JOIN_TOK
+            if base_tokens + used + cost <= budget:
+                accepted.append(piece)
+                used += cost
+                break
+    return accepted
+
+
+def _greedy_pack_section(
+    base_tokens: int,
+    header: str,
+    candidates: Iterable[str],
+    budget: int,
+) -> str | None:
+    """Headed-section pattern (used everywhere else: callees [certain]
+    sigs/bodies, inferred sigs, inherited members, layer1/2 hops).
+
+    Builds a block of the form `header + "\n" + "\n\n".join(accepted)` while
+    `base_tokens + block_tokens` stays under `budget`. Returns the block
+    string, or None if no candidates fit.
+    """
+    header_with_nl_tok = count_tokens(header + "\n")
+    accepted: list[str] = []
+    inner_tokens = 0  # tokens of the joined candidates so far
+    for piece in candidates:
+        piece_tok = count_tokens(piece)
+        new_inner = inner_tokens + (_JOIN_TOK + piece_tok if accepted else piece_tok)
+        # The whole block costs sep + header + "\n" + inner, glued onto the
+        # base content by another sep.
+        proposed = base_tokens + _JOIN_TOK + header_with_nl_tok + new_inner
+        if proposed > budget:
+            break
+        accepted.append(piece)
+        inner_tokens = new_inner
+    if not accepted:
+        return None
+    return header + "\n" + "\n\n".join(accepted)
+
+
 # ────────────────────────────────────────────────────────────────────
 # Helpers
 # ────────────────────────────────────────────────────────────────────
@@ -151,11 +215,24 @@ def _hash_content(metadata: dict, content: str) -> str:
 
 
 async def _load_defs(conn: asyncpg.Connection, repo_id: int) -> list[_DefRow]:
-    rows = await conn.fetch(
+    # Pull raw_content once per file (261 rows for a mid-size repo) rather than
+    # once per definition. Joining `f.raw_content` into the per-def fetch made
+    # Postgres ship the whole file body N×defs-in-that-file times and asyncpg
+    # materialize a fresh Python string per row — for a large Solidity repo
+    # that grew into multi-GB and got the OOM killer's attention.
+    file_rows = await conn.fetch(
+        "SELECT id, raw_content, path, language FROM files WHERE repo_id = $1",
+        repo_id,
+    )
+    file_meta: dict[int, tuple[str, str, str]] = {
+        r["id"]: (r["raw_content"] or "", r["path"], r["language"])
+        for r in file_rows
+    }
+
+    def_rows = await conn.fetch(
         """
         SELECT d.id, d.file_id, d.kind, d.name, d.qualified_name, d.scope_id,
-               n.start_byte, n.end_byte,
-               f.raw_content, f.path, f.language
+               n.start_byte, n.end_byte
         FROM definitions d
         JOIN nodes n ON n.id = d.node_id
         JOIN files f ON f.id = d.file_id
@@ -164,15 +241,24 @@ async def _load_defs(conn: asyncpg.Connection, repo_id: int) -> list[_DefRow]:
         """,
         repo_id,
     )
-    return [
-        _DefRow(
-            id=r["id"], file_id=r["file_id"], kind=r["kind"], name=r["name"],
-            qualified_name=r["qualified_name"], scope_id=r["scope_id"],
-            start_byte=r["start_byte"], end_byte=r["end_byte"],
-            raw_content=r["raw_content"] or "", file_path=r["path"], language=r["language"],
+    out: list[_DefRow] = []
+    for r in def_rows:
+        meta = file_meta.get(r["file_id"])
+        if meta is None:
+            # Should not happen — defs FK files — but be defensive.
+            continue
+        raw_content, file_path, language = meta
+        out.append(
+            _DefRow(
+                id=r["id"], file_id=r["file_id"], kind=r["kind"], name=r["name"],
+                qualified_name=r["qualified_name"], scope_id=r["scope_id"],
+                start_byte=r["start_byte"], end_byte=r["end_byte"],
+                # Same Python string instance is shared by every def from this
+                # file, so memory is O(total file size), not O(defs × file size).
+                raw_content=raw_content, file_path=file_path, language=language,
+            )
         )
-        for r in rows
-    ]
+    return out
 
 
 async def _load_call_edges(conn: asyncpg.Connection, repo_id: int) -> list[asyncpg.Record]:
@@ -462,6 +548,17 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
         return _md_preamble(metadata) + "\n\n".join(parts + extras)
 
     extras: list[str] = []
+    # Tokens of `_join(extras)` — recomputed once per phase rather than per
+    # candidate. Each phase that commits a block adds an exact recount of
+    # that block's tokens (plus one separator) to keep `extras_tokens`
+    # bounded by reality, even though intra-block packing uses the
+    # incremental approximation.
+    base_tokens = count_tokens(_join())
+
+    def _commit(block: str) -> None:
+        nonlocal base_tokens
+        extras.append(block)
+        base_tokens += _JOIN_TOK + count_tokens(block)
 
     # Phase: inherited member signatures (greedy under hard_cap). Excluded:
     # the override base (already shown as its own block above).
@@ -470,55 +567,45 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
         exclude_def_ids={override_base_id} if override_base_id else set(),
     )
     if inherited:
-        sigs: list[str] = []
-        for m in inherited:
-            trial = sigs + [_format_signature(m)]
-            block = "# inherited members\n" + "\n\n".join(trial)
-            if count_tokens(_join(extras + [block])) > hard_cap:
-                break
-            sigs = trial
-        if sigs:
-            extras.append("# inherited members\n" + "\n\n".join(sigs))
+        block = _greedy_pack_section(
+            base_tokens, "# inherited members",
+            (_format_signature(m) for m in inherited), hard_cap,
+        )
+        if block is not None:
+            _commit(block)
 
-    # Phase 1: signatures of certain callees.
+    # Phase 1: signatures of certain callees. Try the whole block first;
+    # if it fits, commit it as one piece. Otherwise greedy-pack.
     if certain:
         sig_block = "# callees [certain]\n" + "\n\n".join(_format_signature(c) for c in certain)
-        if count_tokens(_join(extras + [sig_block])) <= hard_cap:
-            extras.append(sig_block)
+        if base_tokens + _JOIN_TOK + count_tokens(sig_block) <= hard_cap:
+            _commit(sig_block)
         else:
-            sigs: list[str] = []
-            for c in certain:
-                trial = sigs + [_format_signature(c)]
-                block = "# callees [certain]\n" + "\n\n".join(trial)
-                if count_tokens(_join(extras + [block])) > hard_cap:
-                    break
-                sigs = trial
-            if sigs:
-                extras.append("# callees [certain]\n" + "\n\n".join(sigs))
+            block = _greedy_pack_section(
+                base_tokens, "# callees [certain]",
+                (_format_signature(c) for c in certain), hard_cap,
+            )
+            if block is not None:
+                _commit(block)
 
     # Phase 2: bodies of certain callees if budget allows.
     if certain:
-        body_chunks: list[str] = []
-        for c in certain:
-            trial = body_chunks + [_format_body(c, header=f"# callee body: {c.qualified_name}")]
-            block = "# callee bodies [certain]\n" + "\n\n".join(trial)
-            if count_tokens(_join(extras + [block])) > hard_cap:
-                break
-            body_chunks = trial
-        if body_chunks:
-            extras.append("# callee bodies [certain]\n" + "\n\n".join(body_chunks))
+        block = _greedy_pack_section(
+            base_tokens, "# callee bodies [certain]",
+            (_format_body(c, header=f"# callee body: {c.qualified_name}") for c in certain),
+            hard_cap,
+        )
+        if block is not None:
+            _commit(block)
 
     # Phase 3: signatures of inferred callees.
     if inferred:
-        sigs: list[str] = []
-        for c in inferred:
-            trial = sigs + [_format_signature(c)]
-            block = "# callees [inferred]\n" + "\n\n".join(trial)
-            if count_tokens(_join(extras + [block])) > hard_cap:
-                break
-            sigs = trial
-        if sigs:
-            extras.append("# callees [inferred]\n" + "\n\n".join(sigs))
+        block = _greedy_pack_section(
+            base_tokens, "# callees [inferred]",
+            (_format_signature(c) for c in inferred), hard_cap,
+        )
+        if block is not None:
+            _commit(block)
 
     content = _join(extras)
     return _ChunkRow(
@@ -567,16 +654,15 @@ def _build_module_chunk(module_def: _DefRow, idx: _GraphIndex) -> _ChunkRow:
     parts.append(f"# module: {module_def.qualified_name} ({module_def.file_path})")
 
     # Greedy include children: full body for short ones, otherwise signature.
+    # Incremental token accounting — each piece tokenized once instead of
+    # re-tokenizing the entire growing accumulator on every iteration.
     budget = TOKEN_BUDGETS[GRANULARITY_MODULE]
-    accumulated: list[str] = []
-    for c in children:
-        # Try full body, fall back to signature.
-        for piece in [_format_body(c), _format_signature(c)]:
-            trial = accumulated + [piece]
-            content_try = _md_preamble(metadata) + "\n\n".join(parts + trial)
-            if count_tokens(content_try) <= budget:
-                accumulated = trial
-                break
+    base_tokens = count_tokens(_md_preamble(metadata) + "\n\n".join(parts))
+    accumulated = _greedy_pack_pieces(
+        base_tokens,
+        ([_format_body(c), _format_signature(c)] for c in children),
+        budget,
+    )
 
     parts.extend(accumulated)
     content = _md_preamble(metadata) + "\n\n".join(parts)
@@ -650,28 +736,34 @@ def _build_cross_module_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
         return _md_preamble(metadata) + "\n\n".join(parts + extras)
 
     extras: list[str] = []
+    # base_tokens tracks `_join(extras)` token count incrementally, so each
+    # phase pays one tokenization for its committed block instead of
+    # re-tokenizing the full accumulator per candidate.
+    base_tokens = count_tokens(_join([]))
+
+    def _commit(block: str) -> None:
+        nonlocal base_tokens
+        extras.append(block)
+        base_tokens += _JOIN_TOK + count_tokens(block)
+
     # Layer 1 bodies first.
-    layer1_bodies: list[str] = []
-    for c in layer1:
-        trial = layer1_bodies + [_format_body(c, header=f"# callee (1 hop): {c.qualified_name}")]
-        block = "# callees (1 hop)\n" + "\n\n".join(trial)
-        if count_tokens(_join([block])) > budget:
-            break
-        layer1_bodies = trial
-    if layer1_bodies:
-        extras.append("# callees (1 hop)\n" + "\n\n".join(layer1_bodies))
+    block = _greedy_pack_section(
+        base_tokens, "# callees (1 hop)",
+        (_format_body(c, header=f"# callee (1 hop): {c.qualified_name}") for c in layer1),
+        budget,
+    )
+    if block is not None:
+        _commit(block)
 
     # Layer 2 signatures only (saves budget).
     if layer2:
-        sigs: list[str] = []
-        for c in layer2:
-            trial = sigs + [_format_signature(c)]
-            block = "# callees (2 hop)\n" + "\n\n".join(trial)
-            if count_tokens(_join(extras + [block])) > budget:
-                break
-            sigs = trial
-        if sigs:
-            extras.append("# callees (2 hop)\n" + "\n\n".join(sigs))
+        block = _greedy_pack_section(
+            base_tokens, "# callees (2 hop)",
+            (_format_signature(c) for c in layer2),
+            budget,
+        )
+        if block is not None:
+            _commit(block)
 
     content = _join(extras)
     return _ChunkRow(
