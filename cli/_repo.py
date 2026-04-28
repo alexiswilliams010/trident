@@ -40,3 +40,26 @@ async def resolve_repo_id(
             name, root_path,
         )
         return row["id"]
+
+
+async def resolve_repo_ids(pool: asyncpg.Pool, names: list[str]) -> list[int]:
+    """Bulk version: take a list of repo names and return their IDs in the
+    same order. Errors out (SystemExit 2) on any name that isn't indexed,
+    so a typo can't silently scope a cross-repo query to fewer repos than
+    the caller asked for."""
+    if not names:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT name, id FROM repos WHERE name = ANY($1::text[])", names,
+        )
+    found = {r["name"]: r["id"] for r in rows}
+    missing = [n for n in names if n not in found]
+    if missing:
+        print(
+            f"error: no repo(s) named {missing!r} in this database. "
+            "Check `SELECT name FROM repos` for the right names.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return [found[n] for n in names]

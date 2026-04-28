@@ -61,6 +61,24 @@ async def clean_repo(pg_pool):
         await conn.execute("DELETE FROM repos WHERE id=$1", repo_id)
 
 
+@pytest_asyncio.fixture(loop_scope="session")
+async def two_repos(pg_pool):
+    """Yield (pool, repo_id_a, repo_id_b). Used by cross-repo / MMR tests
+    that need two distinct repos coexisting in the same DB."""
+    name_a = f"test-a-{os.urandom(8).hex()}"
+    name_b = f"test-b-{os.urandom(8).hex()}"
+    async with pg_pool.acquire() as conn:
+        a = await conn.fetchval(
+            "INSERT INTO repos (name) VALUES ($1) RETURNING id", name_a,
+        )
+        b = await conn.fetchval(
+            "INSERT INTO repos (name) VALUES ($1) RETURNING id", name_b,
+        )
+    yield pg_pool, a, b
+    async with pg_pool.acquire() as conn:
+        await conn.execute("DELETE FROM repos WHERE id = ANY($1::bigint[])", [a, b])
+
+
 @pytest.fixture
 def python_fixture_root() -> Path:
     return PYTHON_FIXTURE

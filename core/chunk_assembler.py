@@ -889,13 +889,39 @@ def _split_camel(s: str) -> str:
     )
 
 
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]+")
+
+
+def _expand_idents(text: str) -> str:
+    """Append camelCase- and snake_case-split forms of every identifier-shaped
+    token in `text` to the end of the string, so `to_tsvector('english', ...)`
+    indexes both the original lexeme (`getuserbyid`) and each subtoken
+    (`get`/`user`/`by`/`id`). Without this, body identifiers like
+    `getUserById` are opaque to the english parser and a query for `user`
+    misses chunks that only mention them inside compound names.
+
+    Bounded blow-up: each identifier emits at most a few extras, so output
+    size is at most ~2× the input on identifier-dense code.
+    """
+    extras: list[str] = []
+    for m in _IDENT_RE.finditer(text):
+        tok = m.group(0)
+        if "_" in tok:
+            extras.extend(p for p in tok.split("_") if p)
+        camel = _split_camel(tok)
+        if camel != tok:
+            extras.append(camel)
+    return text if not extras else text + " " + " ".join(extras)
+
+
 def _fts_text(qualified_name: str | None, content: str) -> str:
     """Document text fed to `to_tsvector('english', ...)`. Includes the
     qualified name twice — once raw (so identifier-equality queries match)
     and once camelCase-split (so token queries match) — followed by chunk
-    content for natural-language matching of comments and strings."""
+    content with body identifiers expanded into their subtokens, so a query
+    for `user` matches a chunk whose body contains `getUserById`."""
     qn = qualified_name or ""
-    return f"{qn} {_split_camel(qn)} {content}"
+    return f"{qn} {_split_camel(qn)} {_expand_idents(content)}"
 
 
 async def _upsert_chunk(conn: asyncpg.Connection, chunk: _ChunkRow) -> str:

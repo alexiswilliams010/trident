@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 import asyncpg
 
+from .chunk_assembler import _split_camel
 from .embedder import EmbedFn, _vector_literal
 
 
@@ -36,6 +37,17 @@ class RetrievedChunk:
     token_count: int
     content: str
     score: float                     # higher is better; meaning depends on query mode
+    repo_id: int | None = None       # which repo this chunk came from (multi-repo aware)
+    matched_view: str | None = None  # which embedding view produced the top score
+
+
+def _norm_repo_ids(x: int | list[int]) -> list[int]:
+    """`semantic_query(repo_ids=42)` is sugar for `repo_ids=[42]`. A single
+    int is by far the most common shape; the list form is what cross-repo
+    callers pass."""
+    if isinstance(x, int):
+        return [x]
+    return list(x)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -45,7 +57,7 @@ class RetrievedChunk:
 
 async def structural_query(
     pool: asyncpg.Pool,
-    repo_id: int,
+    repo_ids: int | list[int],
     definition_name: str,
     *,
     depth: int = 2,
@@ -55,16 +67,22 @@ async def structural_query(
     chunk plus chunks for transitive callees up to `depth` hops.
 
     Score = 1.0 at hop 0, halved per hop.
+
+    `repo_ids` can be a single int or a list. Cross-repo callers pass a
+    list; the seed lookup spans all listed repos. Graph walks are intra-repo
+    by construction (def IDs are globally unique and edges are created by
+    intra-repo resolution), so no extra filter is needed during the walk.
     """
+    rids = _norm_repo_ids(repo_ids)
     async with pool.acquire() as conn:
         seeds = await conn.fetch(
             """
             SELECT d.id FROM definitions d
             JOIN files f ON f.id = d.file_id
-            WHERE f.repo_id = $1
+            WHERE f.repo_id = ANY($1::bigint[])
               AND (d.name = $2 OR d.qualified_name = $2 OR d.qualified_name LIKE '%.' || $2)
             """,
-            repo_id, definition_name,
+            rids, definition_name,
         )
         if not seeds:
             return []
@@ -88,7 +106,9 @@ async def structural_query(
                 break
             frontier = next_frontier
 
-        return await _fetch_chunks_for_anchors(conn, list(scores.keys()), scores, granularity)
+        return await _fetch_chunks_for_anchors(
+            conn, list(scores.keys()), scores, granularity, repo_ids=rids,
+        )
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -150,25 +170,53 @@ _SKELETON_JOINS_SQL = """
                     GROUP BY defs.file_id
                 ) file_sig ON file_sig.file_id = c.file_id
 """
-_SCORE_EXPR = f"(1.0 - (ce.embedding <=> $1::vector)) * {_SKELETON_FACTOR_SQL}"
+# Lateral that picks the best-scoring view per chunk. Each chunk has one row
+# per (view_kind, model) in `chunk_embeddings`; we want the closest one.
+# `$2` is the optional view_kinds filter (NULL for "all views"); $1 is the
+# query vector (text representation, cast to vector).
+_BEST_VIEW_LATERAL = """
+LEFT JOIN LATERAL (
+    SELECT ce.view_kind, ce.embedding <=> $1::vector AS dist
+    FROM chunk_embeddings ce
+    WHERE ce.chunk_id = c.id
+      AND ($2::text[] IS NULL OR ce.view_kind = ANY($2::text[]))
+    ORDER BY dist
+    LIMIT 1
+) best_view ON TRUE
+"""
+
+_SCORE_EXPR = f"(1.0 - best_view.dist) * {_SKELETON_FACTOR_SQL}"
 
 
 async def semantic_query(
     pool: asyncpg.Pool,
-    repo_id: int,
+    repo_ids: int | list[int],
     query: str,
     embed_fn: EmbedFn,
     *,
     top_k: int = 10,
     granularities: tuple[str, ...] | None = None,
+    view_kinds: tuple[str, ...] | None = None,
 ) -> list[RetrievedChunk]:
     """Embed `query` and return the top-k nearest chunks by cosine distance,
     with a graph-signal penalty applied so signature-only defs don't crowd
-    out real implementations."""
+    out real implementations.
+
+    Each chunk has multiple embedding "views" (e.g. raw source vs. source +
+    inlined referenced types — see `core/embed_views.py`). The lateral inside
+    the SQL picks the *best-scoring view per chunk* against the query vector,
+    so a query that matches the enriched view will surface the chunk even if
+    the source view alone wouldn't have.
+
+    `view_kinds` filters which views to consider (e.g. `("source",)` to
+    exactly reproduce pre-multi-view behavior); `None` means all views.
+    """
     vectors = await embed_fn([query])
     if not vectors:
         return []
     qvec = _vector_literal(vectors[0])
+    rids = _norm_repo_ids(repo_ids)
+    vks = list(view_kinds) if view_kinds else None
 
     async with pool.acquire() as conn:
         if granularities:
@@ -176,34 +224,39 @@ async def semantic_query(
                 f"""
                 SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
                        d.qualified_name, f.path AS file_path, f.id AS file_id,
+                       f.repo_id AS repo_id, best_view.view_kind AS matched_view,
                        {_SCORE_EXPR} AS score
                 FROM chunks c
                 JOIN files f ON f.id = c.file_id
                 LEFT JOIN definitions d ON d.id = c.anchor_def_id
                 {_SKELETON_JOINS_SQL}
-                JOIN chunk_embeddings ce ON ce.chunk_id = c.id
-                WHERE f.repo_id = $2 AND c.granularity = ANY($3::text[])
+                {_BEST_VIEW_LATERAL}
+                WHERE f.repo_id = ANY($3::bigint[])
+                  AND c.granularity = ANY($4::text[])
+                  AND best_view.dist IS NOT NULL
                 ORDER BY score DESC
-                LIMIT $4
+                LIMIT $5
                 """,
-                qvec, repo_id, list(granularities), top_k,
+                qvec, vks, rids, list(granularities), top_k,
             )
         else:
             rows = await conn.fetch(
                 f"""
                 SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
                        d.qualified_name, f.path AS file_path, f.id AS file_id,
+                       f.repo_id AS repo_id, best_view.view_kind AS matched_view,
                        {_SCORE_EXPR} AS score
                 FROM chunks c
                 JOIN files f ON f.id = c.file_id
                 LEFT JOIN definitions d ON d.id = c.anchor_def_id
                 {_SKELETON_JOINS_SQL}
-                JOIN chunk_embeddings ce ON ce.chunk_id = c.id
-                WHERE f.repo_id = $2
+                {_BEST_VIEW_LATERAL}
+                WHERE f.repo_id = ANY($3::bigint[])
+                  AND best_view.dist IS NOT NULL
                 ORDER BY score DESC
-                LIMIT $3
+                LIMIT $4
                 """,
-                qvec, repo_id, top_k,
+                qvec, vks, rids, top_k,
             )
     return [_row_to_chunk(r) for r in rows]
 
@@ -221,13 +274,11 @@ def _build_tsquery(query: str) -> str | None:
     """Sanitize a free-text query into an OR'd `tsquery` string. Returns None
     if no valid tokens.
 
-    Each token is suffixed with `:*` for prefix matching, so a query for
-    `parse` matches indexed lexemes `pars`, `parse`, `parser`, `parsing`
-    (after stemming). The OR'd form is fed to `to_tsquery('english', ...)`
-    in the SQL — without the explicit `english` config the parser would
-    NOT stem the query side, so a query token like `parsing` would never
-    match the `pars` lexeme that `to_tsvector('english', ...)` stored in
-    fts_doc.
+    Each token is suffixed with `:*` for prefix matching, and compound
+    identifiers are fanned out to mirror the indexer (`chunk_assembler.
+    _expand_idents`): `getUserById` becomes `getuserbyid:* | get:* |
+    user:* | by:* | id:*`, so a body containing `getUserById` matches
+    a query for any of those parts and vice-versa.
 
     OR semantics (rather than `plainto_tsquery`'s implicit AND) because
     multi-word queries often mention several alternative terms — a query
@@ -239,15 +290,31 @@ def _build_tsquery(query: str) -> str | None:
     Tokens are constrained to `[A-Za-z0-9_]` so user-supplied content can't
     inject tsquery operators (`!`, `&`, `|`, parens).
     """
-    tokens = _TSQUERY_TOKEN_RE.findall(query)
-    if not tokens:
+    raw_tokens = _TSQUERY_TOKEN_RE.findall(query)
+    if not raw_tokens:
         return None
-    return " | ".join(f"{t.lower()}:*" for t in tokens)
+    expanded: list[str] = []
+    for t in raw_tokens:
+        expanded.append(t.lower())
+        if "_" in t:
+            expanded.extend(p.lower() for p in t.split("_") if p)
+        camel = _split_camel(t)
+        if camel != t:
+            expanded.extend(p.lower() for p in camel.split() if p)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for t in expanded:
+        if t and t not in seen:
+            seen.add(t)
+            deduped.append(t)
+    if not deduped:
+        return None
+    return " | ".join(f"{t}:*" for t in deduped)
 
 
 async def lexical_query(
     pool: asyncpg.Pool,
-    repo_id: int,
+    repo_ids: int | list[int],
     query: str,
     *,
     top_k: int = 10,
@@ -257,10 +324,16 @@ async def lexical_query(
     (cover density — weights term-proximity highly) over the precomputed
     `chunks.fts_doc` column. Same skeleton-penalty multiplier as
     `semantic_query` so this path doesn't surface signature-only defs
-    either."""
+    either.
+
+    Lexical retrieval is single-channel by design (no view aggregation):
+    `chunks.fts_doc` is one tsvector per chunk, populated at chunk-assembly
+    time with body-identifier fan-out (see `chunk_assembler._fts_text`).
+    """
     tsq = _build_tsquery(query)
     if tsq is None:
         return []
+    rids = _norm_repo_ids(repo_ids)
 
     async with pool.acquire() as conn:
         if granularities:
@@ -268,33 +341,36 @@ async def lexical_query(
                 f"""
                 SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
                        d.qualified_name, f.path AS file_path, f.id AS file_id,
+                       f.repo_id AS repo_id,
                        {_LEX_SCORE_EXPR} AS score
                 FROM chunks c
                 JOIN files f ON f.id = c.file_id
                 LEFT JOIN definitions d ON d.id = c.anchor_def_id
                 {_SKELETON_JOINS_SQL}
-                WHERE f.repo_id = $2 AND c.granularity = ANY($3::text[])
+                WHERE f.repo_id = ANY($2::bigint[]) AND c.granularity = ANY($3::text[])
                   AND c.fts_doc @@ to_tsquery('english', $1)
                 ORDER BY score DESC
                 LIMIT $4
                 """,
-                tsq, repo_id, list(granularities), top_k,
+                tsq, rids, list(granularities), top_k,
             )
         else:
             rows = await conn.fetch(
                 f"""
                 SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
                        d.qualified_name, f.path AS file_path, f.id AS file_id,
+                       f.repo_id AS repo_id,
                        {_LEX_SCORE_EXPR} AS score
                 FROM chunks c
                 JOIN files f ON f.id = c.file_id
                 LEFT JOIN definitions d ON d.id = c.anchor_def_id
                 {_SKELETON_JOINS_SQL}
-                WHERE f.repo_id = $2 AND c.fts_doc @@ to_tsquery('english', $1)
+                WHERE f.repo_id = ANY($2::bigint[])
+                  AND c.fts_doc @@ to_tsquery('english', $1)
                 ORDER BY score DESC
                 LIMIT $3
                 """,
-                tsq, repo_id, top_k,
+                tsq, rids, top_k,
             )
     return [_row_to_chunk(r) for r in rows]
 
@@ -304,49 +380,57 @@ async def lexical_query(
 # ────────────────────────────────────────────────────────────────────
 
 
-SEM_WEIGHT = 0.3  # weight of the cosine retriever's normalized score in
-                  # the final fused score; lexical gets (1 - SEM_WEIGHT).
-                  # 0.5 = balanced; >0.5 favours embedding similarity, <0.5
-                  # favours lexical / keyword match.
+RRF_K = 60        # Standard constant from the RRF paper. Damps the head-of-list
+                  # advantage so rank 1 isn't disproportionately above rank 2.
+SEM_WEIGHT = 0.5  # Per-retriever weight on the RRF contribution. Equal weights
+LEX_WEIGHT = 0.5  # by default; bump SEM > LEX for prose-y queries, LEX > SEM
+                  # for identifier-heavy queries.
 
 
 def _fuse_scores(
     sem_results: list[RetrievedChunk],
     lex_results: list[RetrievedChunk],
 ) -> tuple[dict[int, RetrievedChunk], dict[int, float]]:
-    """Score-based weighted fusion. Each retriever's scores are normalized
-    to [0, 1] (divide by that retriever's top score), then combined with
-    `SEM_WEIGHT` and `1 - SEM_WEIGHT`. Chunks present in only one retriever
-    still receive that retriever's contribution; chunks in both add up.
+    """Reciprocal Rank Fusion. Each retriever contributes
+        weight_i / (RRF_K + rank_i)
+    per chunk it returned (1-indexed ranks). Chunks present in both
+    retrievers sum the contributions; chunks in one still get that
+    retriever's contribution.
 
-    Score-based (rather than rank-based RRF) preserves the *magnitude*
-    signal: a chunk that's a weak noise match in cosine doesn't get
-    artificially boosted just because it landed in the top-K. With the
-    deterministic test embedder this is critical — many candidates have
-    near-zero cosine but happen to occupy ranks 2..20; rank-based fusion
-    would treat them comparably to a real top hit.
+    Robust to score-distribution skew: a single dominant cosine hit no
+    longer drowns out the lexical retriever, which was the failure mode
+    that the previous score-fusion variant kept tripping under the
+    deterministic test embedder.
+
+    Final scores are normalized to [0, 1] (divide by the max) so downstream
+    graph bonuses (`graph_weight=0.3`, `override_weight=0.5`) keep their
+    "fraction of the seed's rank" meaning. Without this normalization the
+    raw RRF values are tiny (head of list ≈ 1/61 ≈ 0.016) and the bonus
+    constants would need re-tuning.
     """
     by_id: dict[int, RetrievedChunk] = {}
     score: dict[int, float] = {}
 
-    sem_max = max((c.score for c in sem_results), default=0.0)
-    if sem_max > 0:
-        for c in sem_results:
-            score[c.chunk_id] = score.get(c.chunk_id, 0.0) + SEM_WEIGHT * (c.score / sem_max)
-            by_id[c.chunk_id] = c
+    for rank, c in enumerate(sem_results, start=1):
+        score[c.chunk_id] = score.get(c.chunk_id, 0.0) + SEM_WEIGHT / (RRF_K + rank)
+        by_id[c.chunk_id] = c
 
-    lex_max = max((c.score for c in lex_results), default=0.0)
-    if lex_max > 0:
-        for c in lex_results:
-            score[c.chunk_id] = score.get(c.chunk_id, 0.0) + (1 - SEM_WEIGHT) * (c.score / lex_max)
-            by_id.setdefault(c.chunk_id, c)
+    for rank, c in enumerate(lex_results, start=1):
+        score[c.chunk_id] = score.get(c.chunk_id, 0.0) + LEX_WEIGHT / (RRF_K + rank)
+        by_id.setdefault(c.chunk_id, c)
+
+    if score:
+        m = max(score.values())
+        if m > 0:
+            for k in score:
+                score[k] = score[k] / m
 
     return by_id, score
 
 
 async def hybrid_query(
     pool: asyncpg.Pool,
-    repo_id: int,
+    repo_ids: int | list[int],
     query: str,
     embed_fn: EmbedFn,
     *,
@@ -354,6 +438,9 @@ async def hybrid_query(
     candidate_pool: int = 20,
     graph_weight: float = 0.3,
     override_weight: float = 0.5,
+    view_kinds: tuple[str, ...] | None = None,
+    mmr_repo_lambda: float = 0.3,
+    mmr_file_lambda: float = 0.15,
 ) -> list[RetrievedChunk]:
     """Pull `candidate_pool` candidates from BOTH the semantic (cosine) and
     lexical (BM25 / FTS) retrievers, fuse via Reciprocal Rank Fusion, then
@@ -367,17 +454,31 @@ async def hybrid_query(
         override IS the implementation of the base, not just structurally
         related.
 
+    Then MMR-rerank with per-repo and per-file diversity penalties so the
+    top-k spans repos and files instead of collapsing into the most-cosine-
+    similar cluster. `mmr_repo_lambda` / `mmr_file_lambda` control the
+    penalty magnitudes; both are no-ops when only one repo/file appears in
+    the candidate pool.
+
     The lexical layer fixes the case where rare domain identifiers don't
     embed into recognizable neighbours but a plain keyword search nails
     them. Bonuses are blended additively, then results are re-ranked.
     Bidirectional walking on inheritance is what surfaces a child override
     when the query happens to match the base first, and vice versa.
+
+    `repo_ids` may be a single int (single-repo query, sugar) or a list
+    (cross-repo query). `view_kinds` filters which embedding views the
+    semantic side is allowed to consider; `None` means all views.
     """
+    rids = _norm_repo_ids(repo_ids)
     # Run cosine + lexical concurrently — they hit different indexes and
     # don't share state, so the second one is essentially free in wall time.
     sem_results, lex_results = await asyncio.gather(
-        semantic_query(pool, repo_id, query, embed_fn, top_k=candidate_pool),
-        lexical_query(pool, repo_id, query, top_k=candidate_pool),
+        semantic_query(
+            pool, rids, query, embed_fn,
+            top_k=candidate_pool, view_kinds=view_kinds,
+        ),
+        lexical_query(pool, rids, query, top_k=candidate_pool),
     )
     if not sem_results and not lex_results:
         return []
@@ -410,7 +511,10 @@ async def hybrid_query(
         ranked = sorted(by_id.values(), key=lambda c: scores[c.chunk_id], reverse=True)
         for c in ranked:
             c.score = scores[c.chunk_id]
-        return ranked[:top_k]
+        return _mmr_rerank(
+            ranked, scores, top_k,
+            repo_lambda=mmr_repo_lambda, file_lambda=mmr_file_lambda,
+        )
 
     anchor_ids = list(anchor_scores.keys())
     conf_weight = {"certain": 1.0, "inferred": 0.7, "uncertain": 0.4}
@@ -517,7 +621,7 @@ async def hybrid_query(
             related_ids = sorted(related_bonus.keys())
             related_chunks = await _fetch_chunks_for_anchors(
                 conn, related_ids, scores={cid: 1.0 for cid in related_ids},
-                granularity="function",
+                granularity="function", repo_ids=rids,
             )
             for nc in related_chunks:
                 bonus = related_bonus.get(nc.anchor_def_id or -1, 0.0)
@@ -532,7 +636,60 @@ async def hybrid_query(
     ranked = sorted(by_id.values(), key=lambda c: scores[c.chunk_id], reverse=True)
     for c in ranked:
         c.score = scores[c.chunk_id]
-    return ranked[:top_k]
+    return _mmr_rerank(
+        ranked, scores, top_k,
+        repo_lambda=mmr_repo_lambda, file_lambda=mmr_file_lambda,
+    )
+
+
+def _mmr_rerank(
+    candidates: list[RetrievedChunk],
+    scores: dict[int, float],
+    top_k: int,
+    *,
+    repo_lambda: float = 0.3,
+    file_lambda: float = 0.15,
+) -> list[RetrievedChunk]:
+    """Greedy MMR with per-repo + per-file diversity penalties.
+
+    At each pick:
+        adjusted = base_score - repo_lambda*n_repo_picked - file_lambda*n_file_picked
+
+    `n_repo_picked` / `n_file_picked` are counts of items already chosen
+    sharing the same repo / file. Returns up to `top_k`.
+
+    No-op when the candidate pool spans only one repo and one file — the
+    natural single-repo, single-file case shouldn't shuffle results.
+    """
+    if not candidates:
+        return []
+    distinct_repos = {c.repo_id for c in candidates if c.repo_id is not None}
+    distinct_files = {c.file_id for c in candidates}
+    if len(distinct_repos) <= 1 and len(distinct_files) <= 1:
+        return candidates[:top_k]
+
+    remaining = list(candidates)
+    picked: list[RetrievedChunk] = []
+    repo_count: dict[int | None, int] = {}
+    file_count: dict[int, int] = {}
+
+    while remaining and len(picked) < top_k:
+        best_idx = 0
+        best_adj = float("-inf")
+        for i, c in enumerate(remaining):
+            penalty = (
+                repo_lambda * repo_count.get(c.repo_id, 0)
+                + file_lambda * file_count.get(c.file_id, 0)
+            )
+            adj = scores.get(c.chunk_id, 0.0) - penalty
+            if adj > best_adj:
+                best_adj = adj
+                best_idx = i
+        chosen = remaining.pop(best_idx)
+        picked.append(chosen)
+        repo_count[chosen.repo_id] = repo_count.get(chosen.repo_id, 0) + 1
+        file_count[chosen.file_id] = file_count.get(chosen.file_id, 0) + 1
+    return picked
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -564,6 +721,9 @@ def assemble_context(chunks: list[RetrievedChunk], token_budget: int) -> str:
 
 
 def _row_to_chunk(r: asyncpg.Record) -> RetrievedChunk:
+    # `r.keys()` returns a one-shot iterator on asyncpg.Record, so materialize
+    # to a set before doing repeated containment checks.
+    keys = set(r.keys())
     return RetrievedChunk(
         chunk_id=r["id"],
         anchor_def_id=r["anchor_def_id"],
@@ -573,7 +733,9 @@ def _row_to_chunk(r: asyncpg.Record) -> RetrievedChunk:
         file_id=r["file_id"],
         token_count=r["token_count"] or 0,
         content=r["content"],
-        score=float(r["score"]) if "score" in r.keys() else 0.0,
+        score=float(r["score"]) if "score" in keys else 0.0,
+        repo_id=r["repo_id"] if "repo_id" in keys else None,
+        matched_view=r["matched_view"] if "matched_view" in keys else None,
     )
 
 
@@ -582,21 +744,40 @@ async def _fetch_chunks_for_anchors(
     anchor_ids: list[int],
     scores: dict[int, float],
     granularity: str,
+    *,
+    repo_ids: list[int] | None = None,
 ) -> list[RetrievedChunk]:
     if not anchor_ids:
         return []
-    rows = await conn.fetch(
-        """
-        SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
-               d.qualified_name, f.path AS file_path, f.id AS file_id,
-               0::float AS score
-        FROM chunks c
-        JOIN files f ON f.id = c.file_id
-        LEFT JOIN definitions d ON d.id = c.anchor_def_id
-        WHERE c.anchor_def_id = ANY($1::bigint[]) AND c.granularity = $2
-        """,
-        anchor_ids, granularity,
-    )
+    if repo_ids:
+        rows = await conn.fetch(
+            """
+            SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
+                   d.qualified_name, f.path AS file_path, f.id AS file_id,
+                   f.repo_id AS repo_id,
+                   0::float AS score
+            FROM chunks c
+            JOIN files f ON f.id = c.file_id
+            LEFT JOIN definitions d ON d.id = c.anchor_def_id
+            WHERE c.anchor_def_id = ANY($1::bigint[]) AND c.granularity = $2
+              AND f.repo_id = ANY($3::bigint[])
+            """,
+            anchor_ids, granularity, repo_ids,
+        )
+    else:
+        rows = await conn.fetch(
+            """
+            SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
+                   d.qualified_name, f.path AS file_path, f.id AS file_id,
+                   f.repo_id AS repo_id,
+                   0::float AS score
+            FROM chunks c
+            JOIN files f ON f.id = c.file_id
+            LEFT JOIN definitions d ON d.id = c.anchor_def_id
+            WHERE c.anchor_def_id = ANY($1::bigint[]) AND c.granularity = $2
+            """,
+            anchor_ids, granularity,
+        )
     out: list[RetrievedChunk] = []
     for r in rows:
         c = _row_to_chunk(r)
