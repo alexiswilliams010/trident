@@ -15,6 +15,7 @@ PG_DB ?= tsgrep
 MIGRATIONS_DIR := db/migrations
 
 PASS_CLI ?= pass-cli
+ENV_FILE ?= .env
 ENV_TEMPLATE ?= .env.template
 
 # DB selection. Default `tsgrep` is the shared multi-repo DB. Override on
@@ -27,8 +28,14 @@ DB_DSN := postgresql://$(DB_USER)@localhost:5432/$(DB)
 # Run $(1) with:
 #   - secrets streamed from pass-cli into the env (no file on disk),
 #   - DATABASE_URL pointing at $(DB).
+# Reads $(ENV_FILE) (default `.env`); copy $(ENV_TEMPLATE) to $(ENV_FILE)
+# on first use and edit values to taste.
 define inject_and_run
-	@OUTPUT=$$($(PASS_CLI) inject --in-file $(ENV_TEMPLATE)) || { echo "pass-cli inject failed"; exit 1; }; \
+	@if [ ! -f $(ENV_FILE) ]; then \
+		echo "$(ENV_FILE) not found — copy $(ENV_TEMPLATE) to $(ENV_FILE) and edit it"; \
+		exit 1; \
+	fi; \
+	OUTPUT=$$($(PASS_CLI) inject --in-file $(ENV_FILE)) || { echo "pass-cli inject failed"; exit 1; }; \
 	set -a; \
 	eval "$$OUTPUT"; \
 	set +a; \
