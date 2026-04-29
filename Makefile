@@ -1,10 +1,10 @@
 .PHONY: help install lint test test-extractor \
         db-start db-stop db-create db-drop db-migrate db-setup db-teardown db-reset db-psql \
         diagnose diagnose-isolated \
-        query-semantic query-hybrid query-fake-hybrid \
+        query-semantic query-lexical query-hybrid query-fake-hybrid \
         query-multi-repo-semantic query-multi-repo-hybrid \
         index embed \
-        index-isolated embed-isolated query-isolated-semantic query-isolated-hybrid \
+        index-isolated embed-isolated query-isolated-semantic query-isolated-lexical query-isolated-hybrid \
         db-ensure-isolated
 
 UV ?= uv
@@ -152,6 +152,12 @@ query-semantic: ## Semantic query. QUERY="..." REPO_NAME=name [TOP_K=10]
 	fi
 	$(call inject_and_run,$(PYTHON) -m cli.query --repo-name $(REPO_NAME) --semantic "$(QUERY)" --top-k $(TOP_K))
 
+query-lexical: ## Lexical (FTS) query. QUERY="..." REPO_NAME=name [TOP_K=10]. No embedder needed.
+	@if [ -z "$(QUERY)" ] || [ -z "$(REPO_NAME)" ]; then \
+		echo 'usage: make query-lexical QUERY="..." REPO_NAME=name [TOP_K=...]'; exit 2; \
+	fi
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.query --repo-name $(REPO_NAME) --lexical "$(QUERY)" --top-k $(TOP_K)
+
 query-hybrid: ## Hybrid query. QUERY="..." REPO_NAME=name [TOP_K=10] [MMR_REPO_LAMBDA=0.3] [MMR_FILE_LAMBDA=0.15]
 	@if [ -z "$(QUERY)" ] || [ -z "$(REPO_NAME)" ]; then \
 		echo 'usage: make query-hybrid QUERY="..." REPO_NAME=name [TOP_K=...] [MMR_*=...]'; exit 2; \
@@ -209,6 +215,9 @@ embed-isolated: ## Index + embed any repo into its own DB. REPO_PATH=/path REPO_
 
 query-isolated-semantic: ## Semantic query against per-repo DB. QUERY="..." REPO_NAME=name
 	@$(MAKE) --no-print-directory query-semantic QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME)
+
+query-isolated-lexical: ## Lexical query against per-repo DB. QUERY="..." REPO_NAME=name
+	@$(MAKE) --no-print-directory query-lexical QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME)
 
 query-isolated-hybrid: ## Hybrid query against per-repo DB. QUERY="..." REPO_NAME=name
 	@$(MAKE) --no-print-directory query-hybrid QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME)

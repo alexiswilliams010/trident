@@ -29,6 +29,7 @@ from core.retrieval import (
     RetrievedChunk,
     assemble_context,
     hybrid_query,
+    lexical_query,
     semantic_query,
     structural_query,
 )
@@ -91,8 +92,15 @@ async def _run(args: argparse.Namespace) -> int:
                 mmr_repo_lambda=args.mmr_repo_lambda,
                 mmr_file_lambda=args.mmr_file_lambda,
             )
+        elif args.lexical:
+            chunks = await lexical_query(
+                pool, repo_ids, args.lexical,
+                top_k=args.top_k,
+                granularities=tuple(args.granularity.split(",")) if args.granularity else None,
+            )
         else:
-            print("error: must pass one of --semantic / --structural / --hybrid", file=sys.stderr)
+            print("error: must pass one of --semantic / --lexical / --structural / --hybrid",
+                  file=sys.stderr)
             return 2
 
     if not chunks:
@@ -121,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dsn", type=str, default=None)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--semantic", type=str, help="natural-language query")
+    mode.add_argument("--lexical", type=str, help="full-text search over chunk bodies (no embedder)")
     mode.add_argument("--structural", type=str, help="definition name or qualified name")
     mode.add_argument("--hybrid", type=str, help="natural-language query (semantic + graph expand)")
     parser.add_argument("--top-k", type=int, default=10)
