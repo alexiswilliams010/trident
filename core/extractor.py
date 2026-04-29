@@ -48,6 +48,7 @@ class IndexFileResult:
 class IndexRepoResult:
     indexed: list[IndexFileResult]
     skipped: list[IndexFileResult]
+    deleted: list[str]
 
     @property
     def total_nodes(self) -> int:
@@ -195,6 +196,7 @@ async def index_repo(
     cfg = walk_config or WalkConfig.with_defaults(repo_root)
     indexed: list[IndexFileResult] = []
     skipped: list[IndexFileResult] = []
+    walked_paths: list[str] = []
     async with pool.acquire() as conn:
         # Record the on-disk root so Phase 3 resolvers (e.g. Go's go.mod parse)
         # can find files outside the DB. Idempotent; overwrites if changed.
@@ -204,13 +206,30 @@ async def index_repo(
             str(Path(repo_root).resolve()),
         )
         for discovered in walk_repo(cfg):
+            walked_paths.append(discovered.rel_path)
             async with conn.transaction():
                 result = await index_file(conn, repo_id, discovered)
             if result.skipped:
                 skipped.append(result)
             else:
                 indexed.append(result)
-    return IndexRepoResult(indexed=indexed, skipped=skipped)
+
+        # Prune rows for user files no longer reached by the walker (deletes,
+        # moves, newly excluded). Dependency files are kept — they're populated
+        # by Phase 3, not the walker, so absence here is not evidence of removal.
+        deleted_rows = await conn.fetch(
+            """
+            DELETE FROM files
+            WHERE repo_id = $1
+              AND from_dependency = FALSE
+              AND path <> ALL($2::text[])
+            RETURNING path
+            """,
+            repo_id,
+            walked_paths,
+        )
+        deleted = [r["path"] for r in deleted_rows]
+    return IndexRepoResult(indexed=indexed, skipped=skipped, deleted=deleted)
 
 
 def index_repo_sync(repo_id: int, repo_root: str | Path, dsn: str | None = None) -> IndexRepoResult:

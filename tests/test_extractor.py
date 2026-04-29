@@ -256,8 +256,44 @@ async def test_incremental_indexing_skips_unchanged(clean_repo, python_fixture_r
     first = await index_repo(pool, repo_id, python_fixture_root)
     assert len(first.indexed) > 0
     assert len(first.skipped) == 0
+    assert first.deleted == []
 
     second = await index_repo(pool, repo_id, python_fixture_root)
-    # Second run: every file should be skipped because the content hash matches.
+    # Second run: every file should be skipped because the content hash matches,
+    # and nothing should be pruned (the walker yields the same set both times).
     assert len(second.indexed) == 0
     assert len(second.skipped) == len(first.indexed)
+    assert second.deleted == []
+
+
+async def test_indexing_prunes_moved_and_deleted_files(clean_repo, tmp_path: Path) -> None:
+    """A file moved or deleted on disk between runs must have its DB rows
+    removed by the next index_repo call. Unchanged siblings must not be
+    affected."""
+    pool, repo_id = clean_repo
+
+    (tmp_path / "keep.py").write_text("def keep():\n    return 1\n")
+    (tmp_path / "moves.py").write_text("def moves():\n    return 2\n")
+    (tmp_path / "deleted.py").write_text("def deleted():\n    return 3\n")
+
+    first = await index_repo(pool, repo_id, tmp_path)
+    assert {r.rel_path for r in first.indexed} == {"keep.py", "moves.py", "deleted.py"}
+    assert first.deleted == []
+
+    # Move moves.py → sub/moved.py and remove deleted.py entirely.
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "moves.py").rename(tmp_path / "sub" / "moved.py")
+    (tmp_path / "deleted.py").unlink()
+
+    second = await index_repo(pool, repo_id, tmp_path)
+    # The moved file shows up at its new path; keep.py is unchanged.
+    assert {r.rel_path for r in second.indexed} == {"sub/moved.py"}
+    assert {r.rel_path for r in second.skipped} == {"keep.py"}
+    assert sorted(second.deleted) == ["deleted.py", "moves.py"]
+
+    # DB confirms the old paths are gone and the new path exists.
+    async with pool.acquire() as conn:
+        remaining = await conn.fetch(
+            "SELECT path FROM files WHERE repo_id=$1 ORDER BY path", repo_id,
+        )
+    assert [r["path"] for r in remaining] == ["keep.py", "sub/moved.py"]

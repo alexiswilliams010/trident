@@ -70,7 +70,9 @@ async def _run(
         extract_result = await index_repo(pool, repo_id, repo_path, walk_config=walk_cfg)
         print(
             f"[Tier 1] Indexed {len(extract_result.indexed)} files "
-            f"({extract_result.total_nodes} nodes); skipped {len(extract_result.skipped)} unchanged"
+            f"({extract_result.total_nodes} nodes); "
+            f"skipped {len(extract_result.skipped)} unchanged; "
+            f"pruned {len(extract_result.deleted)} stale"
         )
 
         if do_resolve:
