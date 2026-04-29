@@ -169,6 +169,26 @@ HARD_OUTPUT_CAP = {
     GRANULARITY_CROSS_MODULE: 3000,
 }
 
+# Order in which to shed bulky JSON fields when even (full preamble + body)
+# overflows the cap. Earlier = less important = dropped first. We stop as
+# soon as the chunk fits, so chunks where a single huge field is the problem
+# keep the rest of the enrichment. Reasoning per field:
+#   dependencies_truncated → tiny marker, no signal once we're trimming
+#   dependencies / external_deps → callee FQNs also appear in the body's
+#                                  call sites, so partially redundant
+#   inheritance_chain / overrides → small structural info, recoverable from
+#                                   the module / cross-module chunks
+#   callers → asymmetric: NOT visible from the function's own source, and
+#             the highest-value enrichment we have. Drop last.
+_METADATA_TRIM_ORDER = (
+    "dependencies_truncated",
+    "dependencies",
+    "external_deps",
+    "inheritance_chain",
+    "overrides",
+    "callers",
+)
+
 
 def _truncate_deps(deps: list[str]) -> tuple[list[str], int]:
     """Cap the dependency list. Returns (capped, n_truncated)."""
@@ -183,19 +203,41 @@ def _degrade_if_oversize(
     content: str,
     anchor_label: str,
     file_path: str,
+    body_only: str = "",
 ) -> tuple[dict, str, int]:
-    """If `content` exceeds the per-granularity hard cap, return a minimal
-    placeholder chunk instead. Keeps the chunks table free of garbage and
-    avoids wasting embedder calls on rows the gateway will reject.
+    """If `content` exceeds the per-granularity hard cap, first try shedding
+    the enrichment context (callee bodies, signatures, inheritance summaries)
+    and embed just the anchor body. Only when even body-alone overflows —
+    typically generated/minified code — fall back to a minimal stub.
+    Keeping the body keeps real retrieval signal in the embedding; falling
+    straight to the stub turns the chunk into a metadata-shaped near-clone
+    of every other oversized chunk and pollutes nearest-neighbor results.
     """
     tc = count_tokens(content)
     cap = HARD_OUTPUT_CAP.get(granularity)
     if cap is None or tc <= cap:
         return metadata, content, tc
+
+    if body_only:
+        shed_metadata = {**metadata, "degraded": "enrichment_shed", "original_token_count": tc}
+        shed_content = _md_preamble(shed_metadata) + body_only
+        shed_tc = count_tokens(shed_content)
+        if shed_tc <= cap:
+            return shed_metadata, shed_content, shed_tc
+
+        # Full metadata + body still overflows. Shed bulky fields one at a
+        # time in least-→most-important order, stopping as soon as it fits.
+        trimmed = {**metadata, "degraded": "metadata_trimmed", "original_token_count": tc}
+        for key in _METADATA_TRIM_ORDER:
+            if not trimmed.get(key):
+                continue
+            del trimmed[key]
+            attempt_content = _md_preamble(trimmed) + body_only
+            attempt_tc = count_tokens(attempt_content)
+            if attempt_tc <= cap:
+                return trimmed, attempt_content, attempt_tc
+
     degraded = {**metadata, "degraded": "oversize", "original_token_count": tc}
-    # Minimal stub: preamble + one-line marker, no source / callees / etc.
-    # The original content was almost certainly generated/minified code that
-    # has no useful retrieval signal anyway.
     stub = f"# {granularity} (degraded): {anchor_label} ({file_path})"
     new_content = _md_preamble(degraded) + "\n\n" + stub
     return degraded, new_content, count_tokens(new_content)
@@ -666,6 +708,7 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
     metadata, content, token_count = _degrade_if_oversize(
         GRANULARITY_FUNCTION, metadata, content,
         anchor_label=d.qualified_name, file_path=d.file_path,
+        body_only=body,
     )
     return _ChunkRow(
         file_id=d.file_id,
@@ -797,7 +840,13 @@ def _build_cross_module_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
     if deps_truncated:
         metadata["dependencies_truncated"] = deps_truncated
 
-    parts: list[str] = [_format_body(d, header=f"# anchor: {d.qualified_name}")]
+    # Anchor identity only — the full body lives in the function-granularity
+    # chunk for the same def. Cross-module's value is the 2-hop callee graph;
+    # repeating the body here is pure token waste and crowds out callee
+    # context the function chunk doesn't carry.
+    src = d.source()
+    anchor_first_line = src.splitlines()[0] if src else ""
+    parts: list[str] = [f"# anchor: {d.qualified_name} [{d.kind}]\n{anchor_first_line}"]
     if shared_state:
         parts.append("# shared state\n" + "\n".join(shared_state))
 
@@ -840,6 +889,7 @@ def _build_cross_module_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
     metadata, content, token_count = _degrade_if_oversize(
         GRANULARITY_CROSS_MODULE, metadata, content,
         anchor_label=d.qualified_name, file_path=d.file_path,
+        body_only=parts[0],
     )
     return _ChunkRow(
         file_id=d.file_id,

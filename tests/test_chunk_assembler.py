@@ -5,7 +5,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from core.chunk_assembler import assemble_chunks, count_tokens
+from core.chunk_assembler import (
+    GRANULARITY_FUNCTION,
+    HARD_OUTPUT_CAP,
+    _degrade_if_oversize,
+    assemble_chunks,
+    count_tokens,
+)
 from core.extractor import index_repo
 from core.heuristic_resolver import resolve_repo_imports
 from core.semantic_resolver import resolve_repo
@@ -26,6 +32,121 @@ async def _full_pipeline(pool, repo_id: int, root: Path):
 def test_count_tokens_basic():
     assert count_tokens("hello world") > 0
     assert count_tokens("") == 0
+
+
+# ────────────────────────────────────────────────────────────────────
+# Oversize degradation
+# ────────────────────────────────────────────────────────────────────
+
+
+def test_degrade_keeps_body_when_enrichment_overflows():
+    """When the assembled chunk overflows the cap but the body alone fits,
+    we should keep the body and shed the enrichment context. The previous
+    behavior of replacing the entire chunk with a metadata stub destroyed
+    retrieval signal and clustered every degraded chunk in the same corner
+    of embedding space."""
+    cap = HARD_OUTPUT_CAP[GRANULARITY_FUNCTION]
+    metadata = {
+        "anchor": "Foo.move",
+        "kind": "function",
+        "language": "solidity",
+        "file": "src/Foo.sol",
+        "granularity": GRANULARITY_FUNCTION,
+    }
+    body = "function move() external {\n    require(true);\n    state = 1;\n}"
+    bloat = " ".join(["bloat"] * (cap * 2))
+    full_content = f"/* preamble */\n{body}\n\n# extras\n{bloat}"
+    assert count_tokens(full_content) > cap
+
+    new_meta, new_content, tc = _degrade_if_oversize(
+        GRANULARITY_FUNCTION, metadata, full_content,
+        anchor_label="Foo.move", file_path="src/Foo.sol",
+        body_only=body,
+    )
+    assert new_meta["degraded"] == "enrichment_shed"
+    assert "function move()" in new_content
+    assert "bloat" not in new_content
+    assert tc <= cap
+
+
+def test_degrade_trims_metadata_incrementally_least_important_first():
+    """When (full preamble + body) overflows because the metadata is bulky,
+    drop bulky JSON fields one at a time in least-→most-important order
+    until it fits. `callers` is asymmetric (not derivable from the body)
+    and should survive longest; `dependencies` is partially redundant with
+    the body's own call sites and should be shed earlier."""
+    cap = HARD_OUTPUT_CAP[GRANULARITY_FUNCTION]
+    body = "function move() external {\n    doThing();\n}"
+    # Big `dependencies` list: 200 long FQN entries — alone enough to push
+    # the preamble past cap. Keep callers small to verify it survives.
+    big_deps = [f"Pkg.Contract.veryLongDependencyName_{i:04d}" for i in range(200)]
+    metadata = {
+        "anchor": "Pkg.Contract.move",
+        "kind": "function",
+        "language": "solidity",
+        "file": "src/Pkg/Contract.sol",
+        "dependencies": big_deps,
+        "callers": ["Pkg.Contract.attack", "Pkg.Contract.defend"],
+        "external_deps": ["foo", "bar"],
+        "inheritance_chain": ["BaseContract"],
+        "overrides": "BaseContract.move",
+        "granularity": GRANULARITY_FUNCTION,
+    }
+    bloat = " ".join(["bloat"] * (cap * 2))
+    full_content = f"/* preamble */\n{body}\n\n# extras\n{bloat}"
+
+    new_meta, new_content, tc = _degrade_if_oversize(
+        GRANULARITY_FUNCTION, metadata, full_content,
+        anchor_label="Pkg.Contract.move", file_path="src/Pkg/Contract.sol",
+        body_only=body,
+    )
+    assert new_meta["degraded"] == "metadata_trimmed"
+    assert "function move()" in new_content
+    assert tc <= cap
+    # `dependencies` is the bulky, partially-redundant field — should be the
+    # first thing dropped, and dropping just it should be enough here.
+    assert "dependencies" not in new_meta
+    # Higher-value enrichment that wasn't required to fit must survive.
+    assert new_meta.get("callers") == ["Pkg.Contract.attack", "Pkg.Contract.defend"]
+    assert new_meta.get("overrides") == "BaseContract.move"
+
+
+def test_degrade_falls_back_to_stub_when_body_alone_overflows():
+    """Pathological case: even the body alone is bigger than the cap (e.g.
+    minified vendored code). Fall through to the existing stub behavior."""
+    cap = HARD_OUTPUT_CAP[GRANULARITY_FUNCTION]
+    metadata = {
+        "anchor": "Vendor.blob",
+        "kind": "function",
+        "language": "javascript",
+        "file": "dist/bundle.js",
+        "granularity": GRANULARITY_FUNCTION,
+    }
+    huge_body = " ".join(["x"] * (cap * 3))
+    full_content = f"/* preamble */\n{huge_body}"
+    assert count_tokens(huge_body) > cap
+
+    new_meta, new_content, _ = _degrade_if_oversize(
+        GRANULARITY_FUNCTION, metadata, full_content,
+        anchor_label="Vendor.blob", file_path="dist/bundle.js",
+        body_only=huge_body,
+    )
+    assert new_meta["degraded"] == "oversize"
+    assert "(degraded): Vendor.blob" in new_content
+
+
+def test_degrade_passthrough_when_under_cap():
+    """No-op when the chunk is under cap — metadata and content unchanged."""
+    metadata = {"anchor": "Foo.bar", "granularity": GRANULARITY_FUNCTION}
+    content = "/* preamble */\nfunction bar() {}"
+    new_meta, new_content, tc = _degrade_if_oversize(
+        GRANULARITY_FUNCTION, metadata, content,
+        anchor_label="Foo.bar", file_path="src/Foo.sol",
+        body_only="function bar() {}",
+    )
+    assert new_meta is metadata
+    assert new_content == content
+    assert tc == count_tokens(content)
 
 
 # ────────────────────────────────────────────────────────────────────

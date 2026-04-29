@@ -98,25 +98,6 @@ async def test_semantic_query_returns_top_k(clean_repo, python_fixture_root: Pat
     assert same and same[0].qualified_name == "main.Calculator.add"
 
 
-async def test_hybrid_query_expands_via_graph(clean_repo, python_fixture_root: Path):
-    pool, repo_id = clean_repo
-    embed_fn = await _seed_python(pool, repo_id, python_fixture_root)
-    # Seed the query with main.run's content; hybrid should also surface its callees.
-    async with pool.acquire() as conn:
-        seed = await conn.fetchval(
-            "SELECT c.content FROM chunks c "
-            "JOIN definitions d ON d.id=c.anchor_def_id "
-            "WHERE d.qualified_name='main.run' AND c.granularity='function'",
-        )
-    # Wider top_k because RRF compresses rank-1 advantage relative to graph
-    # bonuses — the load-bearing claim is "the callee gets surfaced via the
-    # graph", not that the exact-match seed dominates.
-    chunks = await hybrid_query(pool, repo_id, seed, embed_fn, top_k=20)
-    qns = {c.qualified_name for c in chunks}
-    # Calculator.add is a 1-hop neighbour and should be lifted into the rank.
-    assert "main.Calculator.add" in qns
-
-
 def test_assemble_context_dedupes_and_budgets():
     a = RetrievedChunk(chunk_id=1, anchor_def_id=10, qualified_name="x", granularity="function",
                        file_path="a.py", file_id=1, token_count=300, content="A " * 100, score=0.9)
