@@ -103,12 +103,15 @@ class EmbedStats:
             self.skipped_oversize = []
 
 
-# Conservative ceiling — well under typical embedding-model context windows
+# Outer ceiling that filters chunks before sending to the embedder gateway.
+# Sized to comfortably exceed our per-granularity `HARD_OUTPUT_CAP` (largest
+# is cross-module at 8000) while staying under typical model context windows
 # (qwen3-embedding-8b: 32k, OpenAI v3: 8191, Voyage: 32k). Chunks above this
 # are skipped rather than failing the whole run; in practice they come from
 # vendored minified bundles or pathological generated code that has no
-# semantic value to index anyway.
-DEFAULT_MAX_INPUT_TOKENS = 8000
+# semantic value to index anyway. Override via `EMBEDDING_MAX_INPUT_TOKENS`
+# for models with smaller context (e.g. OpenAI v3 at 8191).
+DEFAULT_MAX_INPUT_TOKENS = int(os.environ.get("EMBEDDING_MAX_INPUT_TOKENS", "16000"))
 
 
 def _vector_literal(values: list[float]) -> str:

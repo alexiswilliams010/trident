@@ -69,17 +69,25 @@ def test_degrade_keeps_body_when_enrichment_overflows():
     assert tc <= cap
 
 
-def test_degrade_trims_metadata_incrementally_least_important_first():
+def test_degrade_trims_metadata_incrementally_least_important_first(monkeypatch):
     """When (full preamble + body) overflows because the metadata is bulky,
     drop bulky JSON fields one at a time in least-→most-important order
     until it fits. `callers` is asymmetric (not derivable from the body)
     and should survive longest; `dependencies` is partially redundant with
-    the body's own call sites and should be shed earlier."""
-    cap = HARD_OUTPUT_CAP[GRANULARITY_FUNCTION]
+    the body's own call sites and should be shed earlier.
+
+    Pins a small per-test cap so the assertion isn't coupled to the
+    production cap, which is tuned to the embedding model and will shift
+    over time.
+    """
+    test_cap = 300
+    monkeypatch.setitem(HARD_OUTPUT_CAP, GRANULARITY_FUNCTION, test_cap)
+
     body = "function move() external {\n    doThing();\n}"
-    # Big `dependencies` list: 200 long FQN entries — alone enough to push
-    # the preamble past cap. Keep callers small to verify it survives.
-    big_deps = [f"Pkg.Contract.veryLongDependencyName_{i:04d}" for i in range(200)]
+    # Big `dependencies` list — alone enough to push the preamble past the
+    # pinned 300-token cap. Keep `callers` small so we can verify it
+    # survives the trim.
+    big_deps = [f"Pkg.Contract.dep_{i:04d}" for i in range(60)]
     metadata = {
         "anchor": "Pkg.Contract.move",
         "kind": "function",
@@ -92,7 +100,7 @@ def test_degrade_trims_metadata_incrementally_least_important_first():
         "overrides": "BaseContract.move",
         "granularity": GRANULARITY_FUNCTION,
     }
-    bloat = " ".join(["bloat"] * (cap * 2))
+    bloat = " ".join(["bloat"] * (test_cap * 2))
     full_content = f"/* preamble */\n{body}\n\n# extras\n{bloat}"
 
     new_meta, new_content, tc = _degrade_if_oversize(
@@ -102,7 +110,7 @@ def test_degrade_trims_metadata_incrementally_least_important_first():
     )
     assert new_meta["degraded"] == "metadata_trimmed"
     assert "function move()" in new_content
-    assert tc <= cap
+    assert tc <= test_cap
     # `dependencies` is the bulky, partially-redundant field — should be the
     # first thing dropped, and dropping just it should be enough here.
     assert "dependencies" not in new_meta

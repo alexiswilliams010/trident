@@ -160,13 +160,20 @@ MAX_DEPS_IN_METADATA = 50
 
 # Defense-in-depth ceiling per granularity. Anything past this is replaced
 # with a minimal placeholder chunk before persistence — see
-# `_degrade_if_oversize`. The embedder's `DEFAULT_MAX_INPUT_TOKENS` (8000) is
-# the outermost guard; these caps catch things earlier so the `chunks` table
+# `_degrade_if_oversize`. The embedder's `DEFAULT_MAX_INPUT_TOKENS` is the
+# outermost guard; these caps catch things earlier so the `chunks` table
 # doesn't accumulate unembeddable rows.
+#
+# Sized to fit real hand-written function bodies (largest seen ~3540 tokens
+# in OP Stack contracts) plus headroom for enrichment, while staying well
+# under modern embedding context windows (qwen3-embedding-8b: 32k, Voyage
+# code-3: 32k, OpenAI v3: 8191). Soft budgets (`TOKEN_BUDGETS`) and the
+# `HARD_CAP_MULTIPLIER` are unchanged, so most chunks stay small — these
+# caps only stop penalizing the rare chunks that legitimately need room.
 HARD_OUTPUT_CAP = {
-    GRANULARITY_FUNCTION:     1500,
-    GRANULARITY_MODULE:       2000,
-    GRANULARITY_CROSS_MODULE: 3000,
+    GRANULARITY_FUNCTION:     4000,
+    GRANULARITY_MODULE:       6000,
+    GRANULARITY_CROSS_MODULE: 8000,
 }
 
 # Order in which to shed bulky JSON fields when even (full preamble + body)
