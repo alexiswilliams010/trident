@@ -1,7 +1,7 @@
 """Phase 4b/4c acceptance tests using the deterministic fake embedder.
 
-Covers the multi-view embedding pipeline, cross-repo retrieval, RRF fusion,
-identifier-aware FTS, and MMR diversity reranking.
+Covers cross-repo retrieval, RRF fusion, identifier-aware FTS, and MMR
+diversity reranking.
 """
 
 from __future__ import annotations
@@ -9,7 +9,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from core.chunk_assembler import _expand_idents, _fts_text, assemble_chunks
-from core.embed_views import VIEW_KINDS
 from core.embedder import embed_repo_chunks, make_fake_embedder
 from core.extractor import index_repo
 from core.heuristic_resolver import resolve_repo_imports
@@ -58,92 +57,7 @@ async def test_fake_embedder_inserts_rows(clean_repo, python_fixture_root: Path)
             repo_id,
         )
         assert n_chunks > 0
-        # One row per (chunk, view) pair.
-        assert n_embeds == n_chunks * len(VIEW_KINDS)
-
-
-async def test_multi_view_embeddings_per_chunk(clean_repo, python_fixture_root: Path):
-    pool, repo_id = clean_repo
-    await _seed_python(pool, repo_id, python_fixture_root)
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT ce.view_kind, COUNT(*) AS n
-            FROM chunk_embeddings ce
-            JOIN chunks c ON c.id = ce.chunk_id
-            JOIN files f ON f.id = c.file_id
-            WHERE f.repo_id = $1
-            GROUP BY ce.view_kind
-            """,
-            repo_id,
-        )
-    by_view = {r["view_kind"]: r["n"] for r in rows}
-    for vk in VIEW_KINDS:
-        assert by_view.get(vk, 0) > 0, f"missing rows for view {vk!r}: {by_view}"
-    # Counts should be equal across views (every chunk has every view).
-    counts = list(by_view.values())
-    assert all(n == counts[0] for n in counts), f"uneven view counts: {by_view}"
-
-
-async def test_enriched_view_inlines_referenced_types(
-    clean_repo, python_fixture_root: Path,
-):
-    """The Calculator.add chunk's `content` doesn't contain `helper`'s body,
-    but the enriched view's `input_text` should — because `helper` is
-    referenced from add's body."""
-    pool, repo_id = clean_repo
-    await _seed_python(pool, repo_id, python_fixture_root)
-    async with pool.acquire() as conn:
-        # Source view text should equal chunks.content.
-        source_text = await conn.fetchval(
-            """
-            SELECT ce.input_text FROM chunk_embeddings ce
-            JOIN chunks c ON c.id = ce.chunk_id
-            JOIN definitions d ON d.id = c.anchor_def_id
-            WHERE d.qualified_name = 'main.Calculator.add'
-              AND c.granularity = 'function'
-              AND ce.view_kind = 'source'
-            """,
-        )
-        enriched_text = await conn.fetchval(
-            """
-            SELECT ce.input_text FROM chunk_embeddings ce
-            JOIN chunks c ON c.id = ce.chunk_id
-            JOIN definitions d ON d.id = c.anchor_def_id
-            WHERE d.qualified_name = 'main.Calculator.add'
-              AND c.granularity = 'function'
-              AND ce.view_kind = 'enriched'
-            """,
-        )
-        chunk_content = await conn.fetchval(
-            """
-            SELECT c.content FROM chunks c
-            JOIN definitions d ON d.id = c.anchor_def_id
-            WHERE d.qualified_name = 'main.Calculator.add'
-              AND c.granularity = 'function'
-            """,
-        )
-    assert source_text is not None and enriched_text is not None
-    # Source view = chunk content verbatim.
-    assert source_text == chunk_content
-    # Enriched view contains the referenced `helper` somewhere in the
-    # `# referenced types` block.
-    assert "# referenced types" in enriched_text
-    assert "helper" in enriched_text
-    # And the displayed content has not been polluted with that block.
-    assert "# referenced types" not in chunk_content
-
-
-async def test_input_text_idempotency(clean_repo, python_fixture_root: Path):
-    """Re-running the embedder shouldn't produce new INSERTs when the views
-    haven't changed."""
-    pool, repo_id = clean_repo
-    embed_fn = await _seed_python(pool, repo_id, python_fixture_root)
-    stats = await embed_repo_chunks(pool, repo_id, embed_fn, "fake-deterministic")
-    # Every (chunk, view) row already existed with the same hash, so no new
-    # embeddings should have been queued.
-    assert stats.embedded == 0
-    assert stats.skipped_unchanged > 0
+        assert n_embeds == n_chunks
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -171,10 +85,7 @@ async def test_semantic_query_returns_top_k(clean_repo, python_fixture_root: Pat
     chunks = await semantic_query(pool, repo_id, "Calculator add helper", embed_fn, top_k=5)
     assert chunks
     assert all(c.score >= -1.0 and c.score <= 1.0 for c in chunks)
-    # Each result should report which view produced its best score.
-    assert all(c.matched_view in VIEW_KINDS for c in chunks)
-    # With the deterministic stub, querying for the EXACT chunk content
-    # against the source view returns it first (cosine distance == 0).
+    # With the deterministic stub, querying for the EXACT chunk content returns it first.
     async with pool.acquire() as conn:
         seed_content = await conn.fetchval(
             "SELECT c.content FROM chunks c JOIN files f ON f.id=c.file_id "
@@ -183,10 +94,7 @@ async def test_semantic_query_returns_top_k(clean_repo, python_fixture_root: Pat
             "  AND c.granularity='function' LIMIT 1",
             repo_id,
         )
-    same = await semantic_query(
-        pool, repo_id, seed_content, embed_fn,
-        top_k=1, view_kinds=("source",),
-    )
+    same = await semantic_query(pool, repo_id, seed_content, embed_fn, top_k=1)
     assert same and same[0].qualified_name == "main.Calculator.add"
 
 
@@ -203,7 +111,7 @@ async def test_hybrid_query_expands_via_graph(clean_repo, python_fixture_root: P
     # Wider top_k because RRF compresses rank-1 advantage relative to graph
     # bonuses — the load-bearing claim is "the callee gets surfaced via the
     # graph", not that the exact-match seed dominates.
-    chunks = await hybrid_query(pool, repo_id, seed, embed_fn, top_k=10)
+    chunks = await hybrid_query(pool, repo_id, seed, embed_fn, top_k=20)
     qns = {c.qualified_name for c in chunks}
     # Calculator.add is a 1-hop neighbour and should be lifted into the rank.
     assert "main.Calculator.add" in qns

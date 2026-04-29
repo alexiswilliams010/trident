@@ -11,25 +11,16 @@ OpenAI-compat endpoint, OpenAI itself) can be slotted in:
 For models with native dim != 1024, the gateway/SDK is expected to truncate
 or project to 1024 (OpenAI v3 supports `dimensions=1024`; Voyage code 3 is
 natively 1024).
-
-Each chunk produces multiple embeddings — one per "view" (see
-`core/embed_views.py`). At retrieval time the lateral picks the best-scoring
-view per chunk. The embedder skips re-embedding any (chunk, view, model)
-triple whose `input_text_hash` is unchanged.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 import asyncpg
-
-from .chunk_assembler import count_tokens
-from .embed_views import VIEW_KINDS, build_views
 
 try:
     from openai import OpenAI
@@ -103,26 +94,26 @@ class OpenAICompatibleEmbedder:
 @dataclass
 class EmbedStats:
     chunks_seen: int = 0
-    embedded: int = 0           # number of (chunk, view) rows newly embedded
-    skipped_unchanged: int = 0  # rows whose input_text_hash was already current
-    skipped_oversize: list[tuple[int, str, int]] = field(default_factory=list)
-    # (chunk_id, view_kind, token_count)
+    embedded: int = 0
+    skipped: int = 0
+    skipped_oversize: list[tuple[int, int]] = None  # (chunk_id, token_count)
+
+    def __post_init__(self):
+        if self.skipped_oversize is None:
+            self.skipped_oversize = []
 
 
 # Conservative ceiling — well under typical embedding-model context windows
-# (qwen3-embedding-8b: 32k, OpenAI v3: 8191, Voyage: 32k). Per-view rows
-# above this are skipped rather than failing the whole run; in practice they
-# come from vendored minified bundles or pathological generated code.
+# (qwen3-embedding-8b: 32k, OpenAI v3: 8191, Voyage: 32k). Chunks above this
+# are skipped rather than failing the whole run; in practice they come from
+# vendored minified bundles or pathological generated code that has no
+# semantic value to index anyway.
 DEFAULT_MAX_INPUT_TOKENS = 8000
 
 
 def _vector_literal(values: list[float]) -> str:
     """pgvector accepts a string of the form '[v1,v2,...]'."""
     return "[" + ",".join(f"{v:.7g}" for v in values) + "]"
-
-
-def _hash_input(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
 async def embed_repo_chunks(
@@ -134,117 +125,70 @@ async def embed_repo_chunks(
     dim: int = 4096,
     batch_size: int = 64,
     max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS,
-    view_kinds: tuple[str, ...] = VIEW_KINDS,
 ) -> EmbedStats:
-    """Embed every (chunk, view) pair in `repo_id` whose input_text_hash is
-    missing or stale.
+    """Embed every chunk in `repo_id` that doesn't already have an embedding.
 
     `embed_fn(texts) -> vectors` is the abstraction; production passes
     `OpenAICompatibleEmbedder(...).embed`, tests pass a deterministic stub.
 
-    For each chunk, `build_views` (in `core/embed_views.py`) computes one
-    text per view kind. We hash each view's text and compare against the
-    existing row for `(chunk_id, view_kind, model_name)`; rows whose hash
-    matches the current text are skipped. Rows whose hash differs are
-    re-embedded and UPSERTed.
+    Chunks whose `token_count` exceeds `max_input_tokens` are skipped rather
+    than sent to the gateway: most embedding endpoints reject inputs above
+    their context window with HTTP 422, which would otherwise abort the
+    whole run. Skipped chunks are reported on `EmbedStats.skipped_oversize`.
     """
     stats = EmbedStats()
     async with pool.acquire() as conn:
-        chunk_rows = await conn.fetch(
+        rows = await conn.fetch(
             """
-            SELECT c.id, c.content, c.anchor_def_id, c.granularity
+            SELECT c.id, c.content, c.token_count
             FROM chunks c
             JOIN files f ON f.id = c.file_id
-            WHERE f.repo_id = $1
+            LEFT JOIN chunk_embeddings ce ON ce.chunk_id = c.id
+            WHERE f.repo_id = $1 AND ce.id IS NULL
             ORDER BY c.id
             """,
             repo_id,
         )
-        stats.chunks_seen = len(chunk_rows)
-        if not chunk_rows:
+        stats.chunks_seen = len(rows)
+        if not rows:
             return stats
 
-        existing = await conn.fetch(
-            """
-            SELECT ce.chunk_id, ce.view_kind, ce.input_text_hash
-            FROM chunk_embeddings ce
-            JOIN chunks c ON c.id = ce.chunk_id
-            JOIN files f ON f.id = c.file_id
-            WHERE f.repo_id = $1 AND ce.model_name = $2
-            """,
-            repo_id, model_name,
-        )
-        existing_hash: dict[tuple[int, str], str | None] = {
-            (r["chunk_id"], r["view_kind"]): r["input_text_hash"] for r in existing
-        }
-
-        # Pending = list of dicts with chunk_id, view_kind, text, text_hash.
-        pending: list[dict] = []
-        for cr in chunk_rows:
-            views = await build_views(
-                conn, cr["id"], cr["content"], cr["anchor_def_id"], cr["granularity"],
-            )
-            for vk in view_kinds:
-                text = views.get(vk)
-                if text is None:
-                    continue
-                h = _hash_input(text)
-                prev = existing_hash.get((cr["id"], vk))
-                if prev == h:
-                    stats.skipped_unchanged += 1
-                    continue
-                tc = count_tokens(text)
-                if tc > max_input_tokens:
-                    stats.skipped_oversize.append((cr["id"], vk, tc))
-                    continue
-                pending.append({
-                    "chunk_id": cr["id"],
-                    "view_kind": vk,
-                    "text": text,
-                    "hash": h,
-                })
-
+        # Filter oversize chunks up front. We still report each one so the
+        # operator can see what's being dropped (typically vendored bundles
+        # like *.min.js or pathological generated code).
+        eligible: list = []
+        for r in rows:
+            tc = r["token_count"] or 0
+            if tc > max_input_tokens:
+                stats.skipped_oversize.append((r["id"], tc))
+                stats.skipped += 1
+            else:
+                eligible.append(r)
         if stats.skipped_oversize:
             print(
                 f"[Tier 3 embed] skipping {len(stats.skipped_oversize)} oversize "
-                f"view(s) > {max_input_tokens} tokens "
-                f"(largest: {max(t for _, _, t in stats.skipped_oversize)})"
+                f"chunk(s) > {max_input_tokens} tokens "
+                f"(largest: {max(t for _, t in stats.skipped_oversize)})"
             )
 
-        for i in range(0, len(pending), batch_size):
-            batch = pending[i : i + batch_size]
-            texts = [item["text"] for item in batch]
+        for i in range(0, len(eligible), batch_size):
+            batch = eligible[i : i + batch_size]
+            texts = [r["content"] for r in batch]
             vectors = await embed_fn(texts)
             if len(vectors) != len(batch):
                 raise RuntimeError(
                     f"embed_fn returned {len(vectors)} vectors for batch of {len(batch)}"
                 )
             insert_rows = []
-            for item, vec in zip(batch, vectors):
+            for r, vec in zip(batch, vectors):
                 if len(vec) != dim:
                     raise RuntimeError(
-                        f"embedding dim mismatch: got {len(vec)}, expected {dim} "
-                        f"(chunk {item['chunk_id']}, view {item['view_kind']})"
+                        f"embedding dim mismatch: got {len(vec)}, expected {dim} (chunk {r['id']})"
                     )
-                insert_rows.append((
-                    item["chunk_id"],
-                    item["view_kind"],
-                    _vector_literal(vec),
-                    model_name,
-                    item["text"],
-                    item["hash"],
-                ))
+                insert_rows.append((r["id"], _vector_literal(vec), model_name))
             await conn.executemany(
-                """
-                INSERT INTO chunk_embeddings
-                    (chunk_id, view_kind, embedding, model_name, input_text, input_text_hash)
-                VALUES ($1, $2, $3::vector, $4, $5, $6)
-                ON CONFLICT (chunk_id, view_kind, model_name)
-                DO UPDATE SET
-                    embedding = EXCLUDED.embedding,
-                    input_text = EXCLUDED.input_text,
-                    input_text_hash = EXCLUDED.input_text_hash
-                """,
+                "INSERT INTO chunk_embeddings (chunk_id, embedding, model_name) "
+                "VALUES ($1, $2::vector, $3)",
                 insert_rows,
             )
             stats.embedded += len(batch)
@@ -276,6 +220,8 @@ def embed_repo_sync(
 def make_fake_embedder(dim: int = 4096) -> tuple[EmbedFn, str]:
     """Hash-based deterministic embedder. Used by Phase 4 retrieval tests so
     the suite doesn't need an API key. Same input always → same vector."""
+
+    import hashlib
 
     def _vec_from_text(text: str) -> list[float]:
         # Use SHA-256 to seed a pseudo-random sequence; spread across `dim`.
