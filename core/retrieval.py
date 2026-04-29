@@ -38,7 +38,6 @@ class RetrievedChunk:
     content: str
     score: float                     # higher is better; meaning depends on query mode
     repo_id: int | None = None       # which repo this chunk came from (multi-repo aware)
-    matched_view: str | None = None  # which embedding view produced the top score
 
 
 def _norm_repo_ids(x: int | list[int]) -> list[int]:
@@ -170,22 +169,7 @@ _SKELETON_JOINS_SQL = """
                     GROUP BY defs.file_id
                 ) file_sig ON file_sig.file_id = c.file_id
 """
-# Lateral that picks the best-scoring view per chunk. Each chunk has one row
-# per (view_kind, model) in `chunk_embeddings`; we want the closest one.
-# `$2` is the optional view_kinds filter (NULL for "all views"); $1 is the
-# query vector (text representation, cast to vector).
-_BEST_VIEW_LATERAL = """
-LEFT JOIN LATERAL (
-    SELECT ce.view_kind, ce.embedding <=> $1::vector AS dist
-    FROM chunk_embeddings ce
-    WHERE ce.chunk_id = c.id
-      AND ($2::text[] IS NULL OR ce.view_kind = ANY($2::text[]))
-    ORDER BY dist
-    LIMIT 1
-) best_view ON TRUE
-"""
-
-_SCORE_EXPR = f"(1.0 - best_view.dist) * {_SKELETON_FACTOR_SQL}"
+_SCORE_EXPR = f"(1.0 - (ce.embedding <=> $1::vector)) * {_SKELETON_FACTOR_SQL}"
 
 
 async def semantic_query(
@@ -196,27 +180,15 @@ async def semantic_query(
     *,
     top_k: int = 10,
     granularities: tuple[str, ...] | None = None,
-    view_kinds: tuple[str, ...] | None = None,
 ) -> list[RetrievedChunk]:
     """Embed `query` and return the top-k nearest chunks by cosine distance,
     with a graph-signal penalty applied so signature-only defs don't crowd
-    out real implementations.
-
-    Each chunk has multiple embedding "views" (e.g. raw source vs. source +
-    inlined referenced types — see `core/embed_views.py`). The lateral inside
-    the SQL picks the *best-scoring view per chunk* against the query vector,
-    so a query that matches the enriched view will surface the chunk even if
-    the source view alone wouldn't have.
-
-    `view_kinds` filters which views to consider (e.g. `("source",)` to
-    exactly reproduce pre-multi-view behavior); `None` means all views.
-    """
+    out real implementations."""
     vectors = await embed_fn([query])
     if not vectors:
         return []
     qvec = _vector_literal(vectors[0])
     rids = _norm_repo_ids(repo_ids)
-    vks = list(view_kinds) if view_kinds else None
 
     async with pool.acquire() as conn:
         if granularities:
@@ -224,39 +196,36 @@ async def semantic_query(
                 f"""
                 SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
                        d.qualified_name, f.path AS file_path, f.id AS file_id,
-                       f.repo_id AS repo_id, best_view.view_kind AS matched_view,
+                       f.repo_id AS repo_id,
                        {_SCORE_EXPR} AS score
                 FROM chunks c
                 JOIN files f ON f.id = c.file_id
                 LEFT JOIN definitions d ON d.id = c.anchor_def_id
                 {_SKELETON_JOINS_SQL}
-                {_BEST_VIEW_LATERAL}
-                WHERE f.repo_id = ANY($3::bigint[])
-                  AND c.granularity = ANY($4::text[])
-                  AND best_view.dist IS NOT NULL
+                JOIN chunk_embeddings ce ON ce.chunk_id = c.id
+                WHERE f.repo_id = ANY($2::bigint[]) AND c.granularity = ANY($3::text[])
                 ORDER BY score DESC
-                LIMIT $5
+                LIMIT $4
                 """,
-                qvec, vks, rids, list(granularities), top_k,
+                qvec, rids, list(granularities), top_k,
             )
         else:
             rows = await conn.fetch(
                 f"""
                 SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
                        d.qualified_name, f.path AS file_path, f.id AS file_id,
-                       f.repo_id AS repo_id, best_view.view_kind AS matched_view,
+                       f.repo_id AS repo_id,
                        {_SCORE_EXPR} AS score
                 FROM chunks c
                 JOIN files f ON f.id = c.file_id
                 LEFT JOIN definitions d ON d.id = c.anchor_def_id
                 {_SKELETON_JOINS_SQL}
-                {_BEST_VIEW_LATERAL}
-                WHERE f.repo_id = ANY($3::bigint[])
-                  AND best_view.dist IS NOT NULL
+                JOIN chunk_embeddings ce ON ce.chunk_id = c.id
+                WHERE f.repo_id = ANY($2::bigint[])
                 ORDER BY score DESC
-                LIMIT $4
+                LIMIT $3
                 """,
-                qvec, vks, rids, top_k,
+                qvec, rids, top_k,
             )
     return [_row_to_chunk(r) for r in rows]
 
@@ -438,7 +407,6 @@ async def hybrid_query(
     candidate_pool: int = 20,
     graph_weight: float = 0.3,
     override_weight: float = 0.5,
-    view_kinds: tuple[str, ...] | None = None,
     mmr_repo_lambda: float = 0.3,
     mmr_file_lambda: float = 0.15,
 ) -> list[RetrievedChunk]:
@@ -467,17 +435,13 @@ async def hybrid_query(
     when the query happens to match the base first, and vice versa.
 
     `repo_ids` may be a single int (single-repo query, sugar) or a list
-    (cross-repo query). `view_kinds` filters which embedding views the
-    semantic side is allowed to consider; `None` means all views.
+    (cross-repo query).
     """
     rids = _norm_repo_ids(repo_ids)
     # Run cosine + lexical concurrently — they hit different indexes and
     # don't share state, so the second one is essentially free in wall time.
     sem_results, lex_results = await asyncio.gather(
-        semantic_query(
-            pool, rids, query, embed_fn,
-            top_k=candidate_pool, view_kinds=view_kinds,
-        ),
+        semantic_query(pool, rids, query, embed_fn, top_k=candidate_pool),
         lexical_query(pool, rids, query, top_k=candidate_pool),
     )
     if not sem_results and not lex_results:
@@ -735,7 +699,6 @@ def _row_to_chunk(r: asyncpg.Record) -> RetrievedChunk:
         content=r["content"],
         score=float(r["score"]) if "score" in keys else 0.0,
         repo_id=r["repo_id"] if "repo_id" in keys else None,
-        matched_view=r["matched_view"] if "matched_view" in keys else None,
     )
 
 

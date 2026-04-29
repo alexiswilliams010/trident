@@ -1,7 +1,8 @@
 .PHONY: help install lint test test-extractor \
         db-start db-stop db-create db-drop db-migrate db-setup db-teardown db-reset db-psql \
         diagnose diagnose-isolated \
-        query-semantic query-hybrid \
+        query-semantic query-hybrid query-fake-hybrid \
+        query-multi-repo-semantic query-multi-repo-hybrid \
         index embed \
         index-isolated embed-isolated query-isolated-semantic query-isolated-hybrid \
         db-ensure-isolated
@@ -112,12 +113,24 @@ db-psql: ## Open a psql shell on $(PG_DB).
 # ------------------------------------------------------------------------------
 REPO_PATH ?=
 REPO_NAME ?=
+REPOS     ?=
 QUERY     ?=
 EXCLUDE   ?=
+
+# Knobs exposed by the new retrieval features. All optional — only get
+# threaded into the CLI invocation when set, so existing usage is unchanged.
+TOP_K            ?= 10
+MMR_REPO_LAMBDA  ?=    # hybrid only; default 0.3 inside the CLI
+MMR_FILE_LAMBDA  ?=    # hybrid only; default 0.15 inside the CLI
 
 # When EXCLUDE is set, expand to a single --exclude flag carrying the
 # comma-separated value (argparse splits on comma).
 EXCLUDE_FLAG := $(if $(EXCLUDE),--exclude '$(EXCLUDE)',)
+
+# Optional flag expansions — empty when the variable is unset, so the CLI
+# falls back to its built-in defaults.
+MMR_REPO_LAMBDA_FLAG  := $(if $(MMR_REPO_LAMBDA),--mmr-repo-lambda $(MMR_REPO_LAMBDA),)
+MMR_FILE_LAMBDA_FLAG  := $(if $(MMR_FILE_LAMBDA),--mmr-file-lambda $(MMR_FILE_LAMBDA),)
 
 # Generic targets — any repo into $(DB) (default `tsgrep`).
 #   make index REPO_PATH=/path REPO_NAME=name [DB=tsgrep_other]
@@ -133,17 +146,38 @@ embed: ## Index + embed any repo into $(DB) (real embedder, secrets via pass-cli
 	fi
 	$(call inject_and_run,$(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) --embed real $(EXCLUDE_FLAG))
 
-query-semantic: ## Semantic query. QUERY="..." REPO_NAME=name [DB=...]
+query-semantic: ## Semantic query. QUERY="..." REPO_NAME=name [TOP_K=10]
 	@if [ -z "$(QUERY)" ] || [ -z "$(REPO_NAME)" ]; then \
-		echo 'usage: make query-semantic QUERY="..." REPO_NAME=name'; exit 2; \
+		echo 'usage: make query-semantic QUERY="..." REPO_NAME=name [TOP_K=...]'; exit 2; \
 	fi
-	$(call inject_and_run,$(PYTHON) -m cli.query --repo-name $(REPO_NAME) --semantic "$(QUERY)")
+	$(call inject_and_run,$(PYTHON) -m cli.query --repo-name $(REPO_NAME) --semantic "$(QUERY)" --top-k $(TOP_K))
 
-query-hybrid: ## Hybrid query. QUERY="..." REPO_NAME=name [DB=...]
+query-hybrid: ## Hybrid query. QUERY="..." REPO_NAME=name [TOP_K=10] [MMR_REPO_LAMBDA=0.3] [MMR_FILE_LAMBDA=0.15]
 	@if [ -z "$(QUERY)" ] || [ -z "$(REPO_NAME)" ]; then \
-		echo 'usage: make query-hybrid QUERY="..." REPO_NAME=name'; exit 2; \
+		echo 'usage: make query-hybrid QUERY="..." REPO_NAME=name [TOP_K=...] [MMR_*=...]'; exit 2; \
 	fi
-	$(call inject_and_run,$(PYTHON) -m cli.query --repo-name $(REPO_NAME) --hybrid "$(QUERY)")
+	$(call inject_and_run,$(PYTHON) -m cli.query --repo-name $(REPO_NAME) --hybrid "$(QUERY)" \
+		--top-k $(TOP_K) $(MMR_REPO_LAMBDA_FLAG) $(MMR_FILE_LAMBDA_FLAG))
+
+query-fake-hybrid: ## Hybrid query with the deterministic fake embedder (no API key). QUERY="..." REPO_NAME=name [TOP_K=...]
+	@if [ -z "$(QUERY)" ] || [ -z "$(REPO_NAME)" ]; then \
+		echo 'usage: make query-fake-hybrid QUERY="..." REPO_NAME=name [TOP_K=...]'; exit 2; \
+	fi
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.query --repo-name $(REPO_NAME) --hybrid "$(QUERY)" --fake \
+		--top-k $(TOP_K) $(MMR_REPO_LAMBDA_FLAG) $(MMR_FILE_LAMBDA_FLAG)
+
+query-multi-repo-semantic: ## Cross-repo semantic query. QUERY="..." REPOS=a,b[,c] [TOP_K=...]
+	@if [ -z "$(QUERY)" ] || [ -z "$(REPOS)" ]; then \
+		echo 'usage: make query-multi-repo-semantic QUERY="..." REPOS=a,b[,c] [TOP_K=...]'; exit 2; \
+	fi
+	$(call inject_and_run,$(PYTHON) -m cli.query --repos $(REPOS) --semantic "$(QUERY)" --top-k $(TOP_K))
+
+query-multi-repo-hybrid: ## Cross-repo hybrid query (MMR diversifies across repos). QUERY="..." REPOS=a,b[,c] [TOP_K=...] [MMR_*=...]
+	@if [ -z "$(QUERY)" ] || [ -z "$(REPOS)" ]; then \
+		echo 'usage: make query-multi-repo-hybrid QUERY="..." REPOS=a,b[,c] [TOP_K=...] [MMR_*=...]'; exit 2; \
+	fi
+	$(call inject_and_run,$(PYTHON) -m cli.query --repos $(REPOS) --hybrid "$(QUERY)" \
+		--top-k $(TOP_K) $(MMR_REPO_LAMBDA_FLAG) $(MMR_FILE_LAMBDA_FLAG))
 
 diagnose: ## Print resolution stats for any repo in $(DB). REPO_NAME=name [DB=...]
 	@if [ -z "$(REPO_NAME)" ]; then echo 'usage: make diagnose REPO_NAME=name [DB=...]'; exit 2; fi

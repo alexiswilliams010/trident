@@ -16,6 +16,7 @@ applies an MMR re-rank to keep results from collapsing into one repo when
 multiple are queried.
 """
 
+
 from __future__ import annotations
 
 import argparse
@@ -36,10 +37,9 @@ from db.connection import pool_ctx
 
 def _print_chunks(chunks: list[RetrievedChunk], show_content: bool, content_chars: int) -> None:
     for i, c in enumerate(chunks, 1):
-        view = f" view={c.matched_view}" if c.matched_view else ""
         repo = f" repo={c.repo_id}" if c.repo_id is not None else ""
         print(f"[{i:02d}] score={c.score:.3f}  {c.granularity:13s}  "
-              f"{c.qualified_name or '<module>'}  ({c.file_path}, {c.token_count} tok){repo}{view}")
+              f"{c.qualified_name or '<module>'}  ({c.file_path}, {c.token_count} tok){repo}")
         if show_content:
             snippet = c.content if len(c.content) <= content_chars else c.content[:content_chars] + "…"
             print(snippet)
@@ -69,11 +69,6 @@ async def _run(args: argparse.Namespace) -> int:
     else:
         embed_fn = None
 
-    view_kinds = (
-        tuple(s.strip() for s in args.view_kinds.split(",") if s.strip())
-        if args.view_kinds else None
-    )
-
     async with pool_ctx(args.dsn) as pool:
         repo_ids = await _resolve_repo_ids(pool, args)
         if args.structural:
@@ -87,14 +82,12 @@ async def _run(args: argparse.Namespace) -> int:
                 pool, repo_ids, args.semantic, embed_fn,
                 top_k=args.top_k,
                 granularities=tuple(args.granularity.split(",")) if args.granularity else None,
-                view_kinds=view_kinds,
             )
         elif args.hybrid:
             assert embed_fn is not None
             chunks = await hybrid_query(
                 pool, repo_ids, args.hybrid, embed_fn,
                 top_k=args.top_k,
-                view_kinds=view_kinds,
                 mmr_repo_lambda=args.mmr_repo_lambda,
                 mmr_file_lambda=args.mmr_file_lambda,
             )
@@ -134,9 +127,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--depth", type=int, default=2, help="structural traversal depth")
     parser.add_argument("--granularity", type=str, default="function",
                         help="comma-separated for semantic; single for structural (default: function)")
-    parser.add_argument("--view-kinds", type=str, default=None,
-                        help="comma-separated embedding view names to consider "
-                             "(e.g. 'source' or 'source,enriched'); default: all views")
     parser.add_argument("--mmr-repo-lambda", type=float, default=0.3,
                         help="hybrid: per-repo diversity penalty (default 0.3; 0 disables)")
     parser.add_argument("--mmr-file-lambda", type=float, default=0.15,
