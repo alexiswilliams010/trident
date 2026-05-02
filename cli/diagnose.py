@@ -127,7 +127,7 @@ async def _print_stats(pool, repo_id: int, show_unresolved: bool, top_callers: i
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="tsgrep — diagnostics for an indexed repo")
+    parser = argparse.ArgumentParser(description="trident — diagnostics for an indexed repo")
     parser.add_argument("--repo-name", type=str, required=True,
                         help="Repo name (must already be indexed)")
     parser.add_argument("--dsn", type=str, default=None)

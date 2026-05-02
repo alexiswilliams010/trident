@@ -285,7 +285,7 @@ class _ChunkRow:
 
 
 def _md_preamble(metadata: dict) -> str:
-    return "/* tsgrep-meta: " + json.dumps(metadata, separators=(",", ":")) + " */\n\n"
+    return "/* trident-meta: " + json.dumps(metadata, separators=(",", ":")) + " */\n\n"
 
 
 def _format_signature(d: _DefRow) -> str:

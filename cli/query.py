@@ -120,7 +120,7 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="tsgrep — retrieve chunks")
+    parser = argparse.ArgumentParser(description="trident — retrieve chunks")
     repo_group = parser.add_mutually_exclusive_group(required=True)
     repo_group.add_argument("--repo-name", type=str,
                             help="Repo name (single-repo sugar; must already be indexed)")

@@ -26,7 +26,7 @@ Run this migration when **any** of the following holds:
 ### 1. Confirm pgvector version supports `halfvec`
 
 ```
-psql -d tsgrep -c "SELECT extversion FROM pg_extension WHERE extname='vector';"
+psql -d trident -c "SELECT extversion FROM pg_extension WHERE extname='vector';"
 ```
 
 `halfvec` requires pgvector ≥ 0.7.0. Homebrew's `postgresql@18` ships a
@@ -84,7 +84,7 @@ Existing 4096-dim rows survive the column ALTER (they get truncated by the
 scores will be subtly off. Cleanest: drop and re-embed.
 
 ```
-psql -d tsgrep -c "DELETE FROM chunk_embeddings;"
+psql -d trident -c "DELETE FROM chunk_embeddings;"
 make embed REPO_PATH=tests/fixtures/python_fixture REPO_NAME=python_fixture    # or whichever repo
 ```
 

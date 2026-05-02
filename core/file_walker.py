@@ -5,7 +5,7 @@ Yields source files for indexing while skipping dependency directories
 and is loaded from YAML configs in Phase 3. For Phase 1 we provide sensible
 hard-coded defaults so the walker is usable before YAML configs exist.
 
-User-defined exclusions are supported via two channels: a `.tsgrepignore`
+User-defined exclusions are supported via two channels: a `.tridentignore`
 file at the repo root and per-invocation `--exclude` CLI flags. Patterns are
 fnmatch-style globs:
 
@@ -53,7 +53,7 @@ DEFAULT_DEP_PATHS: dict[str, tuple[str, ...]] = {
     "typescript": ("node_modules", "dist", "build", "out", "coverage", ".next", ".nuxt"),
 }
 
-TSGREP_IGNORE_FILE = ".tsgrepignore"
+TRIDENT_IGNORE_FILE = ".tridentignore"
 
 
 @dataclass
@@ -63,7 +63,7 @@ class WalkConfig:
     dep_paths: dict[str, set[str]] = field(default_factory=dict)
     # If True, also skip dotfile dirs (e.g. .next, .cache).
     skip_hidden: bool = True
-    # User-defined exclusion patterns (from .tsgrepignore + --exclude flags).
+    # User-defined exclusion patterns (from .tridentignore + --exclude flags).
     exclude_patterns: tuple[str, ...] = ()
 
     @classmethod
@@ -80,14 +80,14 @@ class WalkConfig:
         return merged
 
 
-def read_tsgrepignore(repo_root: str | Path) -> tuple[str, ...]:
-    """Return the list of patterns from `.tsgrepignore` at the repo root.
+def read_tridentignore(repo_root: str | Path) -> tuple[str, ...]:
+    """Return the list of patterns from `.tridentignore` at the repo root.
 
     Empty lines and lines starting with `#` are skipped. Trailing slashes are
     stripped (the directory-vs-file distinction is handled by the caller).
     Returns an empty tuple if the file is absent.
     """
-    path = Path(repo_root) / TSGREP_IGNORE_FILE
+    path = Path(repo_root) / TRIDENT_IGNORE_FILE
     if not path.is_file():
         return ()
     out: list[str] = []
@@ -206,9 +206,9 @@ __all__ = [
     "ALWAYS_IGNORED",
     "DEFAULT_DEP_PATHS",
     "DiscoveredFile",
-    "TSGREP_IGNORE_FILE",
+    "TRIDENT_IGNORE_FILE",
     "WalkConfig",
-    "read_tsgrepignore",
+    "read_tridentignore",
     "walk_dependency_files",
     "walk_repo",
     "LANGUAGES",

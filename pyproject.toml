@@ -1,5 +1,5 @@
 [project]
-name = "tsgrep"
+name = "trident"
 version = "0.1.0"
 description = "Tree-sitter semantic code graph + vector embedding pipeline"
 requires-python = ">=3.12"

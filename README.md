@@ -1,4 +1,4 @@
-# tsgrep
+# trident
 
 Tree-sitter semantic code graph + vector embedding pipeline. Indexes a
 repository into a relational graph (syntactic CST → semantic edges →
@@ -22,19 +22,19 @@ brew install postgresql@18 pgvector uv
 
 ```sh
 make install     # .venv + project deps via uv
-make db-setup    # start postgres, create tsgrep DB, apply migrations
+make db-setup    # start postgres, create trident DB, apply migrations
 ```
 
-DSN defaults to `postgresql://$USER@localhost:5432/tsgrep`. Override with
+DSN defaults to `postgresql://$USER@localhost:5432/trident`. Override with
 `DATABASE_URL`.
 
 ## Shared vs per-repo DB
 
 Repos are addressed by name (`--repo-name foo`). Two workflows:
 
-- **Shared** — one `tsgrep` DB holding many repos. Use the plain
+- **Shared** — one `trident` DB holding many repos. Use the plain
   `make index` / `make embed` / `make query-*` targets.
-- **Isolated** — one DB per repo (`tsgrep_<name>`). Use the
+- **Isolated** — one DB per repo (`trident_<name>`). Use the
   `*-isolated` variants; they create and migrate the per-repo DB on
   first use. Clean uninstall via `DROP DATABASE`.
 

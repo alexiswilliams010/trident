@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "tsgrep language config",
+  "title": "trident language config",
   "type": "object",
   "required": ["language", "module_node_type", "definitions", "references"],
   "additionalProperties": false,

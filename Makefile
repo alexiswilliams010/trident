@@ -11,15 +11,15 @@ UV ?= uv
 PYTHON := .venv/bin/python
 
 PG_SERVICE ?= postgresql@18
-PG_DB ?= tsgrep
+PG_DB ?= trident
 MIGRATIONS_DIR := db/migrations
 
 PASS_CLI ?= pass-cli
 ENV_FILE ?= .env
 ENV_TEMPLATE ?= .env.template
 
-# DB selection. Default `tsgrep` is the shared multi-repo DB. Override on
-# any target with DB=tsgrep_myrepo, or use the *-isolated variants which do
+# DB selection. Default `trident` is the shared multi-repo DB. Override on
+# any target with DB=trident_myrepo, or use the *-isolated variants which do
 # this automatically.
 DB ?= $(PG_DB)
 DB_USER ?= $(USER)
@@ -112,10 +112,10 @@ db-psql: ## Open a psql shell on $(PG_DB).
 	@psql -d $(PG_DB)
 
 # ------------------------------------------------------------------------------
-# tsgrep CLI helpers
+# trident CLI helpers
 # ------------------------------------------------------------------------------
 # ------------------------------------------------------------------------------
-# Mode A — multi-repo into one shared DB (default `tsgrep`).
+# Mode A — multi-repo into one shared DB (default `trident`).
 # Repos are addressed by name; cross-repo queries are possible.
 # ------------------------------------------------------------------------------
 REPO_PATH ?=
@@ -139,8 +139,8 @@ EXCLUDE_FLAG := $(if $(EXCLUDE),--exclude '$(EXCLUDE)',)
 MMR_REPO_LAMBDA_FLAG  := $(if $(MMR_REPO_LAMBDA),--mmr-repo-lambda $(MMR_REPO_LAMBDA),)
 MMR_FILE_LAMBDA_FLAG  := $(if $(MMR_FILE_LAMBDA),--mmr-file-lambda $(MMR_FILE_LAMBDA),)
 
-# Generic targets — any repo into $(DB) (default `tsgrep`).
-#   make index REPO_PATH=/path REPO_NAME=name [DB=tsgrep_other]
+# Generic targets — any repo into $(DB) (default `trident`).
+#   make index REPO_PATH=/path REPO_NAME=name [DB=trident_other]
 index: ## Index any repo into $(DB). REPO_PATH=/path REPO_NAME=name [EXCLUDE='pat1,pat2']
 	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
 		echo 'usage: make index REPO_PATH=/path REPO_NAME=name [EXCLUDE=...]'; exit 2; \
@@ -198,37 +198,37 @@ diagnose: ## Print resolution stats for any repo in $(DB). REPO_NAME=name [DB=..
 
 # ------------------------------------------------------------------------------
 # Mode B — one DB per repo (CI-friendly, per-repo isolation).
-# Each *-isolated target derives DB=tsgrep_$(REPO_NAME), creates and migrates
+# Each *-isolated target derives DB=trident_$(REPO_NAME), creates and migrates
 # that DB if needed, then delegates to the generic target above.
 # ------------------------------------------------------------------------------
-db-ensure-isolated: ## Create (idempotent) and migrate tsgrep_$(REPO_NAME).
+db-ensure-isolated: ## Create (idempotent) and migrate trident_$(REPO_NAME).
 	@if [ -z "$(REPO_NAME)" ]; then echo 'usage: requires REPO_NAME=name'; exit 2; fi
-	@createdb tsgrep_$(REPO_NAME) 2>/dev/null || true
-	@$(MAKE) --no-print-directory db-migrate PG_DB=tsgrep_$(REPO_NAME)
+	@createdb trident_$(REPO_NAME) 2>/dev/null || true
+	@$(MAKE) --no-print-directory db-migrate PG_DB=trident_$(REPO_NAME)
 
-index-isolated: ## Index any repo into its own DB tsgrep_$(REPO_NAME). REPO_PATH=/path REPO_NAME=name [EXCLUDE=...]
+index-isolated: ## Index any repo into its own DB trident_$(REPO_NAME). REPO_PATH=/path REPO_NAME=name [EXCLUDE=...]
 	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
 		echo 'usage: make index-isolated REPO_PATH=/path REPO_NAME=name [EXCLUDE=...]'; exit 2; \
 	fi
 	@$(MAKE) --no-print-directory db-ensure-isolated REPO_NAME=$(REPO_NAME)
-	@$(MAKE) --no-print-directory index REPO_PATH=$(REPO_PATH) REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME) EXCLUDE='$(EXCLUDE)'
+	@$(MAKE) --no-print-directory index REPO_PATH=$(REPO_PATH) REPO_NAME=$(REPO_NAME) DB=trident_$(REPO_NAME) EXCLUDE='$(EXCLUDE)'
 
 embed-isolated: ## Index + embed any repo into its own DB. REPO_PATH=/path REPO_NAME=name [EXCLUDE=...]
 	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
 		echo 'usage: make embed-isolated REPO_PATH=/path REPO_NAME=name [EXCLUDE=...]'; exit 2; \
 	fi
 	@$(MAKE) --no-print-directory db-ensure-isolated REPO_NAME=$(REPO_NAME)
-	@$(MAKE) --no-print-directory embed REPO_PATH=$(REPO_PATH) REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME) EXCLUDE='$(EXCLUDE)'
+	@$(MAKE) --no-print-directory embed REPO_PATH=$(REPO_PATH) REPO_NAME=$(REPO_NAME) DB=trident_$(REPO_NAME) EXCLUDE='$(EXCLUDE)'
 
 query-isolated-semantic: ## Semantic query against per-repo DB. QUERY="..." REPO_NAME=name
-	@$(MAKE) --no-print-directory query-semantic QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME)
+	@$(MAKE) --no-print-directory query-semantic QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) DB=trident_$(REPO_NAME)
 
 query-isolated-lexical: ## Lexical query against per-repo DB. QUERY="..." REPO_NAME=name
-	@$(MAKE) --no-print-directory query-lexical QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME)
+	@$(MAKE) --no-print-directory query-lexical QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) DB=trident_$(REPO_NAME)
 
 query-isolated-hybrid: ## Hybrid query against per-repo DB. QUERY="..." REPO_NAME=name
-	@$(MAKE) --no-print-directory query-hybrid QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME)
+	@$(MAKE) --no-print-directory query-hybrid QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) DB=trident_$(REPO_NAME)
 
-diagnose-isolated: ## Print resolution stats from per-repo DB tsgrep_$(REPO_NAME). REPO_NAME=name
+diagnose-isolated: ## Print resolution stats from per-repo DB trident_$(REPO_NAME). REPO_NAME=name
 	@if [ -z "$(REPO_NAME)" ]; then echo 'usage: make diagnose-isolated REPO_NAME=name'; exit 2; fi
-	@$(MAKE) --no-print-directory diagnose REPO_NAME=$(REPO_NAME) DB=tsgrep_$(REPO_NAME)
+	@$(MAKE) --no-print-directory diagnose REPO_NAME=$(REPO_NAME) DB=trident_$(REPO_NAME)

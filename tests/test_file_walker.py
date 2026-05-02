@@ -1,4 +1,4 @@
-"""File walker exclusion logic: --exclude flags and .tsgrepignore."""
+"""File walker exclusion logic: --exclude flags and .tridentignore."""
 
 from __future__ import annotations
 
@@ -7,10 +7,10 @@ from pathlib import Path
 import pytest
 
 from core.file_walker import (
-    TSGREP_IGNORE_FILE,
+    TRIDENT_IGNORE_FILE,
     WalkConfig,
     _matches_excludes,
-    read_tsgrepignore,
+    read_tridentignore,
     walk_repo,
 )
 
@@ -47,21 +47,21 @@ def test_empty_patterns_match_nothing():
 
 
 # ────────────────────────────────────────────────────────────────────
-# .tsgrepignore parsing
+# .tridentignore parsing
 # ────────────────────────────────────────────────────────────────────
 
 
-def test_read_tsgrepignore_skips_blanks_and_comments(tmp_path: Path):
-    (tmp_path / TSGREP_IGNORE_FILE).write_text(
+def test_read_tridentignore_skips_blanks_and_comments(tmp_path: Path):
+    (tmp_path / TRIDENT_IGNORE_FILE).write_text(
         "# comment\n\ntest\n*.t.sol\nscript/\n   \n# another comment\n"
     )
-    patterns = read_tsgrepignore(tmp_path)
+    patterns = read_tridentignore(tmp_path)
     # Trailing slash on `script/` should be stripped.
     assert patterns == ("test", "*.t.sol", "script")
 
 
-def test_read_tsgrepignore_returns_empty_when_missing(tmp_path: Path):
-    assert read_tsgrepignore(tmp_path) == ()
+def test_read_tridentignore_returns_empty_when_missing(tmp_path: Path):
+    assert read_tridentignore(tmp_path) == ()
 
 
 # ────────────────────────────────────────────────────────────────────

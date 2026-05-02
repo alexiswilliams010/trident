@@ -190,7 +190,7 @@ async def test_assemble_python_chunks(clean_repo, python_fixture_root: Path):
         add_fn = by_anchor[("main.Calculator.add", "function")]
         assert "helper" in add_fn["content"]
         # Metadata is well-formed JSON inside the chunk.
-        assert "tsgrep-meta" in add_fn["content"]
+        assert "trident-meta" in add_fn["content"]
         meta = json.loads(add_fn["metadata"])
         assert meta["anchor"] == "main.Calculator.add"
         assert meta["language"] == "python"

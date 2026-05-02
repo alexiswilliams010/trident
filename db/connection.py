@@ -17,11 +17,11 @@ def default_dsn() -> str:
     """Default DSN for local Homebrew Postgres.
 
     Homebrew Postgres allows the running OS user to connect over the local
-    socket / TCP without a password. The database name defaults to `tsgrep`.
+    socket / TCP without a password. The database name defaults to `trident`.
     Override with the DATABASE_URL env var.
     """
     user = os.environ.get("PGUSER") or getpass.getuser()
-    db = os.environ.get("PGDATABASE", "tsgrep")
+    db = os.environ.get("PGDATABASE", "trident")
     host = os.environ.get("PGHOST", "localhost")
     port = os.environ.get("PGPORT", "5432")
     return f"postgresql://{user}@{host}:{port}/{db}"
