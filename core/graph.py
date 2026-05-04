@@ -515,8 +515,8 @@ async def get_source(
     result = []
     for r in rows:
         d = _row_to_def(r)
-        raw = r["raw_content"] or ""
-        d.source = raw[r["start_byte"]:r["end_byte"]]
+        raw = (r["raw_content"] or "").encode("utf-8")
+        d.source = raw[r["start_byte"]:r["end_byte"]].decode("utf-8", errors="replace")
         result.append(d)
     return result
 

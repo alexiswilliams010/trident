@@ -265,12 +265,14 @@ class _DefRow:
     scope_id: int | None
     start_byte: int
     end_byte: int
-    raw_content: str
+    # UTF-8 bytes, not str — tree-sitter offsets are byte offsets and slicing
+    # a Python str by them silently drifts on every multi-byte character.
+    raw_content: bytes
     file_path: str
     language: str
 
     def source(self) -> str:
-        return self.raw_content[self.start_byte : self.end_byte]
+        return self.raw_content[self.start_byte : self.end_byte].decode("utf-8", errors="replace")
 
 
 @dataclass
@@ -341,8 +343,8 @@ async def _load_defs(conn: asyncpg.Connection, repo_id: int) -> list[_DefRow]:
         "SELECT id, raw_content, path, language FROM files WHERE repo_id = $1",
         repo_id,
     )
-    file_meta: dict[int, tuple[str, str, str]] = {
-        r["id"]: (r["raw_content"] or "", r["path"], r["language"])
+    file_meta: dict[int, tuple[bytes, str, str]] = {
+        r["id"]: ((r["raw_content"] or "").encode("utf-8"), r["path"], r["language"])
         for r in file_rows
     }
 

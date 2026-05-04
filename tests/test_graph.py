@@ -196,6 +196,37 @@ async def test_get_source(clean_repo, python_fixture_root: Path):
     assert "return x + 1" in src.source
 
 
+async def test_get_source_handles_multibyte_utf8(clean_repo, tmp_path: Path):
+    """Regression: tree-sitter byte offsets index into UTF-8 bytes, not
+    Python codepoints. If get_source slices the str directly by them,
+    every multi-byte char preceding the def shifts the returned source
+    forward — typically chopping off the `def` line and leaking the next
+    statement's tail. The fix encodes raw_content to bytes before slicing
+    and decodes the slice back to str."""
+    pool, repo_id = clean_repo
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    # Pile non-ASCII into the file ahead of the target so byte- and
+    # codepoint-indexed offsets diverge by many characters.
+    (pkg / "mod.py").write_text(
+        '"""Привет мир — multibyte greeting 日本語 🚀."""\n'
+        "# Ω + Ω = 2Ω — more multibyte filler\n"
+        "leading = '日本語'\n"
+        "\n"
+        "def regression_target(x):\n"
+        "    return x + 1\n",
+        encoding="utf-8",
+    )
+    await _seed(pool, repo_id, tmp_path)
+    defs = await get_source(pool, repo_id, "regression_target")
+    assert len(defs) >= 1
+    src = defs[0].source
+    assert src is not None
+    assert src.startswith("def regression_target")
+    assert "return x + 1" in src
+
+
 # ────────────────────────────────────────────────────────────────────
 # file_imports / file_dependents
 # ────────────────────────────────────────────────────────────────────

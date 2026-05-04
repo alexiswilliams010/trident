@@ -8,6 +8,7 @@ from pathlib import Path
 from core.chunk_assembler import (
     GRANULARITY_FUNCTION,
     HARD_OUTPUT_CAP,
+    _DefRow,
     _degrade_if_oversize,
     assemble_chunks,
     count_tokens,
@@ -32,6 +33,45 @@ async def _full_pipeline(pool, repo_id: int, root: Path):
 def test_count_tokens_basic():
     assert count_tokens("hello world") > 0
     assert count_tokens("") == 0
+
+
+# ────────────────────────────────────────────────────────────────────
+# _DefRow.source — UTF-8 byte-offset slicing
+# ────────────────────────────────────────────────────────────────────
+
+
+def test_def_row_source_decodes_multibyte_utf8():
+    """Tree-sitter start_byte/end_byte are byte offsets into the UTF-8
+    encoded source. Slicing a Python str by them silently drifts past
+    every multi-byte char ahead of the slice — the returned source ends
+    up shifted forward by (utf8_len - codepoint_len) characters and may
+    not even start at the def. _DefRow.source() must slice on bytes and
+    decode the result."""
+    src = '"""日本語 — leading docstring."""\ndef target(x):\n    return x + 1\n'
+    src_bytes = src.encode("utf-8")
+    target = "def target(x):\n    return x + 1"
+    target_bytes = target.encode("utf-8")
+    start = src_bytes.index(target_bytes)
+    end = start + len(target_bytes)
+
+    # Sanity check the test itself: the byte offset MUST exceed the
+    # codepoint offset, otherwise this test wouldn't catch the bug.
+    assert start > src.index(target)
+
+    row = _DefRow(
+        id=1,
+        file_id=1,
+        kind="function",
+        name="target",
+        qualified_name="target",
+        scope_id=None,
+        start_byte=start,
+        end_byte=end,
+        raw_content=src_bytes,
+        file_path="mod.py",
+        language="python",
+    )
+    assert row.source() == target
 
 
 # ────────────────────────────────────────────────────────────────────
