@@ -22,6 +22,7 @@ SOLIDITY_FIXTURE = FIXTURES / "solidity_foundry_fixture"
 GO_FIXTURE = FIXTURES / "go_fixture"
 NODE_FIXTURE = FIXTURES / "node_fixture"
 RUST_FIXTURE = FIXTURES / "rust_fixture"
+RUST_WORKSPACE_FIXTURE = FIXTURES / "rust_workspace_fixture"
 
 
 async def _can_connect(dsn: str) -> bool:
@@ -103,3 +104,8 @@ def node_fixture_root() -> Path:
 @pytest.fixture
 def rust_fixture_root() -> Path:
     return RUST_FIXTURE
+
+
+@pytest.fixture
+def rust_workspace_fixture_root() -> Path:
+    return RUST_WORKSPACE_FIXTURE
