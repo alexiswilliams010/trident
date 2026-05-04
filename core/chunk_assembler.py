@@ -288,6 +288,23 @@ def _md_preamble(metadata: dict) -> str:
     return "/* trident-meta: " + json.dumps(metadata, separators=(",", ":")) + " */\n\n"
 
 
+def _semantic_header(d: _DefRow, idx: _GraphIndex) -> str:
+    """Natural-language line placed at the top of a chunk so the embedding
+    model gets a clean relevance signal in its earliest tokens."""
+    name = d.name.lstrip("_")
+    words = _split_camel(name).replace("_", " ").lower()
+    container = None
+    if d.scope_id:
+        cd = idx.defs_by_id.get(d.scope_id)
+        if cd and cd.kind in CONTAINER_KINDS:
+            container = cd.name
+    parts = [words]
+    if container:
+        parts.append(container)
+    parts.append(f"{d.language} {d.kind}")
+    return " | ".join(parts)
+
+
 def _format_signature(d: _DefRow) -> str:
     """First line of the def's source — stand-in for a signature."""
     src = d.source()
@@ -648,8 +665,10 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
     if deps_truncated:
         metadata["dependencies_truncated"] = deps_truncated
 
+    sem_header = _semantic_header(d, idx)
+
     def _join(extras: list[str] = []) -> str:
-        return _md_preamble(metadata) + "\n\n".join(parts + extras)
+        return sem_header + "\n\n" + _md_preamble(metadata) + "\n\n".join(parts + extras)
 
     extras: list[str] = []
     # Tokens of `_join(extras)` — recomputed once per phase rather than per
@@ -858,9 +877,10 @@ def _build_cross_module_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
         parts.append("# shared state\n" + "\n".join(shared_state))
 
     budget = TOKEN_BUDGETS[GRANULARITY_CROSS_MODULE]
+    sem_header = _semantic_header(d, idx)
 
     def _join(extras: list[str]) -> str:
-        return _md_preamble(metadata) + "\n\n".join(parts + extras)
+        return sem_header + "\n\n" + _md_preamble(metadata) + "\n\n".join(parts + extras)
 
     extras: list[str] = []
     # base_tokens tracks `_join(extras)` token count incrementally, so each

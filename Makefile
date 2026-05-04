@@ -1,6 +1,7 @@
 .PHONY: help install lint test test-extractor \
         db-start db-stop db-create db-drop db-migrate db-setup db-teardown db-reset db-psql \
         diagnose diagnose-isolated \
+        graph graph-isolated \
         query-semantic query-lexical query-hybrid query-fake-hybrid \
         query-multi-repo-semantic query-multi-repo-hybrid \
         index embed \
@@ -110,6 +111,12 @@ db-reset: db-drop db-create db-migrate ## Drop and recreate $(PG_DB) from scratc
 
 db-psql: ## Open a psql shell on $(PG_DB).
 	@psql -d $(PG_DB)
+
+graph: ## Graph exploration command. REPO_NAME=name CMD="callers-of foo"
+	@if [ -z "$(REPO_NAME)" ] || [ -z "$(CMD)" ]; then \
+		echo 'usage: make graph REPO_NAME=name CMD="callers-of foo"'; exit 2; \
+	fi
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.graph --repo-name $(REPO_NAME) $(CMD)
 
 # ------------------------------------------------------------------------------
 # trident CLI helpers
@@ -228,6 +235,9 @@ query-isolated-lexical: ## Lexical query against per-repo DB. QUERY="..." REPO_N
 
 query-isolated-hybrid: ## Hybrid query against per-repo DB. QUERY="..." REPO_NAME=name
 	@$(MAKE) --no-print-directory query-hybrid QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) DB=trident_$(REPO_NAME)
+
+graph-isolated: ## Graph exploration against per-repo DB. REPO_NAME=name CMD="callers-of foo"
+	@$(MAKE) --no-print-directory graph REPO_NAME=$(REPO_NAME) CMD="$(CMD)" DB=trident_$(REPO_NAME)
 
 diagnose-isolated: ## Print resolution stats from per-repo DB trident_$(REPO_NAME). REPO_NAME=name
 	@if [ -z "$(REPO_NAME)" ]; then echo 'usage: make diagnose-isolated REPO_NAME=name'; exit 2; fi
