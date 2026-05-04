@@ -141,6 +141,11 @@ MMR_FILE_LAMBDA  ?=    # hybrid only; default 0.15 inside the CLI
 # comma-separated value (argparse splits on comma).
 EXCLUDE_FLAG := $(if $(EXCLUDE),--exclude '$(EXCLUDE)',)
 
+# Force semantic re-resolution even when Tier-1 says nothing changed. Use
+# this after editing core/semantic_resolver.py / configs/*.yaml etc., where
+# the source files are unchanged but the analysis logic is.
+FORCE_RESOLVE_FLAG := $(if $(FORCE_RESOLVE),--force-resolve,)
+
 # Optional flag expansions — empty when the variable is unset, so the CLI
 # falls back to its built-in defaults.
 MMR_REPO_LAMBDA_FLAG  := $(if $(MMR_REPO_LAMBDA),--mmr-repo-lambda $(MMR_REPO_LAMBDA),)
@@ -152,13 +157,13 @@ index: ## Index any repo into $(DB). REPO_PATH=/path REPO_NAME=name [EXCLUDE='pa
 	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
 		echo 'usage: make index REPO_PATH=/path REPO_NAME=name [EXCLUDE=...]'; exit 2; \
 	fi
-	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) $(EXCLUDE_FLAG)
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) $(EXCLUDE_FLAG) $(FORCE_RESOLVE_FLAG)
 
-embed: ## Index + embed any repo into $(DB) (real embedder, secrets via pass-cli). REPO_PATH=/path REPO_NAME=name [EXCLUDE='pat1,pat2']
+embed: ## Index + embed any repo into $(DB) (real embedder, secrets via pass-cli). REPO_PATH=/path REPO_NAME=name [EXCLUDE='pat1,pat2'] [FORCE_RESOLVE=1]
 	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
-		echo 'usage: make embed REPO_PATH=/path REPO_NAME=name [EXCLUDE=...]'; exit 2; \
+		echo 'usage: make embed REPO_PATH=/path REPO_NAME=name [EXCLUDE=...] [FORCE_RESOLVE=1]'; exit 2; \
 	fi
-	$(call inject_and_run,$(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) --embed real $(EXCLUDE_FLAG))
+	$(call inject_and_run,$(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) --embed real $(EXCLUDE_FLAG) $(FORCE_RESOLVE_FLAG))
 
 query-semantic: ## Semantic query. QUERY="..." REPO_NAME=name [TOP_K=10]
 	@if [ -z "$(QUERY)" ] || [ -z "$(REPO_NAME)" ]; then \
