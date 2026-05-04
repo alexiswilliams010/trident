@@ -1,0 +1,132 @@
+language: rust
+
+# Cargo's build artifact directory; pruned so we don't index generated code.
+dependency_paths:
+  - target
+
+module_node_type: source_file
+
+definitions:
+  - node_type: function_item
+    kind: function
+    name_field: name
+    scope_boundary: true
+
+  # NOTE: impl_item is intentionally NOT listed as a definition. Emitting it
+  # as a def would collide with the struct/enum it targets in the
+  # name-resolution index (both want the name "Counter"). Instead, a small
+  # Rust-specific code path in core/semantic_resolver.py:
+  #   (a) prefixes method qualified-names with the impl's target type, and
+  #   (b) emits inherits edges from `impl Trait for Type` directly onto the
+  #       Type's existing def. Same path also produces inferred inherits
+  #       edges for `#[derive(Trait, ...)]` attributes — see Architecture.md
+  #       §5 for why declarative-macro expansion is out of scope here.
+
+  - node_type: struct_item
+    kind: type
+    name_field: name
+    scope_boundary: true
+
+  - node_type: enum_item
+    kind: type
+    name_field: name
+    scope_boundary: true
+
+  - node_type: union_item
+    kind: type
+    name_field: name
+    scope_boundary: true
+
+  - node_type: trait_item
+    kind: trait
+    name_field: name
+    scope_boundary: true
+
+  - node_type: type_item
+    kind: type
+    name_field: name
+
+  # `mod foo { … }` (inline) and `mod foo;` (file-backed). Inline mod becomes
+  # a nested scope; the file-backed form is a leaf declaration whose body is
+  # discovered via package_index_rust during heuristic resolution.
+  - node_type: mod_item
+    kind: module
+    name_field: name
+    scope_boundary: true
+
+  # Top-level `const X: T = …;` and `static X: T = …;` only — function-local
+  # ones aren't useful as graph nodes.
+  - node_type: const_item
+    kind: const
+    name_field: name
+    require_enclosing_scope_kind: [module]
+
+  - node_type: static_item
+    kind: static
+    name_field: name
+    require_enclosing_scope_kind: [module]
+
+  - node_type: macro_definition
+    kind: macro
+    name_field: name
+
+references:
+  - node_type: identifier
+    exclude_parent_field:
+      - function_item.name
+      - mod_item.name
+      - const_item.name
+      - static_item.name
+      - macro_definition.name
+      - parameter.pattern
+      - let_declaration.pattern
+      - field_declaration.name        # struct field name is a definition site, not a ref
+      - field_initializer.field       # `value` in `Foo { value: 0 }` — handled below by field_identifier rule
+      - use_as_clause.alias           # `use Foo as Bar` — `Bar` is the local rename, not a ref
+      - scoped_identifier.name        # handled below by scoped_identifier rule
+      - field_expression.field        # handled below by field_identifier rule
+      - attribute.arguments           # raw token_tree contents — too noisy as plain refs
+    confidence: certain
+
+  - node_type: type_identifier
+    exclude_parent_field:
+      - struct_item.name
+      - enum_item.name
+      - union_item.name
+      - trait_item.name
+      - type_item.name
+      - scoped_type_identifier.name   # handled by terminal_identifier when needed
+    confidence: certain
+
+  # `obj.field` and `Foo { value: 0 }` — pulls the field name. Inferred
+  # because we can't resolve which struct's field without type info.
+  - node_type: field_identifier
+    exclude_parent_field:
+      - field_declaration.name        # struct field declaration site
+    confidence: inferred
+
+  # `Counter::new` / `crate::utils::helper` — the trailing identifier is the
+  # call/use target. Inferred until cross-file resolution runs.
+  - node_type: scoped_identifier
+    name_field: name
+    confidence: inferred
+
+calls:
+  - node_type: call_expression
+    function_field: function
+
+  # Macro invocations: the call edge is recorded so we can show users where
+  # macros are used. Confidence on the resulting reference is `inferred` (via
+  # the macro_invocation reference rule below) since macro bodies are opaque
+  # token_trees and any items they generate are invisible to tree-sitter.
+  - node_type: macro_invocation
+    function_field: macro
+
+imports:
+  node_types: [use_declaration]
+
+# Rust inheritance is not declared here — the YAML inheritance machinery
+# expects a simple parent → bases shape, but Rust's traits live on impl_item
+# while the conceptual child is the impl's target type, and derive macros
+# are attached as attribute_items rather than fields. Both shapes are handled
+# directly in semantic_resolver.py's Rust-specific pass.

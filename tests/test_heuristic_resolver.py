@@ -434,3 +434,211 @@ async def test_node_cross_file_references_resolved(
             repo_id,
         )
         assert rows, "expected `Animal` reference in index.js to resolve to lib.Animal"
+
+
+# ────────────────────────────────────────────────────────────────────
+# Rust
+# ────────────────────────────────────────────────────────────────────
+
+
+async def test_rust_imports_classified(clean_repo, rust_fixture_root: Path):
+    """Three intra-repo paths (one `super::`, two `myapp::`) all resolve to
+    utils.rs; one external (`serde`) gets a row in external_dependencies."""
+    pool, repo_id = clean_repo
+    await _full_pipeline(pool, repo_id, rust_fixture_root)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT f.path, i.import_path, i.dep_class, i.resolved_file_id, i.imported_names "
+            "FROM imports i JOIN files f ON f.id=i.file_id "
+            "WHERE f.repo_id=$1 ORDER BY f.path, i.id",
+            repo_id,
+        )
+        idx = {(r["path"], r["import_path"]): r for r in rows}
+
+        utils_id = await conn.fetchval(
+            "SELECT id FROM files WHERE repo_id=$1 AND path='src/utils.rs'",
+            repo_id,
+        )
+
+        # `use super::utils::helper` from relative_user.rs — relative resolution.
+        rel = idx[("src/relative_user.rs", "super::utils::helper")]
+        assert rel["dep_class"] == "intra_repo"
+        assert rel["resolved_file_id"] == utils_id
+        assert "helper" in rel["imported_names"]
+
+        # `use myapp::utils::{double, helper}` from main.rs flattens to two
+        # entries (one per leaf) — both should resolve to utils.rs.
+        for path in ("myapp::utils::double", "myapp::utils::helper"):
+            row = idx[("src/main.rs", path)]
+            assert row["dep_class"] == "intra_repo"
+            assert row["resolved_file_id"] == utils_id
+
+        # `use serde::Serialize` — external.
+        ext = idx[("src/main.rs", "serde::Serialize")]
+        assert ext["dep_class"] == "external"
+
+        deps = await conn.fetch(
+            "SELECT package_name FROM external_dependencies WHERE repo_id=$1",
+            repo_id,
+        )
+        assert any(r["package_name"] == "serde" for r in deps)
+
+
+async def test_rust_cross_file_call_edges_upgraded(clean_repo, rust_fixture_root: Path):
+    """`run()` in main.rs calls `helper(1)` and `double(2)` — both imported
+    from utils.rs. After Phase 3 the call_edges should point at utils.helper
+    / utils.double with confidence='certain' (Tier-A direct linking)."""
+    pool, repo_id = clean_repo
+    await _full_pipeline(pool, repo_id, rust_fixture_root)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT callee.qualified_name AS callee, ce.confidence
+            FROM call_edges ce
+            JOIN definitions caller ON caller.id=ce.caller_def_id
+            JOIN files f ON f.id=caller.file_id
+            LEFT JOIN definitions callee ON callee.id=ce.callee_def_id
+            WHERE f.repo_id=$1 AND caller.qualified_name='main.run'
+            ORDER BY callee.qualified_name
+            """,
+            repo_id,
+        )
+        callees = {(r["callee"], r["confidence"]) for r in rows}
+        assert ("utils.double", "certain") in callees
+        assert ("utils.helper", "certain") in callees
+
+
+async def test_rust_impl_method_qualified_names(clean_repo, rust_fixture_root: Path):
+    """Methods defined inside `impl Counter { … }` should pick up `Counter`
+    as their qualified-name prefix despite impl_item not being a definition."""
+    pool, repo_id = clean_repo
+    await _full_pipeline(pool, repo_id, rust_fixture_root)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT qualified_name FROM definitions d JOIN files f ON f.id=d.file_id "
+            "WHERE f.repo_id=$1 AND d.kind='function' "
+            "  AND d.qualified_name LIKE 'utils.Counter.%' "
+            "ORDER BY qualified_name",
+            repo_id,
+        )
+        names = {r["qualified_name"] for r in rows}
+        assert names == {"utils.Counter.new", "utils.Counter.increment"}
+
+
+async def test_rust_workspace_cross_crate_imports(clean_repo, rust_workspace_fixture_root: Path):
+    """`use core_lib::helpers::shared` from app's runner.rs must resolve to a
+    file in the *sibling workspace member* (programs/core/src/helpers.rs),
+    not classify as external. Same for `use core_lib::state::Counter`."""
+    pool, repo_id = clean_repo
+    await _full_pipeline(pool, repo_id, rust_workspace_fixture_root)
+
+    async with pool.acquire() as conn:
+        helpers_id = await conn.fetchval(
+            "SELECT id FROM files WHERE repo_id=$1 AND path=$2",
+            repo_id, "programs/core/src/helpers.rs",
+        )
+        state_id = await conn.fetchval(
+            "SELECT id FROM files WHERE repo_id=$1 AND path=$2",
+            repo_id, "programs/core/src/state.rs",
+        )
+        assert helpers_id is not None and state_id is not None
+
+        rows = await conn.fetch(
+            "SELECT i.import_path, i.dep_class, i.resolved_file_id "
+            "FROM imports i JOIN files f ON f.id=i.file_id "
+            "WHERE f.repo_id=$1 AND f.path='programs/app/src/runner.rs' "
+            "ORDER BY i.id",
+            repo_id,
+        )
+        idx = {r["import_path"]: r for r in rows}
+
+        helpers_row = idx["core_lib::helpers::shared"]
+        assert helpers_row["dep_class"] == "intra_repo"
+        assert helpers_row["resolved_file_id"] == helpers_id
+
+        state_row = idx["core_lib::state::Counter"]
+        assert state_row["dep_class"] == "intra_repo"
+        assert state_row["resolved_file_id"] == state_id
+
+        # External imports (serde) still classify correctly.
+        ext = idx["serde::Serialize"]
+        assert ext["dep_class"] == "external"
+
+
+async def test_rust_workspace_relative_within_crate(clean_repo, rust_workspace_fixture_root: Path):
+    """`use super::super::runner` from app's nested/deep.rs must resolve back
+    to programs/app/src/runner.rs — exercises super-chains anchored at the
+    file's owning crate, not at the repo root."""
+    pool, repo_id = clean_repo
+    await _full_pipeline(pool, repo_id, rust_workspace_fixture_root)
+
+    async with pool.acquire() as conn:
+        runner_id = await conn.fetchval(
+            "SELECT id FROM files WHERE repo_id=$1 AND path=$2",
+            repo_id, "programs/app/src/runner.rs",
+        )
+        row = await conn.fetchrow(
+            "SELECT i.dep_class, i.resolved_file_id "
+            "FROM imports i JOIN files f ON f.id=i.file_id "
+            "WHERE f.repo_id=$1 AND f.path='programs/app/src/nested/deep.rs' "
+            "  AND i.import_path='super::super::runner'",
+            repo_id,
+        )
+        assert row is not None
+        assert row["dep_class"] == "intra_repo"
+        assert row["resolved_file_id"] == runner_id
+
+
+async def test_rust_workspace_crate_paths_resolve(clean_repo, rust_workspace_fixture_root: Path):
+    """`use crate::nested::deep::nested_helper` from runner.rs must resolve
+    to the *app* crate's nested/deep.rs (not core_lib's), proving the
+    crate-of-the-source disambiguation works."""
+    pool, repo_id = clean_repo
+    await _full_pipeline(pool, repo_id, rust_workspace_fixture_root)
+
+    async with pool.acquire() as conn:
+        deep_id = await conn.fetchval(
+            "SELECT id FROM files WHERE repo_id=$1 AND path=$2",
+            repo_id, "programs/app/src/nested/deep.rs",
+        )
+        row = await conn.fetchrow(
+            "SELECT i.dep_class, i.resolved_file_id "
+            "FROM imports i JOIN files f ON f.id=i.file_id "
+            "WHERE f.repo_id=$1 AND f.path='programs/app/src/runner.rs' "
+            "  AND i.import_path='crate::nested::deep::nested_helper'",
+            repo_id,
+        )
+        assert row is not None
+        assert row["dep_class"] == "intra_repo"
+        assert row["resolved_file_id"] == deep_id
+
+
+async def test_rust_derive_emits_inferred_inherits(clean_repo, rust_fixture_root: Path):
+    """`#[derive(Clone, Debug, Default)]` on Counter and `#[derive(Serialize)]`
+    on Report should emit one inferred-confidence inherits edge per derived
+    trait. The base names land in inherits_edges.base_name; base_def_id is
+    NULL for traits whose definition lives outside the repo."""
+    pool, repo_id = clean_repo
+    await _full_pipeline(pool, repo_id, rust_fixture_root)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT d.qualified_name AS child, ie.base_name, ie.confidence
+            FROM inherits_edges ie
+            JOIN definitions d ON d.id=ie.child_def_id
+            JOIN files f ON f.id=d.file_id
+            WHERE f.repo_id=$1
+            ORDER BY child, base_name
+            """,
+            repo_id,
+        )
+        edges = {(r["child"], r["base_name"], r["confidence"]) for r in rows}
+        assert ("utils.Counter", "Clone", "inferred") in edges
+        assert ("utils.Counter", "Debug", "inferred") in edges
+        assert ("utils.Counter", "Default", "inferred") in edges
+        assert ("main.Report", "Serialize", "inferred") in edges
+

@@ -48,6 +48,22 @@ def test_javascript_yaml_loads():
     assert "class_declaration" in cfg.inheritance[0].parent_node_types
 
 
+def test_rust_yaml_loads():
+    cfg = load_language_config("rust")
+    assert cfg.language == "rust"
+    assert cfg.module_node_type == "source_file"
+    kinds = {r.kind for r in cfg.definitions}
+    assert {"function", "type", "trait", "module", "macro"} <= kinds
+    # impl_item is intentionally NOT a definition — see configs/rust.yaml.
+    assert all(d.node_type != "impl_item" for d in cfg.definitions)
+    # Macro invocations participate as call edges, with the macro name field.
+    assert any(c.node_type == "macro_invocation" for c in cfg.calls)
+    assert any(c.node_type == "call_expression" for c in cfg.calls)
+    # use_declaration is registered as the import node.
+    assert cfg.imports is not None
+    assert "use_declaration" in cfg.imports.node_types
+
+
 def test_typescript_yaml_loads():
     cfg = load_language_config("typescript")
     assert cfg.language == "typescript"
@@ -318,6 +334,123 @@ async def test_resolve_typescript_definitions(clean_repo, node_fixture_root: Pat
         # override generation can connect implementing classes to them.
         assert kinds_by_qn["lib.Greeter.greet"] == "method"
         assert kinds_by_qn["helpers.Closer.close"] == "method"
+
+
+async def test_resolve_rust_definitions(clean_repo, rust_fixture_root: Path):
+    """Methods defined inside `impl Counter { … }` get the impl's target type
+    as their qualified-name prefix even though impl_item itself is not a
+    definition."""
+    pool, repo_id = clean_repo
+    await index_repo(pool, repo_id, rust_fixture_root)
+    await resolve_repo(pool, repo_id)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT d.kind, d.qualified_name FROM definitions d
+            JOIN files f ON f.id=d.file_id
+            WHERE f.repo_id=$1 AND f.path='src/utils.rs' AND d.kind <> 'module'
+            ORDER BY d.qualified_name
+            """,
+            repo_id,
+        )
+        by_q = {r["qualified_name"]: r["kind"] for r in rows}
+        assert by_q["utils.Counter"] == "type"
+        assert by_q["utils.helper"] == "function"
+        assert by_q["utils.double"] == "function"
+        # Impl methods carry the type prefix.
+        assert by_q["utils.Counter.new"] == "function"
+        assert by_q["utils.Counter.increment"] == "function"
+        # impl_item itself does NOT produce a definition row.
+        impl_rows = await conn.fetch(
+            "SELECT 1 FROM definitions d JOIN files f ON f.id=d.file_id "
+            "WHERE f.repo_id=$1 AND d.kind='impl'",
+            repo_id,
+        )
+        assert impl_rows == []
+
+
+async def test_resolve_rust_skips_inline_test_module(clean_repo, rust_fixture_root: Path):
+    """`#[cfg(test)] mod tests { … }` at the bottom of utils.rs must not
+    contribute any definitions to the graph. The non-test items in the
+    same file are still emitted normally."""
+    pool, repo_id = clean_repo
+    await index_repo(pool, repo_id, rust_fixture_root)
+    await resolve_repo(pool, repo_id)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT d.qualified_name FROM definitions d "
+            "JOIN files f ON f.id=d.file_id "
+            "WHERE f.repo_id=$1 AND f.path='src/utils.rs' "
+            "ORDER BY d.qualified_name",
+            repo_id,
+        )
+        names = {r["qualified_name"] for r in rows}
+
+        # Production code is still indexed.
+        assert "utils.helper" in names
+        assert "utils.double" in names
+        assert "utils.Counter" in names
+        assert "utils.Counter.new" in names
+
+        # Nothing from `mod tests { … }` should be present — neither the
+        # mod itself, nor any of its functions (with or without #[test]).
+        assert all(not n.startswith("utils.tests") for n in names), names
+        assert "utils.test_helper_increments" not in names
+        assert "utils.test_double_doubles_helper" not in names
+        assert "utils.test_only_helper" not in names
+
+
+async def test_resolve_rust_skips_integration_tests_dir(clean_repo, rust_fixture_root: Path):
+    """A file under `tests/` is a separate cargo compilation unit. Its
+    definitions and references must be skipped entirely; the file row
+    in `files` is still present (Tier-1 indexes it) but no semantic rows
+    point at it."""
+    pool, repo_id = clean_repo
+    await index_repo(pool, repo_id, rust_fixture_root)
+    await resolve_repo(pool, repo_id)
+
+    async with pool.acquire() as conn:
+        # Tier-1 still parsed the file.
+        integration_id = await conn.fetchval(
+            "SELECT id FROM files WHERE repo_id=$1 AND path='tests/integration.rs'",
+            repo_id,
+        )
+        assert integration_id is not None
+        # Tier-2 did not emit any defs / refs / call_edges for it.
+        n_defs = await conn.fetchval(
+            "SELECT COUNT(*) FROM definitions WHERE file_id=$1", integration_id,
+        )
+        n_refs = await conn.fetchval(
+            'SELECT COUNT(*) FROM "references" WHERE file_id=$1', integration_id,
+        )
+        assert n_defs == 0
+        assert n_refs == 0
+
+
+async def test_resolve_rust_within_file_calls(clean_repo, rust_fixture_root: Path):
+    """`Counter::increment` calls `helper(...)` inside utils.rs — should
+    resolve to utils.helper via in-file scope chain."""
+    pool, repo_id = clean_repo
+    await index_repo(pool, repo_id, rust_fixture_root)
+    await resolve_repo(pool, repo_id)
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT ce.confidence, callee.qualified_name AS callee_qn
+            FROM call_edges ce
+            JOIN definitions caller ON caller.id=ce.caller_def_id
+            LEFT JOIN definitions callee ON callee.id=ce.callee_def_id
+            JOIN files f ON f.id=caller.file_id
+            WHERE f.repo_id=$1 AND caller.qualified_name='utils.Counter.increment'
+              AND callee.qualified_name='utils.helper'
+            """,
+            repo_id,
+        )
+        assert row is not None
+        assert row["confidence"] == "certain"
 
 
 async def test_resolve_node_intra_file_inheritance(clean_repo, node_fixture_root: Path):

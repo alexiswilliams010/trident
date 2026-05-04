@@ -65,6 +65,16 @@ def test_walker_yields_go_files(go_fixture_root: Path) -> None:
     assert all(p.endswith(".go") for p in found)
 
 
+def test_walker_yields_rust_files(rust_fixture_root: Path) -> None:
+    cfg = WalkConfig.with_defaults(rust_fixture_root)
+    found = sorted(d.rel_path for d in walk_repo(cfg))
+    assert "src/lib.rs" in found
+    assert "src/main.rs" in found
+    assert "src/utils.rs" in found
+    assert "src/relative_user.rs" in found
+    assert all(p.endswith(".rs") for p in found)
+
+
 def test_walker_yields_node_files(node_fixture_root: Path) -> None:
     """JS, JSX, TS, and TSX files all surface from the walker with the right
     language tag. node_modules/ must be pruned."""
@@ -249,6 +259,41 @@ async def test_index_node_fixture(clean_repo, node_fixture_root: Path) -> None:
             app_id,
         )
         assert jsx_count >= 1, "expected JSX nodes in .jsx file"
+
+
+async def test_index_rust_fixture(clean_repo, rust_fixture_root: Path) -> None:
+    pool, repo_id = clean_repo
+    result = await index_repo(pool, repo_id, rust_fixture_root)
+
+    rel_paths = {r.rel_path for r in result.indexed}
+    assert "src/lib.rs" in rel_paths
+    assert "src/utils.rs" in rel_paths
+    assert "src/main.rs" in rel_paths
+    assert "src/relative_user.rs" in rel_paths
+    # target/ would be pruned by the walker if present (per rust.yaml).
+    assert all(not p.startswith("target/") for p in rel_paths)
+
+    async with pool.acquire() as conn:
+        utils_id = await conn.fetchval(
+            "SELECT id FROM files WHERE repo_id=$1 AND path=$2",
+            repo_id, "src/utils.rs",
+        )
+        # Counter struct + impl block + free fns + derive attribute_item.
+        struct_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM nodes WHERE file_id=$1 AND node_type='struct_item'",
+            utils_id,
+        )
+        impl_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM nodes WHERE file_id=$1 AND node_type='impl_item'",
+            utils_id,
+        )
+        attr_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM nodes WHERE file_id=$1 AND node_type='attribute_item'",
+            utils_id,
+        )
+        assert struct_count == 1
+        assert impl_count == 1
+        assert attr_count >= 1
 
 
 async def test_incremental_indexing_skips_unchanged(clean_repo, python_fixture_root: Path) -> None:

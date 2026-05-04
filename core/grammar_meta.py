@@ -81,6 +81,11 @@ LANGUAGES: dict[str, LanguageSpec] = {
             (".tsx", "language_tsx"),
         ),
     ),
+    "rust": LanguageSpec(
+        name="rust",
+        extensions=(".rs",),
+        module_name="tree_sitter_rust",
+    ),
 }
 
 
