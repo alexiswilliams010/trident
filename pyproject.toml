@@ -35,6 +35,9 @@ testpaths = ["tests"]
 line-length = 100
 target-version = "py312"
 
+[project.scripts]
+trident-graph = "cli.graph:main"
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
