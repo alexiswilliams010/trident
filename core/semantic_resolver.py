@@ -494,6 +494,11 @@ async def resolve_file(
         visibility: str | None = None
         if rule.visibility_field:
             vnode = ts.child_by_field_name(rule.visibility_field)
+            if vnode is None:
+                for child in ts.children:
+                    if child.type == rule.visibility_field:
+                        vnode = child
+                        break
             if vnode is not None:
                 visibility = _text(vnode)
 
