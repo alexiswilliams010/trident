@@ -251,6 +251,125 @@ def _terminal_identifier(ts_node) -> str | None:
     return None
 
 
+_RUST_TEST_PATH_SEGMENTS = frozenset({"tests", "benches", "examples", "test_utils"})
+
+
+def _is_rust_test_path(rel_path: str) -> bool:
+    """True if a Rust source file lives in a directory we treat as test-only
+    or test-scaffolding code:
+      • cargo's separate-compilation-unit dirs: `tests/`, `benches/`,
+        `examples/` — these never link into the production crate.
+      • `test_utils/` — Solana/Anchor convention for cross-crate test
+        fixtures. Not gated by `#[cfg(test)]` (so other crates' integration
+        tests can pull them in) but functionally test scaffolding —
+        retrieval-noise for production code questions.
+    Detected by path segment, catching both top-level and per-crate
+    workspace layouts (`programs/bridge/src/test_utils/mod.rs`)."""
+    return any(p in _RUST_TEST_PATH_SEGMENTS for p in rel_path.split("/"))
+
+
+def _rust_attribute_path_name(attr_ts) -> str | None:
+    """Return the dotted-path head of an `attribute` node (the bit before
+    the optional `(...)` arguments). For `#[cfg(test)]` returns `"cfg"`;
+    for `#[serde(rename_all = "snake_case")]` returns `"serde"`; for
+    `#[tokio::test]` returns `"test"` (the trailing identifier)."""
+    for c in attr_ts.children:
+        if c.type == "identifier":
+            return _text(c)
+        if c.type == "scoped_identifier":
+            return _terminal_identifier(c)
+    return None
+
+
+def _token_tree_contains_test(args_ts) -> bool:
+    """True if the `cfg(...)` token-tree mentions a literal `test` token
+    anywhere in its named subtree. We don't try to interpret arbitrary cfg
+    predicates — `cfg(any(test, feature = "x"))` and `cfg(all(test, …))`
+    both correctly trip this. False positives are rare; the cost of
+    occasionally over-skipping borderline test-utility code is far less
+    than the cost of letting unit-test bodies dominate retrieval."""
+    stack = [args_ts]
+    while stack:
+        n = stack.pop()
+        if n.type == "identifier" and _text(n) == "test":
+            return True
+        for c in n.children:
+            stack.append(c)
+    return False
+
+
+def _has_test_attribute(item_ts) -> bool:
+    """Walk previous-sibling attribute_items looking for a test marker:
+      • `#[test]` / `#[tokio::test]` / `#[<runner>::test]`
+      • `#[cfg(test)]` / `#[cfg(any(test, …))]` / `#[cfg(all(test, …))]`
+    Returns True on the first match."""
+    cursor = item_ts.prev_named_sibling
+    while cursor is not None and cursor.type == "attribute_item":
+        attr = next((c for c in cursor.children if c.type == "attribute"), None)
+        if attr is not None:
+            path_name = _rust_attribute_path_name(attr)
+            if path_name == "test":
+                return True
+            if path_name == "cfg":
+                args = attr.child_by_field_name("arguments")
+                if args is not None and _token_tree_contains_test(args):
+                    return True
+        cursor = cursor.prev_named_sibling
+    return False
+
+
+_RUST_SKIP_ITEM_TYPES = frozenset({
+    "mod_item", "function_item", "impl_item",
+    "struct_item", "enum_item", "union_item",
+    "trait_item", "type_item", "const_item", "static_item",
+    "macro_definition",
+})
+
+# Module names that, by convention, hold test scaffolding even when not
+# `#[cfg(test)]`-gated. `tests` is the unit-test convention (almost always
+# paired with cfg(test) but not strictly required). `test_utils` is the
+# Solana/Anchor / cross-crate helper convention — fixtures live here so
+# integration tests in other crates can pull them in, which means they
+# can't be cfg(test)-gated. Both are noise for code retrieval.
+_RUST_TEST_MOD_NAMES = frozenset({"tests", "test_utils"})
+
+
+def _collect_rust_test_skip_ids(ts_walk) -> frozenset[int]:
+    """Return the ts_node ids whose subtrees should be skipped during
+    semantic emission because they are test code. A node is a skip-root
+    when one of:
+      • it carries a test attribute (#[test], #[cfg(test)], etc.)
+      • it's a `mod_item` literally named `tests` (idiomatic test-mod
+        convention; almost always paired with `#[cfg(test)]` but not
+        strictly required by the language)
+
+    The skip set includes all descendants of every skip-root, so any def
+    rule matching anything inside `mod tests { … }` is filtered out before
+    a definition row is reserved."""
+    skip_roots: list = []
+    for ts in ts_walk:
+        if ts.type not in _RUST_SKIP_ITEM_TYPES:
+            continue
+        is_test = _has_test_attribute(ts)
+        if not is_test and ts.type == "mod_item":
+            name_node = ts.child_by_field_name("name")
+            if name_node is not None and _text(name_node) in _RUST_TEST_MOD_NAMES:
+                is_test = True
+        if is_test:
+            skip_roots.append(ts)
+    if not skip_roots:
+        return frozenset()
+    out: set[int] = set()
+    for root in skip_roots:
+        stack = [root]
+        while stack:
+            n = stack.pop()
+            out.add(n.id)
+            for c in n.children:
+                stack.append(c)
+    return frozenset(out)
+
+
 def _collect_rust_derives(item_ts) -> list[str]:
     """Walk an item's previous siblings to collect names from `#[derive(...)]`
     attributes. tree-sitter-rust represents attributes as siblings, not
@@ -455,6 +574,26 @@ async def resolve_file(
 
     await _clear_semantic_for_file(conn, file_id)
 
+    # Rust-only: drop integration-test files (`tests/`, `benches/`,
+    # `examples/`) from semantic emission entirely — these are separate
+    # compilation units and their bodies are noise for retrieval. Inline
+    # `#[cfg(test)] mod tests { … }` blocks are filtered per-node below.
+    if config.language == "rust" and _is_rust_test_path(row["path"]):
+        return ResolveFileResult(
+            file_id=file_id, language=config.language,
+            n_definitions=0, n_references=0,
+            n_call_edges=0, n_data_access=0,
+        )
+
+    # Rust-only: pre-compute the set of ts_node ids inside test-gated items
+    # (cfg(test)/test attribute or `mod tests { … }`). Every emission loop
+    # below treats these as if they didn't exist.
+    test_skip_ts_ids: frozenset[int] = (
+        _collect_rust_test_skip_ids(ts_walk)
+        if config.language == "rust"
+        else frozenset()
+    )
+
     # ── P1: definitions (synthetic module + matched rules) ──
     #
     # Performance: we reserve a contiguous block of definition IDs from the
@@ -505,6 +644,8 @@ async def resolve_file(
     # Walk in DFS preorder; an enclosing scope's def_id is always set before
     # children are processed, so scope_id resolution is straightforward.
     for ts in ts_walk:
+        if ts.id in test_skip_ts_ids:
+            continue
         rule = def_rules.get(ts.type)
         if rule is None:
             continue
@@ -646,6 +787,8 @@ async def resolve_file(
     # (child, base_name, ord, base_def_id, confidence)
     inh_records: list[tuple[int, str, int, int | None, str]] = []
     for ts in ts_walk:
+        if ts.id in test_skip_ts_ids:
+            continue
         child_def_id: int | None = None
         ordinal = 0
         for rule in config.inheritance:
@@ -682,6 +825,8 @@ async def resolve_file(
 
         # impl Trait for Type → Type's def → Trait
         for ts in ts_walk:
+            if ts.id in test_skip_ts_ids:
+                continue
             if ts.type != "impl_item":
                 continue
             type_field = ts.child_by_field_name("type")
@@ -705,6 +850,8 @@ async def resolve_file(
 
         # #[derive(Trait1, Trait2, …)] above struct/enum/union
         for ts in ts_walk:
+            if ts.id in test_skip_ts_ids:
+                continue
             if ts.type not in ("struct_item", "enum_item", "union_item"):
                 continue
             name_node = ts.child_by_field_name("name")
@@ -775,6 +922,8 @@ async def resolve_file(
     # call. We let the reference rule fire on them — the call rule below additionally
     # creates a call_edge.
     for ts in ts_walk:
+        if ts.id in test_skip_ts_ids:
+            continue
         rule = ref_rule_by_type.get(ts.type)
         if rule is None:
             continue
@@ -820,6 +969,8 @@ async def resolve_file(
     # ── P5: call edges ──
     call_records: list[_CallRecord] = []
     for ts in ts_walk:
+        if ts.id in test_skip_ts_ids:
+            continue
         rule = call_rule_by_type.get(ts.type)
         if rule is None:
             continue

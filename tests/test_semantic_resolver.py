@@ -370,6 +370,65 @@ async def test_resolve_rust_definitions(clean_repo, rust_fixture_root: Path):
         assert impl_rows == []
 
 
+async def test_resolve_rust_skips_inline_test_module(clean_repo, rust_fixture_root: Path):
+    """`#[cfg(test)] mod tests { … }` at the bottom of utils.rs must not
+    contribute any definitions to the graph. The non-test items in the
+    same file are still emitted normally."""
+    pool, repo_id = clean_repo
+    await index_repo(pool, repo_id, rust_fixture_root)
+    await resolve_repo(pool, repo_id)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT d.qualified_name FROM definitions d "
+            "JOIN files f ON f.id=d.file_id "
+            "WHERE f.repo_id=$1 AND f.path='src/utils.rs' "
+            "ORDER BY d.qualified_name",
+            repo_id,
+        )
+        names = {r["qualified_name"] for r in rows}
+
+        # Production code is still indexed.
+        assert "utils.helper" in names
+        assert "utils.double" in names
+        assert "utils.Counter" in names
+        assert "utils.Counter.new" in names
+
+        # Nothing from `mod tests { … }` should be present — neither the
+        # mod itself, nor any of its functions (with or without #[test]).
+        assert all(not n.startswith("utils.tests") for n in names), names
+        assert "utils.test_helper_increments" not in names
+        assert "utils.test_double_doubles_helper" not in names
+        assert "utils.test_only_helper" not in names
+
+
+async def test_resolve_rust_skips_integration_tests_dir(clean_repo, rust_fixture_root: Path):
+    """A file under `tests/` is a separate cargo compilation unit. Its
+    definitions and references must be skipped entirely; the file row
+    in `files` is still present (Tier-1 indexes it) but no semantic rows
+    point at it."""
+    pool, repo_id = clean_repo
+    await index_repo(pool, repo_id, rust_fixture_root)
+    await resolve_repo(pool, repo_id)
+
+    async with pool.acquire() as conn:
+        # Tier-1 still parsed the file.
+        integration_id = await conn.fetchval(
+            "SELECT id FROM files WHERE repo_id=$1 AND path='tests/integration.rs'",
+            repo_id,
+        )
+        assert integration_id is not None
+        # Tier-2 did not emit any defs / refs / call_edges for it.
+        n_defs = await conn.fetchval(
+            "SELECT COUNT(*) FROM definitions WHERE file_id=$1", integration_id,
+        )
+        n_refs = await conn.fetchval(
+            'SELECT COUNT(*) FROM "references" WHERE file_id=$1', integration_id,
+        )
+        assert n_defs == 0
+        assert n_refs == 0
+
+
 async def test_resolve_rust_within_file_calls(clean_repo, rust_fixture_root: Path):
     """`Counter::increment` calls `helper(...)` inside utils.rs — should
     resolve to utils.helper via in-file scope chain."""

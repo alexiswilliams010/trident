@@ -326,21 +326,80 @@ def _flatten_rust_use(arg_node, prefix: str):
     yield (full, last)
 
 
+def _rust_inside_test_subtree(ts) -> bool:
+    """True if `ts` sits anywhere inside a `#[cfg(test)]` / `#[test]`-gated
+    item or a `mod tests { … }` block. Mirrors the test-skip logic in
+    semantic_resolver so import rows aren't created for test-only code.
+    Walks the AST upward; returns on the first matching ancestor."""
+    cur = ts.parent
+    while cur is not None:
+        if cur.type == "mod_item":
+            name_node = cur.child_by_field_name("name")
+            if name_node is not None and _text(name_node) in ("tests", "test_utils"):
+                return True
+        if cur.type in (
+            "mod_item", "function_item", "impl_item",
+            "struct_item", "enum_item", "union_item",
+            "trait_item", "type_item", "const_item",
+            "static_item", "macro_definition",
+        ):
+            sib = cur.prev_named_sibling
+            while sib is not None and sib.type == "attribute_item":
+                attr = next((c for c in sib.children if c.type == "attribute"), None)
+                if attr is not None:
+                    path_name = None
+                    for c in attr.children:
+                        if c.type == "identifier":
+                            path_name = _text(c)
+                            break
+                        if c.type == "scoped_identifier":
+                            n = c.child_by_field_name("name")
+                            path_name = _text(n) if n is not None else None
+                            break
+                    if path_name == "test":
+                        return True
+                    if path_name == "cfg":
+                        args = attr.child_by_field_name("arguments")
+                        if args is not None:
+                            stack = [args]
+                            while stack:
+                                m = stack.pop()
+                                if m.type == "identifier" and _text(m) == "test":
+                                    return True
+                                for cc in m.children:
+                                    stack.append(cc)
+                sib = sib.prev_named_sibling
+        cur = cur.parent
+    return False
+
+
 def _extract_imports_rust(file_id: int, source_rel_path: str, ts_root, db_id_for) -> list[ImportEntry]:
     """Walk `use_declaration` nodes; flatten grouped/nested forms into one
     ImportEntry per leaf path. Each entry's import_path includes the trailing
     item name; _resolve_rust strips it to find the containing module file.
 
-    Limitations the future Deno resolver phase will fix:
+    Test-gated imports (inside `#[cfg(test)] mod tests { … }` / `#[test]`)
+    are skipped so the imports table mirrors the semantic-layer skip and
+    test-only crate dependencies don't surface in retrieval. Files in
+    `tests/` / `benches/` / `examples/` directories are skipped at the
+    resolver-loop level (see resolve_repo_imports).
+
+    Other limitations the future Deno resolver phase will fix:
       - `#[path = "..."]` module attributes are ignored; we assume the
         canonical filesystem layout (foo.rs / foo/mod.rs).
-      - Workspace imports (`use other_crate::...`) are classified as external
-        even when the other crate is intra-repo; cross-crate workspace
-        resolution needs per-crate package indexes.
     """
+    # Whole-file skip mirroring semantic_resolver's _is_rust_test_path:
+    # `tests/`, `benches/`, `examples/` are cargo's separate-compilation
+    # dirs; `test_utils/` is the cross-crate fixture convention. Imports
+    # from any of these would never contribute production-relevant edges.
+    parts = source_rel_path.split("/")
+    if any(p in ("tests", "benches", "examples", "test_utils") for p in parts):
+        return []
     out: list[ImportEntry] = []
     for ts in _dfs(ts_root):
         if ts.type != "use_declaration":
+            continue
+        if _rust_inside_test_subtree(ts):
             continue
         argument = ts.child_by_field_name("argument")
         if argument is None:
