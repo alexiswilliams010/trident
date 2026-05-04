@@ -236,7 +236,74 @@ def _terminal_identifier(ts_node) -> str | None:
     if node.type == "member_expression":
         prop = node.child_by_field_name("property")
         return _text(prop) if prop is not None else None
+    if node.type == "scoped_type_identifier":
+        # Rust: `std::fmt::Display` — the trailing `name` field is the trait.
+        name_node = node.child_by_field_name("name")
+        return _text(name_node) if name_node is not None else None
+    if node.type == "scoped_identifier":
+        # Rust: `serde::Serialize` used in trait position via generic_type.
+        name_node = node.child_by_field_name("name")
+        return _text(name_node) if name_node is not None else None
+    if node.type == "generic_type":
+        # Rust: `From<u32>` — drop the type arguments, recurse on the base.
+        base = node.child_by_field_name("type")
+        return _terminal_identifier(base) if base is not None else None
     return None
+
+
+def _collect_rust_derives(item_ts) -> list[str]:
+    """Walk an item's previous siblings to collect names from `#[derive(...)]`
+    attributes. tree-sitter-rust represents attributes as siblings, not
+    children, of the item they decorate.
+
+    Stops at the first non-attribute_item sibling so a comment-or-blank-line
+    gap between an attribute and the item still works (whitespace isn't a
+    named child). `#[derive(Foo, Bar)]` and chained `#[derive(Foo)]
+    #[derive(Bar)]` both yield `[Foo, Bar]`. Any non-derive attribute
+    (`#[serde(rename = "...")]`, `#[cfg(test)]`, …) is skipped — only the
+    derive list contributes graph edges.
+    """
+    out: list[str] = []
+    cursor = item_ts.prev_named_sibling
+    while cursor is not None and cursor.type == "attribute_item":
+        attr = None
+        for c in cursor.children:
+            if c.type == "attribute":
+                attr = c
+                break
+        if attr is None:
+            cursor = cursor.prev_named_sibling
+            continue
+        # First named child of `attribute` is the path (`derive`, `cfg`, …).
+        path_name: str | None = None
+        for c in attr.children:
+            if c.type == "identifier":
+                path_name = _text(c)
+                break
+            if c.type == "scoped_identifier":
+                path_name = _terminal_identifier(c)
+                break
+        if path_name == "derive":
+            args = attr.child_by_field_name("arguments")
+            if args is not None:
+                # token_tree carries the parenthesized list; we collect every
+                # identifier / scoped_identifier child as a derived trait. The
+                # commas and parens are anonymous tokens and are skipped by
+                # is_named. We prepend each attribute's derives so the result
+                # reads in source order despite the prev-sibling walk.
+                this_attr: list[str] = []
+                for c in args.children:
+                    if not c.is_named:
+                        continue
+                    if c.type in ("identifier", "type_identifier"):
+                        this_attr.append(_text(c))
+                    elif c.type == "scoped_identifier":
+                        n = _terminal_identifier(c)
+                        if n:
+                            this_attr.append(n)
+                out = this_attr + out
+        cursor = cursor.prev_named_sibling
+    return out
 
 
 def _extract_bases(ts_node, cfg) -> list[str]:
@@ -491,6 +558,24 @@ async def resolve_file(
                     for i in range(n.child_count - 1, -1, -1):
                         stack.append(n.children[i])
 
+        # Rust-specific: a `function_item` whose AST grandparent is an
+        # `impl_item` is a method; prefix its qualified_name with the impl's
+        # target type (`Counter::new`). impl_item is intentionally not a
+        # definition of its own — see configs/rust.yaml — so the prefix has
+        # to come from the AST, not the scope chain.
+        if (
+            config.language == "rust"
+            and prefix_segment is None
+            and ts.type == "function_item"
+        ):
+            parent = ts.parent
+            if parent is not None and parent.type == "declaration_list":
+                gp = parent.parent
+                if gp is not None and gp.type == "impl_item":
+                    type_field = gp.child_by_field_name("type")
+                    if type_field is not None:
+                        prefix_segment = _terminal_identifier(type_field)
+
         visibility: str | None = None
         if rule.visibility_field:
             vnode = ts.child_by_field_name(rule.visibility_field)
@@ -558,7 +643,8 @@ async def resolve_file(
     # more than one rule (Go: `type_spec` is the parent for both interface
     # embedding and struct embedding). Bases from each rule are concatenated
     # in declaration order so the `ord` column reflects a stable ranking.
-    inh_records: list[tuple[int, str, int, int | None]] = []  # (child, base_name, ord, base_def_id)
+    # (child, base_name, ord, base_def_id, confidence)
+    inh_records: list[tuple[int, str, int, int | None, str]] = []
     for ts in ts_walk:
         child_def_id: int | None = None
         ordinal = 0
@@ -574,13 +660,71 @@ async def resolve_file(
                 # Try intra-file resolution: does any module-scope def in this file
                 # match the base name? (Cross-file matches go through Phase 3.)
                 base_def_id = defs_by_scope_and_name.get((module_def_id, base_name))
-                inh_records.append((child_def_id, base_name, ordinal, base_def_id))
+                inh_records.append((child_def_id, base_name, ordinal, base_def_id, "certain"))
+
+    # ── P2.5b: Rust-specific inheritance (impl-trait + derive macros) ──
+    # Two synthetic shapes the YAML inheritance machinery can't express:
+    #   • `impl Trait for Type { … }` → edge Type → Trait. The child here is
+    #     the Type's existing struct/enum/union/type def, not the impl_item
+    #     (which is intentionally not a definition).
+    #   • `#[derive(Trait1, Trait2)]` on a struct/enum/union → one edge per
+    #     derived trait. Tree-sitter never expands the macro, so the actual
+    #     `impl Trait for Type { ... }` block rust-analyzer would see is
+    #     invisible to us; we synthesize the edges best-effort. Confidence
+    #     `inferred` reflects the heuristic nature of both shapes.
+    if config.language == "rust":
+        ord_for: dict[int, int] = {}
+
+        def _next_ord(target: int) -> int:
+            n = ord_for.get(target, 0) + 1
+            ord_for[target] = n
+            return n
+
+        # impl Trait for Type → Type's def → Trait
+        for ts in ts_walk:
+            if ts.type != "impl_item":
+                continue
+            type_field = ts.child_by_field_name("type")
+            trait_field = ts.child_by_field_name("trait")
+            if type_field is None or trait_field is None:
+                continue
+            target_name = _terminal_identifier(type_field)
+            trait_name = _terminal_identifier(trait_field)
+            if not target_name or not trait_name:
+                continue
+            target_def = defs_by_scope_and_name.get((module_def_id, target_name))
+            if target_def is None:
+                # Type defined in another file — Phase 3 will not currently
+                # link this since inherits cross-file resolution keys on
+                # child_def_id. Skip silently.
+                continue
+            base_def = defs_by_scope_and_name.get((module_def_id, trait_name))
+            inh_records.append(
+                (target_def, trait_name, _next_ord(target_def), base_def, "inferred")
+            )
+
+        # #[derive(Trait1, Trait2, …)] above struct/enum/union
+        for ts in ts_walk:
+            if ts.type not in ("struct_item", "enum_item", "union_item"):
+                continue
+            name_node = ts.child_by_field_name("name")
+            if name_node is None:
+                continue
+            target_name = _text(name_node)
+            target_def = defs_by_scope_and_name.get((module_def_id, target_name))
+            if target_def is None:
+                continue
+            for trait_name in _collect_rust_derives(ts):
+                base_def = defs_by_scope_and_name.get((module_def_id, trait_name))
+                inh_records.append(
+                    (target_def, trait_name, _next_ord(target_def), base_def, "inferred")
+                )
 
     if inh_records:
         await conn.executemany(
             """
             INSERT INTO inherits_edges (child_def_id, base_name, ord, base_def_id, confidence)
-            VALUES ($1, $2, $3, $4, 'certain')
+            VALUES ($1, $2, $3, $4, $5)
             """,
             inh_records,
         )

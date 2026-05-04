@@ -14,6 +14,7 @@ with native resolvers; the table shapes do not change.
 from __future__ import annotations
 
 import asyncio
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Iterable
@@ -101,6 +102,17 @@ class RepoIndex:
     # JS/TS only: parsed `compilerOptions.paths` from tsconfig.json (None if no
     # tsconfig present or no JS/TS files in the repo).
     node_tsconfig: TsconfigPaths | None = None
+    # Rust only — crate-relative module path → file_id (e.g. "utils" → utils.rs's
+    # id, "foo::bar" → src/foo/bar.rs or src/foo/bar/mod.rs's id, "" → the crate
+    # root file lib.rs or main.rs). Populated only when the repo has a parseable
+    # Cargo.toml at root.
+    package_index_rust: dict[str, int] = field(default_factory=dict)
+    # Rust only — file_id → its crate-relative module path. Used to resolve
+    # `super::` and `self::` paths against the importer's location.
+    rust_module_for_file: dict[int, str] = field(default_factory=dict)
+    # Rust only — value from `[package].name` in Cargo.toml. Used to recognise
+    # absolute paths that name the current crate explicitly (`use myapp::utils`).
+    rust_crate_name: str | None = None
 
 
 @dataclass
@@ -245,6 +257,118 @@ def _extract_imports_solidity(file_id: int, source_rel_path: str, ts_root, db_id
     return out
 
 
+def _rust_path_text(path_node) -> str:
+    """Reconstruct a use-path string from a tree-sitter-rust path-shaped node.
+    Handles identifier, type_identifier, crate / self / super, scoped_identifier,
+    metavariable. Falls back to the node's raw text for anything else."""
+    t = path_node.type
+    if t in ("identifier", "type_identifier", "metavariable"):
+        return _text(path_node)
+    if t in ("crate", "self", "super"):
+        return _text(path_node)
+    if t == "scoped_identifier":
+        p = path_node.child_by_field_name("path")
+        n = path_node.child_by_field_name("name")
+        prefix = _rust_path_text(p) if p is not None else ""
+        suffix = _text(n) if n is not None else ""
+        if prefix and suffix:
+            return f"{prefix}::{suffix}"
+        return prefix or suffix
+    return _text(path_node)
+
+
+def _flatten_rust_use(arg_node, prefix: str):
+    """Yield (full_path, last_name_or_None) leaves from a use_declaration's
+    argument. None signifies a wildcard (`use a::*` / `a::{*}`).
+
+    Examples (top-level call uses prefix=''):
+        use a::b::c;            → ('a::b::c', 'c')
+        use a::{b, c};          → ('a::b', 'b'), ('a::c', 'c')
+        use a::{b::c, d};       → ('a::b::c', 'c'), ('a::d', 'd')
+        use a::*;               → ('a', None)
+        use a::B as Bb;         → ('a::B', 'B')   # original name, not alias
+    """
+    t = arg_node.type
+    if t == "use_as_clause":
+        p = arg_node.child_by_field_name("path")
+        if p is not None:
+            yield from _flatten_rust_use(p, prefix)
+        return
+    if t == "use_wildcard":
+        # The path child (if any) is the only named child apart from the
+        # implicit `*` token. `use foo::*;` parses path='foo'; bare `use *;` is
+        # not legal Rust, so we always expect one.
+        p = next((c for c in arg_node.children if c.is_named), None)
+        if p is None:
+            yield (prefix, None)
+            return
+        path_str = _rust_path_text(p)
+        full = f"{prefix}::{path_str}" if prefix and path_str else (path_str or prefix)
+        yield (full, None)
+        return
+    if t == "scoped_use_list":
+        p = arg_node.child_by_field_name("path")
+        list_node = arg_node.child_by_field_name("list")
+        path_str = _rust_path_text(p) if p is not None else ""
+        new_prefix = (
+            f"{prefix}::{path_str}" if prefix and path_str
+            else (path_str or prefix)
+        )
+        if list_node is None:
+            return
+        for c in list_node.children:
+            if c.is_named:
+                yield from _flatten_rust_use(c, new_prefix)
+        return
+    # Leaf: identifier / type_identifier / scoped_identifier / crate / self / super.
+    path_str = _rust_path_text(arg_node)
+    full = f"{prefix}::{path_str}" if prefix else path_str
+    last = full.rsplit("::", 1)[-1] if "::" in full else full
+    yield (full, last)
+
+
+def _extract_imports_rust(file_id: int, source_rel_path: str, ts_root, db_id_for) -> list[ImportEntry]:
+    """Walk `use_declaration` nodes; flatten grouped/nested forms into one
+    ImportEntry per leaf path. Each entry's import_path includes the trailing
+    item name; _resolve_rust strips it to find the containing module file.
+
+    Limitations the future Deno resolver phase will fix:
+      - `#[path = "..."]` module attributes are ignored; we assume the
+        canonical filesystem layout (foo.rs / foo/mod.rs).
+      - Workspace imports (`use other_crate::...`) are classified as external
+        even when the other crate is intra-repo; cross-crate workspace
+        resolution needs per-crate package indexes.
+    """
+    out: list[ImportEntry] = []
+    for ts in _dfs(ts_root):
+        if ts.type != "use_declaration":
+            continue
+        argument = ts.child_by_field_name("argument")
+        if argument is None:
+            continue
+        for full_path, last_name in _flatten_rust_use(argument, ""):
+            if not full_path:
+                continue
+            is_relative = (
+                full_path.startswith("self::")
+                or full_path.startswith("super::")
+                or full_path in ("self", "super")
+            )
+            names = [last_name] if last_name else []
+            out.append(
+                ImportEntry(
+                    file_id=file_id,
+                    node_id=db_id_for[ts.id],
+                    language="rust",
+                    source_rel_path=source_rel_path,
+                    import_path=full_path,
+                    imported_names=names,
+                    is_relative=is_relative,
+                )
+            )
+    return out
+
+
 def _collect_node_import_clause_names(import_stmt) -> list[str]:
     """Names bound by an `import_statement`. We capture the ORIGINAL exported
     name (matching against the target file's defs in Tier-A) rather than the
@@ -379,6 +503,7 @@ _EXTRACTORS = {
     "go": _extract_imports_go,
     "javascript": _make_node_extractor("javascript"),
     "typescript": _make_node_extractor("typescript"),
+    "rust": _extract_imports_rust,
 }
 
 
@@ -398,6 +523,84 @@ def _python_dotted_for(rel_path: str) -> str | None:
     if not parts:
         return None
     return ".".join(parts)
+
+
+def _rust_module_path_for(rel_path: str, crate_root_path: str) -> str | None:
+    """Map a .rs file's repo-relative path to its crate-relative module path.
+
+    Examples (crate_root_path='src/lib.rs'):
+        'src/lib.rs'           → ''             (the crate root itself)
+        'src/utils.rs'         → 'utils'
+        'src/foo/bar.rs'       → 'foo::bar'
+        'src/foo/mod.rs'       → 'foo'
+        'src/foo/bar/mod.rs'   → 'foo::bar'
+
+    Returns None for files that don't sit under the crate root's directory
+    (e.g. test files in `tests/`, examples/, build scripts), which we leave
+    unindexed in the heuristic tier.
+    """
+    if not rel_path.endswith(".rs"):
+        return None
+    if rel_path == crate_root_path:
+        return ""
+    crate_dir = crate_root_path.rsplit("/", 1)[0] if "/" in crate_root_path else ""
+    if crate_dir:
+        if not rel_path.startswith(crate_dir + "/"):
+            return None
+        rel = rel_path[len(crate_dir) + 1:]
+    else:
+        rel = rel_path
+    no_ext = rel[:-3]
+    parts = no_ext.split("/")
+    if parts and parts[-1] == "mod":
+        parts = parts[:-1]
+    return "::".join(parts) if parts else ""
+
+
+def _rust_crate_metadata(repo_root: Path) -> tuple[str | None, str]:
+    """Return (crate_name, crate_root_path) discovered from Cargo.toml at the
+    repo root. crate_root_path is repo-relative (e.g. 'src/lib.rs').
+
+    Defaults: if Cargo.toml is missing or unparsable, falls back to the
+    on-disk file `src/lib.rs` if present, else `src/main.rs`. crate_name
+    falls back to the repo root directory name. We pick lib over bin so
+    library re-exports are preferred when both are present (the common
+    cargo new-with-binary layout).
+    """
+    crate_name: str | None = None
+    crate_root_path: str | None = None
+    cargo = repo_root / "Cargo.toml"
+    if cargo.is_file():
+        try:
+            data = tomllib.loads(cargo.read_text())
+        except Exception:
+            data = {}
+        pkg = data.get("package", {})
+        if isinstance(pkg, dict):
+            n = pkg.get("name")
+            if isinstance(n, str):
+                crate_name = n.replace("-", "_")  # cargo normalizes dashes
+        lib = data.get("lib", {})
+        if isinstance(lib, dict):
+            p = lib.get("path")
+            if isinstance(p, str):
+                crate_root_path = p
+        if crate_root_path is None:
+            bins = data.get("bin", [])
+            if isinstance(bins, list) and bins:
+                first = bins[0]
+                if isinstance(first, dict) and isinstance(first.get("path"), str):
+                    crate_root_path = first["path"]
+    if crate_root_path is None:
+        if (repo_root / "src" / "lib.rs").is_file():
+            crate_root_path = "src/lib.rs"
+        elif (repo_root / "src" / "main.rs").is_file():
+            crate_root_path = "src/main.rs"
+        else:
+            crate_root_path = "src/lib.rs"  # best-effort default
+    if crate_name is None:
+        crate_name = repo_root.name.replace("-", "_") or None
+    return crate_name, crate_root_path
 
 
 async def build_repo_index(conn: asyncpg.Connection, repo_id: int) -> RepoIndex:
@@ -425,8 +628,10 @@ async def build_repo_index(conn: asyncpg.Connection, repo_id: int) -> RepoIndex:
     pkg_index: dict[str, int] = {}
     pkg_index_go: dict[str, int] = {}
     pkg_files_go: dict[str, list[int]] = {}
+    rust_files: list[tuple[int, str]] = []  # (file_id, rel_path); built first, indexed below once we know the crate root
     has_go = False
     has_node = False
+    has_rust = False
     for f in files:
         fid = f["id"]
         file_index[f["path"]] = fid
@@ -447,6 +652,9 @@ async def build_repo_index(conn: asyncpg.Connection, repo_id: int) -> RepoIndex:
             pkg_files_go.setdefault(pkg_dir, []).append(fid)
         elif f["language"] in ("javascript", "typescript"):
             has_node = True
+        elif f["language"] == "rust":
+            has_rust = True
+            rust_files.append((fid, f["path"]))
 
     # Read go.mod once if any Go file is present and a root_path is known.
     go_module_path: str | None = None
@@ -464,6 +672,24 @@ async def build_repo_index(conn: asyncpg.Connection, repo_id: int) -> RepoIndex:
     node_tsconfig: TsconfigPaths | None = None
     if has_node and repo_root:
         node_tsconfig = load_tsconfig_paths(Path(repo_root))
+
+    # Rust: parse Cargo.toml once per repo to discover the crate name and
+    # crate root path; then derive each .rs file's crate-relative module path.
+    # Workspace support (multiple Cargo.toml files) is deliberately deferred —
+    # the heuristic tier handles the single-crate case and external-crate
+    # classification, with workspace member resolution flagged in the
+    # Architecture doc as a Phase 8 follow-up.
+    rust_pkg_index: dict[str, int] = {}
+    rust_module_for_file: dict[int, str] = {}
+    rust_crate_name: str | None = None
+    if has_rust and repo_root:
+        rust_crate_name, crate_root_path = _rust_crate_metadata(Path(repo_root))
+        for fid, rel in rust_files:
+            mod_path = _rust_module_path_for(rel, crate_root_path)
+            if mod_path is None:
+                continue
+            rust_pkg_index.setdefault(mod_path, fid)
+            rust_module_for_file[fid] = mod_path
 
     name_index: dict[str, list[tuple[int, int]]] = {}
     qualified_to_def: dict[tuple[int, str], int] = {}
@@ -483,6 +709,9 @@ async def build_repo_index(conn: asyncpg.Connection, repo_id: int) -> RepoIndex:
         file_languages=file_languages,
         repo_id=repo_id,
         node_tsconfig=node_tsconfig,
+        package_index_rust=rust_pkg_index,
+        rust_module_for_file=rust_module_for_file,
+        rust_crate_name=rust_crate_name,
     )
 
 
@@ -625,6 +854,76 @@ def _resolve_go(entry: ImportEntry, idx: RepoIndex) -> ResolvedImport:
     return ResolvedImport(entry, "external", package_name=pkg)
 
 
+def _try_rust_module_path(entry: ImportEntry, idx: RepoIndex, parts: list[str]) -> ResolvedImport:
+    """Try `parts` as a crate-relative module path; on miss, drop trailing
+    segments and retry. Same shape as the Python resolver's parent-prefix
+    fallback — handles the ambiguity between `use crate::utils::helper`
+    (helper is an item in utils.rs) and `use crate::utils::helpers` (helpers
+    might be a submodule file). Empty parts resolves to the crate root."""
+    while parts:
+        cand = "::".join(parts)
+        target = idx.package_index_rust.get(cand)
+        if target is not None:
+            return ResolvedImport(entry, "intra_repo", resolved_file_id=target)
+        parts = parts[:-1]
+    crate_root = idx.package_index_rust.get("")
+    if crate_root is not None:
+        return ResolvedImport(entry, "intra_repo", resolved_file_id=crate_root)
+    return ResolvedImport(entry, "unresolved")
+
+
+def _resolve_rust(entry: ImportEntry, idx: RepoIndex) -> ResolvedImport:
+    """Classify a Rust use-path.
+
+    Buckets, in priority order:
+      • relative (`self::…` / `super::…`) — anchored at the importer's
+        module path; ascend per leading `super`, then descend per the
+        remaining tail.
+      • `crate::…` — strip prefix, look up against package_index_rust.
+      • Bare path whose head equals the current crate's name (`use myapp::…`)
+        — same treatment as `crate::…`.
+      • Anything else — external. Package = first path segment.
+
+    Workspace member crates currently fall into the external bucket; once
+    the Deno resolver lands they'll be reclassified by walking sibling
+    Cargo.toml files. We don't try to guess that here — wrong intra-repo
+    edges are worse than honest external classification.
+    """
+    raw = entry.import_path
+    if not raw:
+        return ResolvedImport(entry, "unresolved")
+    parts = raw.split("::")
+
+    if entry.is_relative:
+        src_module = idx.rust_module_for_file.get(entry.file_id)
+        if src_module is None:
+            return ResolvedImport(entry, "unresolved")
+        src_parts = src_module.split("::") if src_module else []
+        ascend = 0
+        i = 0
+        while i < len(parts):
+            if parts[i] == "self":
+                i += 1
+                continue
+            if parts[i] == "super":
+                ascend += 1
+                i += 1
+                continue
+            break
+        if ascend > len(src_parts):
+            return ResolvedImport(entry, "unresolved")
+        base = src_parts[: len(src_parts) - ascend]
+        tail = parts[i:]
+        return _try_rust_module_path(entry, idx, base + tail)
+
+    head = parts[0]
+    if head == "crate":
+        return _try_rust_module_path(entry, idx, parts[1:])
+    if idx.rust_crate_name and head == idx.rust_crate_name:
+        return _try_rust_module_path(entry, idx, parts[1:])
+    return ResolvedImport(entry, "external", package_name=head)
+
+
 def _resolve_node_import(entry: ImportEntry, idx: RepoIndex) -> ResolvedImport:
     """Classify a JS/TS import.
 
@@ -666,6 +965,8 @@ def _resolve_one(entry: ImportEntry, idx: RepoIndex, cfg: LanguageConfig) -> Res
         return _resolve_go(entry, idx)
     if entry.language in ("javascript", "typescript"):
         return _resolve_node_import(entry, idx)
+    if entry.language == "rust":
+        return _resolve_rust(entry, idx)
     return ResolvedImport(entry, "unresolved")
 
 
