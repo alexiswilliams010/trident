@@ -41,6 +41,7 @@ async def _run(
     do_embed: str | None,
     exclude_patterns: tuple[str, ...],
     use_tridentignore: bool,
+    force_resolve: bool = False,
 ) -> int:
     async with pool_ctx(dsn) as pool:
         if init_schema:
@@ -76,8 +77,11 @@ async def _run(
         )
 
         if do_resolve:
-            file_ids = [r.file_id for r in extract_result.indexed]
-            if file_ids:
+            file_ids = (
+                None if force_resolve
+                else [r.file_id for r in extract_result.indexed]
+            )
+            if file_ids is None or file_ids:
                 resolve_results = await resolve_repo(pool, repo_id, only_file_ids=file_ids)
                 tot_defs = sum(r.n_definitions for r in resolve_results)
                 tot_refs = sum(r.n_references for r in resolve_results)
@@ -146,6 +150,8 @@ def main(argv: list[str] | None = None) -> int:
                              "with-slash patterns match the full repo-relative path.")
     parser.add_argument("--no-tridentignore", action="store_true",
                         help="Don't auto-load .tridentignore from the repo root.")
+    parser.add_argument("--force-resolve", action="store_true",
+                        help="Re-run semantic resolution on all files, not just changed ones.")
     args = parser.parse_args(argv)
 
     if not args.repo_path.is_dir():
@@ -164,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
             args.embed,
             tuple(p for group in args.exclude for p in group),
             not args.no_tridentignore,
+            force_resolve=args.force_resolve,
         )
     )
 
