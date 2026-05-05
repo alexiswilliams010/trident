@@ -3,6 +3,12 @@
 Tests that need Postgres use the `pg_pool` fixture. If Postgres is not
 reachable, those tests are skipped with a clear message so the suite can
 still run partially in CI without a DB.
+
+Branch model: every `clean_repo` / `two_repos` fixture also creates a
+default branch (named `main`) and yields its branch_id. Existing tests
+that destructured `pool, repo_id = clean_repo` will need updating to
+`pool, repo_id, branch_id = clean_repo` (and pass branch_id to indexer,
+resolver, chunk-assembler, embedder, retrieval, and graph functions).
 """
 
 from __future__ import annotations
@@ -50,33 +56,44 @@ async def pg_pool():
 
 @pytest_asyncio.fixture(loop_scope="session")
 async def clean_repo(pg_pool):
-    """Yield (pool, repo_id). Inserts a `repos` row first so the FK on
-    `files.repo_id → repos.id` is satisfied; deleting the repos row at
-    teardown cascades through files / nodes / definitions / chunks."""
+    """Yield (pool, repo_id, branch_id). Inserts a `repos` row + a default
+    `main` branch so the FK chain is satisfied. Deleting the repos row at
+    teardown cascades through branches → branch_files → everything below."""
     name = f"test-{os.urandom(8).hex()}"
     async with pg_pool.acquire() as conn:
         repo_id = await conn.fetchval(
             "INSERT INTO repos (name) VALUES ($1) RETURNING id", name,
         )
-    yield pg_pool, repo_id
+        branch_id = await conn.fetchval(
+            "INSERT INTO branches (repo_id, name, is_default) VALUES ($1, 'main', TRUE) RETURNING id",
+            repo_id,
+        )
+    yield pg_pool, repo_id, branch_id
     async with pg_pool.acquire() as conn:
         await conn.execute("DELETE FROM repos WHERE id=$1", repo_id)
 
 
 @pytest_asyncio.fixture(loop_scope="session")
 async def two_repos(pg_pool):
-    """Yield (pool, repo_id_a, repo_id_b). Used by cross-repo / MMR tests
-    that need two distinct repos coexisting in the same DB."""
+    """Yield (pool, (repo_a_id, branch_a_id), (repo_b_id, branch_b_id))."""
     name_a = f"test-a-{os.urandom(8).hex()}"
     name_b = f"test-b-{os.urandom(8).hex()}"
     async with pg_pool.acquire() as conn:
         a = await conn.fetchval(
             "INSERT INTO repos (name) VALUES ($1) RETURNING id", name_a,
         )
+        ba = await conn.fetchval(
+            "INSERT INTO branches (repo_id, name, is_default) VALUES ($1, 'main', TRUE) RETURNING id",
+            a,
+        )
         b = await conn.fetchval(
             "INSERT INTO repos (name) VALUES ($1) RETURNING id", name_b,
         )
-    yield pg_pool, a, b
+        bb = await conn.fetchval(
+            "INSERT INTO branches (repo_id, name, is_default) VALUES ($1, 'main', TRUE) RETURNING id",
+            b,
+        )
+    yield pg_pool, (a, ba), (b, bb)
     async with pg_pool.acquire() as conn:
         await conn.execute("DELETE FROM repos WHERE id = ANY($1::bigint[])", [a, b])
 
