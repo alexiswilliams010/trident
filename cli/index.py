@@ -1,16 +1,17 @@
 """CLI: index a repository (Tier 1 extractor + Tier 2 semantic resolver).
 
 Usage:
-    python -m cli.index <repo_path> --repo-name myrepo [--dsn postgresql://...]
-                        [--init-schema] [--no-resolve]
+    python -m cli.index <repo_path> --repo-name myrepo [--branch main]
+                        [--dsn postgresql://...] [--init-schema] [--no-resolve]
                         [--exclude PATTERN ...] [--no-tridentignore]
+
+Branch handling: each repo has a designated default branch (auto-created as
+`main` on first index). Pass `--branch <name>` to index a different branch
+of the same repo without overwriting other branches' data.
 
 Exclusion patterns combine `.tridentignore` (auto-loaded from repo root) with
 any `--exclude` flags. Patterns without `/` match any path component;
-patterns with `/` match the full repo-relative path. Examples:
-    --exclude '*.t.sol'     # Foundry test files anywhere
-    --exclude test          # any directory or file named `test`
-    --exclude src/legacy    # exact relative path
+patterns with `/` match the full repo-relative path.
 """
 
 from __future__ import annotations
@@ -20,12 +21,12 @@ import asyncio
 import sys
 from pathlib import Path
 
-from cli._repo import resolve_repo_id
+from cli._repo import resolve_repo_and_branch
 from core.chunk_assembler import assemble_chunks
-from core.embedder import EmbedderConfig, OpenAICompatibleEmbedder, embed_repo_chunks, make_fake_embedder
+from core.embedder import EmbedderConfig, OpenAICompatibleEmbedder, embed_branch_chunks, make_fake_embedder
 from core.extractor import index_repo
 from core.file_walker import WalkConfig, read_tridentignore
-from core.heuristic_resolver import resolve_repo_imports
+from core.heuristic_resolver import resolve_branch_imports
 from core.semantic_resolver import resolve_repo
 from db.connection import apply_migrations, pool_ctx
 
@@ -33,6 +34,7 @@ from db.connection import apply_migrations, pool_ctx
 async def _run(
     repo_path: Path,
     repo_name: str,
+    branch_name: str | None,
     dsn: str | None,
     init_schema: bool,
     do_resolve: bool,
@@ -50,10 +52,11 @@ async def _run(
                 if applied:
                     print(f"Applied migrations: {', '.join(applied)}")
 
-        repo_id = await resolve_repo_id(
-            pool, name=repo_name, root_path=str(repo_path.resolve()), create=True,
+        repo_id, branch_id = await resolve_repo_and_branch(
+            pool, repo_name=repo_name, branch_name=branch_name, create=True,
+            root_path=str(repo_path.resolve()),
         )
-        print(f"[repo] {repo_name} → repo_id={repo_id}")
+        print(f"[repo] {repo_name} → repo_id={repo_id}, branch={branch_name or 'main'} → branch_id={branch_id}")
 
         # Build the walk config: defaults + .tridentignore (if present) + --exclude flags.
         walk_cfg = WalkConfig.with_defaults(repo_path)
@@ -68,7 +71,7 @@ async def _run(
             walk_cfg.exclude_patterns = tuple(all_excludes)
             print(f"[walk] excluding: {', '.join(all_excludes)}")
 
-        extract_result = await index_repo(pool, repo_id, repo_path, walk_config=walk_cfg)
+        extract_result = await index_repo(pool, repo_id, branch_id, repo_path, walk_config=walk_cfg)
         print(
             f"[Tier 1] Indexed {len(extract_result.indexed)} files "
             f"({extract_result.total_nodes} nodes); "
@@ -77,12 +80,14 @@ async def _run(
         )
 
         if do_resolve:
-            file_ids = (
+            file_version_ids = (
                 None if force_resolve
-                else [r.file_id for r in extract_result.indexed]
+                else [r.file_version_id for r in extract_result.indexed]
             )
-            if file_ids is None or file_ids:
-                resolve_results = await resolve_repo(pool, repo_id, only_file_ids=file_ids)
+            if file_version_ids is None or file_version_ids:
+                resolve_results = await resolve_repo(
+                    pool, repo_id, branch_id, only_file_version_ids=file_version_ids,
+                )
                 tot_defs = sum(r.n_definitions for r in resolve_results)
                 tot_refs = sum(r.n_references for r in resolve_results)
                 tot_calls = sum(r.n_call_edges for r in resolve_results)
@@ -94,7 +99,7 @@ async def _run(
                 )
 
         if do_imports:
-            stats = await resolve_repo_imports(pool, repo_id)
+            stats = await resolve_branch_imports(pool, repo_id, branch_id)
             cls = stats.by_class
             total = sum(cls.values()) or 1
             print(
@@ -110,7 +115,7 @@ async def _run(
             )
 
         if do_chunks:
-            cstats = await assemble_chunks(pool, repo_id)
+            cstats = await assemble_chunks(pool, repo_id, branch_id)
             print(
                 f"[Tier 3 chunks] {cstats.total} chunks "
                 f"(function={cstats.n_function} module={cstats.n_module} "
@@ -125,7 +130,7 @@ async def _run(
                 cfg = EmbedderConfig.from_env()
                 embed_fn = OpenAICompatibleEmbedder(cfg).embed
                 model_name = cfg.model
-            estats = await embed_repo_chunks(pool, repo_id, embed_fn, model_name)
+            estats = await embed_branch_chunks(pool, branch_id, embed_fn, model_name)
             print(f"[Tier 3 embed] {estats.embedded}/{estats.chunks_seen} chunks embedded ({model_name})")
 
     return 0
@@ -136,6 +141,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("repo_path", type=Path, help="Path to the repo to index")
     parser.add_argument("--repo-name", type=str, required=True,
                         help="Human-readable repo name (created on first use)")
+    parser.add_argument("--branch", type=str, default=None,
+                        help="Branch name (defaults to the repo's designated default, "
+                             "auto-created as 'main' on first index)")
     parser.add_argument("--dsn", type=str, default=None, help="Postgres DSN (defaults to DATABASE_URL env)")
     parser.add_argument("--init-schema", action="store_true", help="Apply migrations before indexing (idempotent)")
     parser.add_argument("--no-resolve", action="store_true", help="Skip Tier 2 semantic resolution")
@@ -162,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
         _run(
             args.repo_path,
             args.repo_name,
+            args.branch,
             args.dsn,
             args.init_schema,
             not args.no_resolve,

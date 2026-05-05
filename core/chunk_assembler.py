@@ -34,6 +34,15 @@ callees are greedy under the hard cap.
 
 Token counting uses tiktoken's `cl100k_base` — overestimates ~10 % on code
 versus newer encoders (o200k_base), which is safe for budget fitting.
+
+Branch model:
+  • Definitions are content-shared (per file_version), so the same anchor_def
+    can have one chunk per branch (UNIQUE on `branch_id, anchor_def_id,
+    granularity`). Per-branch is necessary because the skeleton inlined into
+    the chunk content references branch-resolved cross-file targets.
+  • `chunk_embeddings` is keyed by chunk content_hash, so when two branches
+    happen to assemble byte-identical chunks (typical for an unchanged file
+    with stable cross-file edges), the embedding row is reused.
 """
 
 from __future__ import annotations
@@ -163,30 +172,12 @@ MAX_DEPS_IN_METADATA = 50
 # `_degrade_if_oversize`. The embedder's `DEFAULT_MAX_INPUT_TOKENS` is the
 # outermost guard; these caps catch things earlier so the `chunks` table
 # doesn't accumulate unembeddable rows.
-#
-# Sized to fit real hand-written function bodies (largest seen ~3540 tokens
-# in OP Stack contracts) plus headroom for enrichment, while staying well
-# under modern embedding context windows (qwen3-embedding-8b: 32k, Voyage
-# code-3: 32k, OpenAI v3: 8191). Soft budgets (`TOKEN_BUDGETS`) and the
-# `HARD_CAP_MULTIPLIER` are unchanged, so most chunks stay small — these
-# caps only stop penalizing the rare chunks that legitimately need room.
 HARD_OUTPUT_CAP = {
     GRANULARITY_FUNCTION:     4000,
     GRANULARITY_MODULE:       6000,
     GRANULARITY_CROSS_MODULE: 8000,
 }
 
-# Order in which to shed bulky JSON fields when even (full preamble + body)
-# overflows the cap. Earlier = less important = dropped first. We stop as
-# soon as the chunk fits, so chunks where a single huge field is the problem
-# keep the rest of the enrichment. Reasoning per field:
-#   dependencies_truncated → tiny marker, no signal once we're trimming
-#   dependencies / external_deps → callee FQNs also appear in the body's
-#                                  call sites, so partially redundant
-#   inheritance_chain / overrides → small structural info, recoverable from
-#                                   the module / cross-module chunks
-#   callers → asymmetric: NOT visible from the function's own source, and
-#             the highest-value enrichment we have. Drop last.
 _METADATA_TRIM_ORDER = (
     "dependencies_truncated",
     "dependencies",
@@ -216,9 +207,6 @@ def _degrade_if_oversize(
     the enrichment context (callee bodies, signatures, inheritance summaries)
     and embed just the anchor body. Only when even body-alone overflows —
     typically generated/minified code — fall back to a minimal stub.
-    Keeping the body keeps real retrieval signal in the embedding; falling
-    straight to the stub turns the chunk into a metadata-shaped near-clone
-    of every other oversized chunk and pollutes nearest-neighbor results.
     """
     tc = count_tokens(content)
     cap = HARD_OUTPUT_CAP.get(granularity)
@@ -232,8 +220,6 @@ def _degrade_if_oversize(
         if shed_tc <= cap:
             return shed_metadata, shed_content, shed_tc
 
-        # Full metadata + body still overflows. Shed bulky fields one at a
-        # time in least-→most-important order, stopping as soon as it fits.
         trimmed = {**metadata, "degraded": "metadata_trimmed", "original_token_count": tc}
         for key in _METADATA_TRIM_ORDER:
             if not trimmed.get(key):
@@ -258,7 +244,7 @@ def _degrade_if_oversize(
 @dataclass
 class _DefRow:
     id: int
-    file_id: int
+    file_version_id: int
     kind: str
     name: str
     qualified_name: str
@@ -277,7 +263,8 @@ class _DefRow:
 
 @dataclass
 class _ChunkRow:
-    file_id: int
+    branch_id: int
+    file_version_id: int
     anchor_def_id: int
     granularity: str
     metadata: dict
@@ -328,20 +315,21 @@ def _hash_content(metadata: dict, content: str) -> str:
 
 
 # ────────────────────────────────────────────────────────────────────
-# Loading rows
+# Loading rows (branch-scoped)
 # ────────────────────────────────────────────────────────────────────
 
 
-async def _load_defs(conn: asyncpg.Connection, repo_id: int) -> list[_DefRow]:
-    # Pull raw_content once per file (a few hundred rows for a mid-size repo)
-    # rather than once per definition. Joining `f.raw_content` into the per-def
-    # fetch made Postgres ship the whole file body N×defs-in-that-file times
-    # and asyncpg materialize a fresh string per row — on a large repo with
-    # tens of thousands of defs that grew into multi-GB and got the OOM
-    # killer's attention.
+async def _load_defs(conn: asyncpg.Connection, branch_id: int) -> list[_DefRow]:
+    """Load all defs whose file_version is mapped by this branch, hydrating
+    raw_content + path from file_versions + branch_files."""
     file_rows = await conn.fetch(
-        "SELECT id, raw_content, path, language FROM files WHERE repo_id = $1",
-        repo_id,
+        """
+        SELECT fv.id, fv.raw_content, bf.path, fv.language
+        FROM branch_files bf
+        JOIN file_versions fv ON fv.id = bf.file_version_id
+        WHERE bf.branch_id = $1
+        """,
+        branch_id,
     )
     file_meta: dict[int, tuple[bytes, str, str]] = {
         r["id"]: ((r["raw_content"] or "").encode("utf-8"), r["path"], r["language"])
@@ -350,107 +338,94 @@ async def _load_defs(conn: asyncpg.Connection, repo_id: int) -> list[_DefRow]:
 
     def_rows = await conn.fetch(
         """
-        SELECT d.id, d.file_id, d.kind, d.name, d.qualified_name, d.scope_id,
+        SELECT d.id, d.file_version_id, d.kind, d.name, d.qualified_name, d.scope_id,
                n.start_byte, n.end_byte
         FROM definitions d
         JOIN nodes n ON n.id = d.node_id
-        JOIN files f ON f.id = d.file_id
-        WHERE f.repo_id = $1
+        JOIN branch_files bf ON bf.file_version_id = d.file_version_id
+        WHERE bf.branch_id = $1
         ORDER BY d.id
         """,
-        repo_id,
+        branch_id,
     )
     out: list[_DefRow] = []
     for r in def_rows:
-        meta = file_meta.get(r["file_id"])
+        meta = file_meta.get(r["file_version_id"])
         if meta is None:
-            # Should not happen — defs FK files — but be defensive.
             continue
         raw_content, file_path, language = meta
         out.append(
             _DefRow(
-                id=r["id"], file_id=r["file_id"], kind=r["kind"], name=r["name"],
+                id=r["id"], file_version_id=r["file_version_id"], kind=r["kind"], name=r["name"],
                 qualified_name=r["qualified_name"], scope_id=r["scope_id"],
                 start_byte=r["start_byte"], end_byte=r["end_byte"],
-                # Same Python string instance is shared by every def from this
-                # file, so memory is O(total file size), not O(defs × file size).
                 raw_content=raw_content, file_path=file_path, language=language,
             )
         )
     return out
 
 
-async def _load_call_edges(conn: asyncpg.Connection, repo_id: int) -> list[asyncpg.Record]:
+async def _load_call_edges(conn: asyncpg.Connection, branch_id: int) -> list[asyncpg.Record]:
     return await conn.fetch(
         """
         SELECT ce.caller_def_id, ce.callee_def_id, ce.callee_name, ce.confidence
         FROM call_edges ce
-        JOIN definitions caller ON caller.id = ce.caller_def_id
-        JOIN files f ON f.id = caller.file_id
-        WHERE f.repo_id = $1
+        WHERE ce.branch_id = $1
         """,
-        repo_id,
+        branch_id,
     )
 
 
-async def _load_data_access(conn: asyncpg.Connection, repo_id: int) -> list[asyncpg.Record]:
+async def _load_data_access(conn: asyncpg.Connection, branch_id: int) -> list[asyncpg.Record]:
     return await conn.fetch(
         """
         SELECT da.accessor_def_id, da.target_def_id, da.access_type
         FROM data_access da
-        JOIN definitions accessor ON accessor.id = da.accessor_def_id
-        JOIN files f ON f.id = accessor.file_id
-        WHERE f.repo_id = $1
+        WHERE da.branch_id = $1
         """,
-        repo_id,
+        branch_id,
     )
 
 
-async def _load_imports(conn: asyncpg.Connection, repo_id: int) -> dict[int, list[asyncpg.Record]]:
+async def _load_imports(conn: asyncpg.Connection, branch_id: int) -> dict[int, list[asyncpg.Record]]:
     rows = await conn.fetch(
         """
-        SELECT i.file_id, i.import_path, i.dep_class, e.package_name
+        SELECT i.file_version_id, i.import_path, i.dep_class, e.package_name
         FROM imports i
-        JOIN files f ON f.id = i.file_id
         LEFT JOIN external_dependencies e ON e.id = i.external_dep_id
-        WHERE f.repo_id = $1
+        WHERE i.branch_id = $1
         """,
-        repo_id,
+        branch_id,
     )
     out: dict[int, list[asyncpg.Record]] = {}
     for row in rows:
-        out.setdefault(row["file_id"], []).append(row)
+        out.setdefault(row["file_version_id"], []).append(row)
     return out
 
 
-async def _load_inherits_edges(conn: asyncpg.Connection, repo_id: int) -> list[asyncpg.Record]:
-    """All resolved inherits_edges for the repo, ordered by (child, ord) so
+async def _load_inherits_edges(conn: asyncpg.Connection, branch_id: int) -> list[asyncpg.Record]:
+    """Resolved inherits_edges for the branch, ordered by (child, ord) so
     direct-base lists preserve declaration order."""
     return await conn.fetch(
         """
         SELECT ie.child_def_id, ie.base_def_id, ie.ord
         FROM inherits_edges ie
-        JOIN definitions d ON d.id = ie.child_def_id
-        JOIN files f ON f.id = d.file_id
-        WHERE f.repo_id = $1 AND ie.base_def_id IS NOT NULL
+        WHERE ie.branch_id = $1 AND ie.base_def_id IS NOT NULL
         ORDER BY ie.child_def_id, ie.ord
         """,
-        repo_id,
+        branch_id,
     )
 
 
-async def _load_overrides_edges(conn: asyncpg.Connection, repo_id: int) -> list[asyncpg.Record]:
-    """All overrides_edges for the repo. Each child has at most one row
-    (the resolver picks the nearest ancestor's matching method)."""
+async def _load_overrides_edges(conn: asyncpg.Connection, branch_id: int) -> list[asyncpg.Record]:
+    """All overrides_edges for the branch."""
     return await conn.fetch(
         """
         SELECT oe.child_def_id, oe.base_def_id
         FROM overrides_edges oe
-        JOIN definitions d ON d.id = oe.child_def_id
-        JOIN files f ON f.id = d.file_id
-        WHERE f.repo_id = $1
+        WHERE oe.branch_id = $1
         """,
-        repo_id,
+        branch_id,
     )
 
 
@@ -465,8 +440,8 @@ class _GraphIndex:
     callees_by_caller: dict[int, list[tuple[int | None, str | None, str]]]  # (callee_id, callee_name, conf)
     callers_by_callee: dict[int, list[int]]
     data_access_by_accessor: dict[int, list[tuple[int, str]]]   # (target_def_id, op)
-    defs_by_file: dict[int, list[int]]                          # file_id -> [def_id, ...]
-    imports_by_file: dict[int, list[asyncpg.Record]]
+    defs_by_file_version: dict[int, list[int]]                  # file_version_id -> [def_id, ...]
+    imports_by_file_version: dict[int, list[asyncpg.Record]]
     # Inheritance: child class def_id → ordered list of direct base class def_ids.
     bases_by_child: dict[int, list[int]]
     # Method override: child method def_id → base method def_id (one or none).
@@ -497,7 +472,7 @@ def _build_index(
         da_by.setdefault(r["accessor_def_id"], []).append((r["target_def_id"], r["access_type"]))
     by_file: dict[int, list[int]] = {}
     for d in defs:
-        by_file.setdefault(d.file_id, []).append(d.id)
+        by_file.setdefault(d.file_version_id, []).append(d.id)
     bases_by_child: dict[int, list[int]] = {}
     for r in inherits:  # already ordered by (child, ord)
         bases_by_child.setdefault(r["child_def_id"], []).append(r["base_def_id"])
@@ -513,8 +488,8 @@ def _build_index(
         callees_by_caller=callees,
         callers_by_callee=callers,
         data_access_by_accessor=da_by,
-        defs_by_file=by_file,
-        imports_by_file=imports,
+        defs_by_file_version=by_file,
+        imports_by_file_version=imports,
         bases_by_child=bases_by_child,
         override_base_by_child=override_base_by_child,
         members_by_container=members_by_container,
@@ -547,9 +522,7 @@ def _inherited_members_for(
     exclude_def_ids: set[int],
 ) -> list[_DefRow]:
     """Methods/modifiers defined on any ancestor of `container_id`, deduped by
-    name (closer ancestor wins, since BFS yields them in proximity order).
-    Excludes any def_id in `exclude_def_ids` (typically the override base
-    we're already showing as a dedicated block)."""
+    name (closer ancestor wins, since BFS yields them in proximity order)."""
     if container_id is None:
         return []
     out: list[_DefRow] = []
@@ -594,7 +567,7 @@ def _data_access_summary(idx: _GraphIndex, accessor_id: int) -> list[str]:
     return out
 
 
-def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
+def _build_function_chunk(d: _DefRow, idx: _GraphIndex, branch_id: int) -> _ChunkRow | None:
     if d.kind not in FUNCTION_KINDS:
         return None
 
@@ -628,7 +601,6 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
         parts.append("# external calls (unresolved)\n" + "\n".join(f"// external: {x}()" for x in ext))
 
     # ── Inheritance enrichment (always-include tiers) ──
-    # Override base: the specific method this one shadows.
     override_base_id = idx.override_base_by_child.get(d.id)
     override_base = idx.defs_by_id.get(override_base_id) if override_base_id else None
     if override_base is not None:
@@ -636,7 +608,6 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
             f"# overrides: {override_base.qualified_name}\n{_format_signature(override_base)}"
         )
 
-    # Inheritance chain of the enclosing container (e.g. contract → base → interface).
     container_id = d.scope_id if d.scope_id and idx.defs_by_id.get(d.scope_id) and idx.defs_by_id[d.scope_id].kind in CONTAINER_KINDS else None
     ancestor_ids = _ancestor_chain(idx, container_id)
     if container_id is not None and ancestor_ids:
@@ -673,11 +644,6 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
         return sem_header + "\n\n" + _md_preamble(metadata) + "\n\n".join(parts + extras)
 
     extras: list[str] = []
-    # Tokens of `_join(extras)` — recomputed once per phase rather than per
-    # candidate. Each phase that commits a block adds an exact recount of
-    # that block's tokens (plus one separator) to keep `extras_tokens`
-    # bounded by reality, even though intra-block packing uses the
-    # incremental approximation.
     base_tokens = count_tokens(_join())
 
     def _commit(block: str) -> None:
@@ -685,8 +651,6 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
         extras.append(block)
         base_tokens += _JOIN_TOK + count_tokens(block)
 
-    # Phase: inherited member signatures (greedy under hard_cap). Excluded:
-    # the override base (already shown as its own block above).
     inherited = _inherited_members_for(
         idx, container_id,
         exclude_def_ids={override_base_id} if override_base_id else set(),
@@ -699,8 +663,6 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
         if block is not None:
             _commit(block)
 
-    # Phase 1: signatures of certain callees. Try the whole block first;
-    # if it fits, commit it as one piece. Otherwise greedy-pack.
     if certain:
         sig_block = "# callees [certain]\n" + "\n\n".join(_format_signature(c) for c in certain)
         if base_tokens + _JOIN_TOK + count_tokens(sig_block) <= hard_cap:
@@ -713,7 +675,6 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
             if block is not None:
                 _commit(block)
 
-    # Phase 2: bodies of certain callees if budget allows.
     if certain:
         block = _greedy_pack_section(
             base_tokens, "# callee bodies [certain]",
@@ -723,7 +684,6 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
         if block is not None:
             _commit(block)
 
-    # Phase 3: signatures of inferred callees.
     if inferred:
         block = _greedy_pack_section(
             base_tokens, "# callees [inferred]",
@@ -739,7 +699,8 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
         body_only=body,
     )
     return _ChunkRow(
-        file_id=d.file_id,
+        branch_id=branch_id,
+        file_version_id=d.file_version_id,
         anchor_def_id=d.id,
         granularity=GRANULARITY_FUNCTION,
         metadata=metadata,
@@ -749,13 +710,12 @@ def _build_function_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
     )
 
 
-def _build_module_chunk(module_def: _DefRow, idx: _GraphIndex) -> _ChunkRow:
-    file_id = module_def.file_id
-    # All defs in this file (excluding the synthetic module def itself).
-    def_ids = idx.defs_by_file.get(file_id, [])
+def _build_module_chunk(module_def: _DefRow, idx: _GraphIndex, branch_id: int) -> _ChunkRow:
+    file_version_id = module_def.file_version_id
+    def_ids = idx.defs_by_file_version.get(file_version_id, [])
     children = [idx.defs_by_id[i] for i in def_ids if i != module_def.id]
 
-    imports = idx.imports_by_file.get(file_id, [])
+    imports = idx.imports_by_file_version.get(file_version_id, [])
     intra = [r["import_path"] for r in imports if r["dep_class"] == "intra_repo"]
     external = sorted({r["package_name"] or r["import_path"] for r in imports if r["dep_class"] == "external"})
     unresolved = [r["import_path"] for r in imports if r["dep_class"] == "unresolved"]
@@ -787,9 +747,6 @@ def _build_module_chunk(module_def: _DefRow, idx: _GraphIndex) -> _ChunkRow:
 
     parts.append(f"# module: {module_def.qualified_name} ({module_def.file_path})")
 
-    # Greedy include children: full body for short ones, otherwise signature.
-    # Incremental token accounting — each piece tokenized once instead of
-    # re-tokenizing the entire growing accumulator on every iteration.
     budget = TOKEN_BUDGETS[GRANULARITY_MODULE]
     base_tokens = count_tokens(_md_preamble(metadata) + "\n\n".join(parts))
     accumulated = _greedy_pack_pieces(
@@ -805,7 +762,8 @@ def _build_module_chunk(module_def: _DefRow, idx: _GraphIndex) -> _ChunkRow:
         anchor_label=module_def.qualified_name, file_path=module_def.file_path,
     )
     return _ChunkRow(
-        file_id=file_id,
+        branch_id=branch_id,
+        file_version_id=file_version_id,
         anchor_def_id=module_def.id,
         granularity=GRANULARITY_MODULE,
         metadata=metadata,
@@ -815,10 +773,9 @@ def _build_module_chunk(module_def: _DefRow, idx: _GraphIndex) -> _ChunkRow:
     )
 
 
-def _build_cross_module_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
+def _build_cross_module_chunk(d: _DefRow, idx: _GraphIndex, branch_id: int) -> _ChunkRow | None:
     if d.kind not in FUNCTION_KINDS:
         return None
-    # Walk callees up to 2 hops (BFS). Include all confidence levels.
     visited: set[int] = {d.id}
     layer1: list[_DefRow] = []
     for cid, _, _ in idx.callees_by_caller.get(d.id, []):
@@ -829,7 +786,7 @@ def _build_cross_module_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
         if cd is not None:
             layer1.append(cd)
     if not layer1:
-        return None  # no cross-module value if no resolved callees
+        return None
 
     layer2: list[_DefRow] = []
     for c in layer1:
@@ -841,7 +798,6 @@ def _build_cross_module_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
             if cd is not None:
                 layer2.append(cd)
 
-    # Shared state across the chain: union of data_access targets.
     shared_state: list[str] = []
     seen: set[int] = set()
     for accessor in [d, *layer1, *layer2]:
@@ -868,10 +824,6 @@ def _build_cross_module_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
     if deps_truncated:
         metadata["dependencies_truncated"] = deps_truncated
 
-    # Anchor identity only — the full body lives in the function-granularity
-    # chunk for the same def. Cross-module's value is the 2-hop callee graph;
-    # repeating the body here is pure token waste and crowds out callee
-    # context the function chunk doesn't carry.
     src = d.source()
     anchor_first_line = src.splitlines()[0] if src else ""
     parts: list[str] = [f"# anchor: {d.qualified_name} [{d.kind}]\n{anchor_first_line}"]
@@ -885,9 +837,6 @@ def _build_cross_module_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
         return sem_header + "\n\n" + _md_preamble(metadata) + "\n\n".join(parts + extras)
 
     extras: list[str] = []
-    # base_tokens tracks `_join(extras)` token count incrementally, so each
-    # phase pays one tokenization for its committed block instead of
-    # re-tokenizing the full accumulator per candidate.
     base_tokens = count_tokens(_join([]))
 
     def _commit(block: str) -> None:
@@ -895,7 +844,6 @@ def _build_cross_module_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
         extras.append(block)
         base_tokens += _JOIN_TOK + count_tokens(block)
 
-    # Layer 1 bodies first.
     block = _greedy_pack_section(
         base_tokens, "# callees (1 hop)",
         (_format_body(c, header=f"# callee (1 hop): {c.qualified_name}") for c in layer1),
@@ -904,7 +852,6 @@ def _build_cross_module_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
     if block is not None:
         _commit(block)
 
-    # Layer 2 signatures only (saves budget).
     if layer2:
         block = _greedy_pack_section(
             base_tokens, "# callees (2 hop)",
@@ -921,7 +868,8 @@ def _build_cross_module_chunk(d: _DefRow, idx: _GraphIndex) -> _ChunkRow | None:
         body_only=parts[0],
     )
     return _ChunkRow(
-        file_id=d.file_id,
+        branch_id=branch_id,
+        file_version_id=d.file_version_id,
         anchor_def_id=d.id,
         granularity=GRANULARITY_CROSS_MODULE,
         metadata=metadata,
@@ -950,18 +898,11 @@ class ChunkStats:
         return self.n_function + self.n_module + self.n_cross_module
 
 
-# Identifier boundary-splitter. Matches the transition lower/digit -> upper,
-# OR an ALLCAPS run followed by a Capitalized word (so `parseURL` becomes
-# `parse URL`, `URLParser` becomes `URL Parser`, `fooBar` becomes `foo Bar`).
 _CAMEL_BOUNDARY_RE = re.compile(r"([a-z\d])([A-Z])|([A-Z]+)([A-Z][a-z])")
 
 
 def _split_camel(s: str) -> str:
-    """`fooBar` → `foo Bar`; `XMLParser` → `XML Parser`. Used to fan out
-    compound identifiers into separate FTS tokens so a token query for one
-    component (e.g. `foo`) matches identifiers built from it (`fooBar`,
-    `MyFooThing`) — Postgres tsvector wouldn't normally split those into
-    multiple words."""
+    """`fooBar` → `foo Bar`; `XMLParser` → `XML Parser`."""
     return _CAMEL_BOUNDARY_RE.sub(
         lambda m: f"{m.group(1) or m.group(3)} {m.group(2) or m.group(4)}",
         s,
@@ -973,14 +914,7 @@ _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]+")
 
 def _expand_idents(text: str) -> str:
     """Append camelCase- and snake_case-split forms of every identifier-shaped
-    token in `text` to the end of the string, so `to_tsvector('english', ...)`
-    indexes both the original lexeme (`getuserbyid`) and each subtoken
-    (`get`/`user`/`by`/`id`). Without this, body identifiers like
-    `getUserById` are opaque to the english parser and a query for `user`
-    misses chunks that only mention them inside compound names.
-
-    Bounded blow-up: each identifier emits at most a few extras, so output
-    size is at most ~2× the input on identifier-dense code.
+    token so the english parser indexes both `getuserbyid` and the subtokens.
     """
     extras: list[str] = []
     for m in _IDENT_RE.finditer(text):
@@ -994,20 +928,27 @@ def _expand_idents(text: str) -> str:
 
 
 def _fts_text(qualified_name: str | None, content: str) -> str:
-    """Document text fed to `to_tsvector('english', ...)`. Includes the
-    qualified name twice — once raw (so identifier-equality queries match)
-    and once camelCase-split (so token queries match) — followed by chunk
-    content with body identifiers expanded into their subtokens, so a query
-    for `user` matches a chunk whose body contains `getUserById`."""
     qn = qualified_name or ""
     return f"{qn} {_split_camel(qn)} {_expand_idents(content)}"
 
 
 async def _upsert_chunk(conn: asyncpg.Connection, chunk: _ChunkRow) -> str:
-    """Returns 'inserted' | 'updated' | 'unchanged'."""
+    """Upsert a per-branch chunk row.
+
+    chunk_embeddings are content-keyed and shared across chunks (and
+    branches): we never delete embedding rows here. If a chunk's content
+    changed, the new content_hash either already has an embedding (reused)
+    or will be embedded by the next embedder pass. Stale embeddings are
+    reclaimed by `make gc`.
+
+    Returns 'inserted' | 'updated' | 'unchanged'.
+    """
     existing = await conn.fetchrow(
-        "SELECT id, content_hash FROM chunks WHERE anchor_def_id=$1 AND granularity=$2",
-        chunk.anchor_def_id, chunk.granularity,
+        """
+        SELECT id, content_hash FROM chunks
+        WHERE branch_id=$1 AND anchor_def_id=$2 AND granularity=$3
+        """,
+        chunk.branch_id, chunk.anchor_def_id, chunk.granularity,
     )
     if existing is not None and existing["content_hash"] == chunk.content_hash:
         return "unchanged"
@@ -1016,55 +957,59 @@ async def _upsert_chunk(conn: asyncpg.Connection, chunk: _ChunkRow) -> str:
         await conn.execute(
             """
             UPDATE chunks
-            SET file_id=$1, content=$2, token_count=$3, metadata=$4, content_hash=$5,
+            SET file_version_id=$1, content=$2, token_count=$3, metadata=$4, content_hash=$5,
                 fts_doc=to_tsvector('english', $6)
             WHERE id=$7
             """,
-            chunk.file_id, chunk.content, chunk.token_count,
+            chunk.file_version_id, chunk.content, chunk.token_count,
             json.dumps(chunk.metadata), chunk.content_hash, fts_text, existing["id"],
         )
-        # Embedding for this chunk is invalid — drop it.
-        await conn.execute("DELETE FROM chunk_embeddings WHERE chunk_id=$1", existing["id"])
         return "updated"
     await conn.execute(
         """
         INSERT INTO chunks
-            (file_id, anchor_def_id, granularity, content, token_count, metadata,
+            (branch_id, file_version_id, anchor_def_id, granularity, content, token_count, metadata,
              content_hash, fts_doc)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, to_tsvector('english', $8))
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, to_tsvector('english', $9))
         """,
-        chunk.file_id, chunk.anchor_def_id, chunk.granularity,
+        chunk.branch_id, chunk.file_version_id, chunk.anchor_def_id, chunk.granularity,
         chunk.content, chunk.token_count, json.dumps(chunk.metadata),
         chunk.content_hash, fts_text,
     )
     return "inserted"
 
 
-async def assemble_chunks(pool: asyncpg.Pool, repo_id: int) -> ChunkStats:
-    """Build all chunks at all three granularities for a repo."""
+async def assemble_chunks(pool: asyncpg.Pool, repo_id: int, branch_id: int) -> ChunkStats:
+    """Build all chunks at all three granularities for a (repo, branch).
+
+    `repo_id` is currently unused in the body — branch_id implies repo via
+    the branches table — but kept in the signature so callers can pass both
+    explicitly without a redundant lookup.
+    """
+    del repo_id  # implied by branch_id; kept in signature for caller ergonomics
     stats = ChunkStats()
     async with pool.acquire() as conn:
-        defs = await _load_defs(conn, repo_id)
-        edges = await _load_call_edges(conn, repo_id)
-        da = await _load_data_access(conn, repo_id)
-        imports = await _load_imports(conn, repo_id)
-        inherits = await _load_inherits_edges(conn, repo_id)
-        overrides = await _load_overrides_edges(conn, repo_id)
+        defs = await _load_defs(conn, branch_id)
+        edges = await _load_call_edges(conn, branch_id)
+        da = await _load_data_access(conn, branch_id)
+        imports = await _load_imports(conn, branch_id)
+        inherits = await _load_inherits_edges(conn, branch_id)
+        overrides = await _load_overrides_edges(conn, branch_id)
         idx = _build_index(defs, edges, da, imports, inherits, overrides)
 
         chunks: list[_ChunkRow] = []
         for d in defs:
             if d.kind in FUNCTION_KINDS:
-                fc = _build_function_chunk(d, idx)
+                fc = _build_function_chunk(d, idx, branch_id)
                 if fc:
                     chunks.append(fc)
                     stats.n_function += 1
-                cm = _build_cross_module_chunk(d, idx)
+                cm = _build_cross_module_chunk(d, idx, branch_id)
                 if cm:
                     chunks.append(cm)
                     stats.n_cross_module += 1
             elif d.kind == "module":
-                mc = _build_module_chunk(d, idx)
+                mc = _build_module_chunk(d, idx, branch_id)
                 chunks.append(mc)
                 stats.n_module += 1
 
@@ -1081,11 +1026,11 @@ async def assemble_chunks(pool: asyncpg.Pool, repo_id: int) -> ChunkStats:
     return stats
 
 
-def assemble_chunks_sync(repo_id: int, dsn: str | None = None) -> ChunkStats:
+def assemble_chunks_sync(repo_id: int, branch_id: int, dsn: str | None = None) -> ChunkStats:
     from db.connection import pool_ctx
 
     async def _run():
         async with pool_ctx(dsn) as pool:
-            return await assemble_chunks(pool, repo_id)
+            return await assemble_chunks(pool, repo_id, branch_id)
 
     return asyncio.run(_run())

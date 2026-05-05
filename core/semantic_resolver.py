@@ -11,9 +11,22 @@ Pipeline (Architecture §5.2 — P4 is deferred to Phase 3):
     P5 Calls               — resolve callee, tag confidence (certain/inferred/uncertain)
     P6 Data access         — function references targeting variable-kind defs
 
-The resolver re-parses each file from `files.raw_content` (cheap; tree-sitter
-parses millions of LOC/sec). DB ids are paired to ts_nodes by walking in the
-same DFS preorder used by the Tier 1 extractor.
+Branch-aware model:
+  • file_versions / nodes / definitions are content-keyed and shared across
+    branches. Tier-1 emission (definitions, intra-file scope tree) only runs
+    once per file_version, even when multiple branches index that content.
+    The first branch to resolve the file_version writes definitions; later
+    branches enter "hydrate mode" — same walk, but instead of allocating new
+    def_ids and INSERTing, look up existing def_ids from the DB and just
+    rebuild the in-memory scope tables.
+
+  • References, calls, data_access, intra-file inheritance edges are tagged
+    with branch_id and regenerated per branch (cross-file resolution depends
+    on which files are visible in the branch).
+
+The resolver re-parses each file from `file_versions.raw_content` (cheap;
+tree-sitter parses millions of LOC/sec). DB ids are paired to ts_nodes by
+walking in the same DFS preorder used by the Tier 1 extractor.
 """
 
 from __future__ import annotations
@@ -51,7 +64,7 @@ class _DefRecord:
 @dataclass
 class _RefRecord:
     db_node_id: int
-    file_id: int
+    file_version_id: int
     name: str
     confidence: str  # 'certain' | 'inferred' | 'uncertain'
     target_def_id: int | None
@@ -76,7 +89,7 @@ class _DataAccessRecord:
 
 @dataclass
 class ResolveFileResult:
-    file_id: int
+    file_version_id: int
     language: str
     n_definitions: int
     n_references: int
@@ -506,81 +519,93 @@ def _extract_bases(ts_node, cfg) -> list[str]:
 # ────────────────────────────────────────────────────────────────────
 
 
-async def _clear_semantic_for_file(conn: asyncpg.Connection, file_id: int) -> None:
-    """Idempotency: drop any prior Tier 2 rows tied to this file.
+async def _clear_branch_semantic_for_file_version(
+    conn: asyncpg.Connection,
+    branch_id: int,
+    file_version_id: int,
+) -> None:
+    """Idempotency: drop any prior branch-scoped Tier 2 rows tied to this
+    (branch, file_version). Critically, this NEVER deletes definitions,
+    nodes, chunks, or any content-derived table — those are shared across
+    branches and only `make gc` reclaims them when truly unreferenced.
 
-    All six statements ship in a single multi-statement command (asyncpg's
-    simple-query protocol, used when no parameters are bound). Postgres still
-    processes them in order, so the `UPDATE definitions SET scope_id=NULL`
-    sequences correctly before the self-FK-bearing `DELETE FROM definitions`.
-
-    `file_id` is interpolated rather than parameterized because the extended
-    query protocol that handles `$1` only supports a single statement per
-    call. file_id is always an int from a DB fetch; the explicit `int(...)`
-    cast makes injection-safety obvious.
-
-    Note: inherits_edges and overrides_edges cascade off definitions(id), so
-    deleting definitions also drops them — no explicit DELETE needed here.
+    Uses the simple-query protocol (no parameters) so all six statements
+    run in order. branch_id and file_version_id are interpolated as ints.
     """
-    fid = int(file_id)
+    bid = int(branch_id)
+    fvid = int(file_version_id)
     await conn.execute(f"""
         DELETE FROM call_edges
-          WHERE callsite_node_id IN (SELECT id FROM nodes WHERE file_id={fid});
-        DELETE FROM call_edges
-          WHERE caller_def_id IN (SELECT id FROM definitions WHERE file_id={fid})
-             OR callee_def_id IN (SELECT id FROM definitions WHERE file_id={fid});
+          WHERE branch_id={bid}
+            AND callsite_node_id IN (SELECT id FROM nodes WHERE file_version_id={fvid});
         DELETE FROM data_access
-          WHERE accessor_def_id IN (SELECT id FROM definitions WHERE file_id={fid})
-             OR target_def_id  IN (SELECT id FROM definitions WHERE file_id={fid});
-        DELETE FROM "references" WHERE file_id={fid};
-        UPDATE definitions SET scope_id=NULL
-          WHERE scope_id IN (SELECT id FROM definitions WHERE file_id={fid});
-        DELETE FROM definitions WHERE file_id={fid};
+          WHERE branch_id={bid}
+            AND accessor_def_id IN (SELECT id FROM definitions WHERE file_version_id={fvid});
+        DELETE FROM "references" WHERE branch_id={bid} AND file_version_id={fvid};
+        DELETE FROM overrides_edges
+          WHERE branch_id={bid}
+            AND child_def_id IN (SELECT id FROM definitions WHERE file_version_id={fvid});
+        DELETE FROM inherits_edges
+          WHERE branch_id={bid}
+            AND child_def_id IN (SELECT id FROM definitions WHERE file_version_id={fvid});
+        DELETE FROM imports WHERE branch_id={bid} AND file_version_id={fvid};
     """)
 
 
 async def resolve_file(
     conn: asyncpg.Connection,
-    file_id: int,
+    branch_id: int,
+    file_version_id: int,
+    rel_path: str,
     config: LanguageConfig,
 ) -> ResolveFileResult:
+    """Run Tier-2 resolution for one (branch, file_version) pair.
+
+    Tier-1 outputs (definitions, intra-file scope tables) are content-derived,
+    so when this file_version was already resolved by another branch the
+    function enters "hydrate mode": it walks the AST exactly as before but
+    looks up each existing def_id from the DB instead of allocating a new
+    one. Tier-2 outputs (refs, calls, data_access, intra-file inheritance)
+    are always emitted, tagged with branch_id, after the per-(branch,
+    file_version) clear has removed any stale rows.
+    """
     row = await conn.fetchrow(
-        "SELECT path, language, raw_content FROM files WHERE id=$1",
-        file_id,
+        "SELECT language, raw_content FROM file_versions WHERE id=$1",
+        file_version_id,
     )
     if row is None:
-        raise ValueError(f"file_id {file_id} not found")
+        raise ValueError(f"file_version_id {file_version_id} not found")
     if row["language"] != config.language:
         raise ValueError(
             f"file language={row['language']} but config language={config.language}"
         )
 
     source = (row["raw_content"] or "").encode("utf-8")
-    parser = LANGUAGES[config.language].parser(PurePosixPath(row["path"]).suffix.lower())
+    parser = LANGUAGES[config.language].parser(PurePosixPath(rel_path).suffix.lower())
     tree = parser.parse(source)
 
     # Pair ts_nodes to DB ids (same DFS preorder as Tier 1).
     ts_walk: list = list(_dfs(tree.root_node))
     db_ids = await conn.fetch(
-        "SELECT id FROM nodes WHERE file_id=$1 ORDER BY id",
-        file_id,
+        "SELECT id FROM nodes WHERE file_version_id=$1 ORDER BY id",
+        file_version_id,
     )
     if len(ts_walk) != len(db_ids):
         raise RuntimeError(
-            f"CST size mismatch for file_id={file_id}: "
+            f"CST size mismatch for file_version_id={file_version_id}: "
             f"reparse produced {len(ts_walk)} nodes, DB has {len(db_ids)}"
         )
     db_id_for: dict[int, int] = {ts.id: db_ids[i]["id"] for i, ts in enumerate(ts_walk)}
 
-    await _clear_semantic_for_file(conn, file_id)
+    await _clear_branch_semantic_for_file_version(conn, branch_id, file_version_id)
 
     # Rust-only: drop integration-test files (`tests/`, `benches/`,
     # `examples/`) from semantic emission entirely — these are separate
     # compilation units and their bodies are noise for retrieval. Inline
     # `#[cfg(test)] mod tests { … }` blocks are filtered per-node below.
-    if config.language == "rust" and _is_rust_test_path(row["path"]):
+    if config.language == "rust" and _is_rust_test_path(rel_path):
         return ResolveFileResult(
-            file_id=file_id, language=config.language,
+            file_version_id=file_version_id, language=config.language,
             n_definitions=0, n_references=0,
             n_call_edges=0, n_data_access=0,
         )
@@ -594,43 +619,237 @@ async def resolve_file(
         else frozenset()
     )
 
+    # Hydrate mode: when another branch already resolved this file_version,
+    # definitions and nodes are already in the DB. We rebuild the in-memory
+    # scope tables from the existing rows instead of inserting new ones.
+    hydrate_mode = await conn.fetchval(
+        "SELECT 1 FROM definitions WHERE file_version_id=$1 LIMIT 1",
+        file_version_id,
+    )
+    hydrate_mode = bool(hydrate_mode)
+
     # ── P1: definitions (synthetic module + matched rules) ──
-    #
-    # Performance: we reserve a contiguous block of definition IDs from the
-    # sequence and PREDICT each new def's id as we walk, instead of doing
-    # `INSERT … RETURNING id` per row. All in-memory lookup tables
-    # (scope_def_id_by_ts, def_meta_by_id, etc.) are populated with the
-    # predicted ids, which are guaranteed to match the rows we batch-insert
-    # at the end. A safe upper bound on the count is `len(ts_walk) + 1`
-    # (one def per ts_node plus the synthetic module). Wasted ids inside the
-    # reserved block become harmless sequence gaps.
     def_rules = {r.node_type: r for r in config.definitions}
 
-    reserved_first = await reserve_definition_ids(conn, len(ts_walk) + 1)
-    next_def_id = reserved_first
-
-    # Module / source_file root definition.
-    module_db_node_id = db_id_for[tree.root_node.id]
-    module_name = _module_name(row["path"])
-    module_def_id = next_def_id
-    next_def_id += 1
-
-    # Pending def rows. Each tuple matches the INSERT column order at the
-    # bottom of P1; one batched UNNEST flushes them all.
-    pending_defs: list[tuple[int, int, int, str, str, str, int | None, str | None]] = [
-        (module_def_id, module_db_node_id, file_id, "module", module_name, module_name, None, None),
-    ]
-
-    # ts_node.id → def_id (only for scope-owning nodes: module + scope_boundary defs).
-    scope_def_id_by_ts: dict[int, int] = {tree.root_node.id: module_def_id}
-    # def_id → kind (used for require_enclosing_scope_kind checks).
-    def_kind_by_id: dict[int, str] = {module_def_id: "module"}
-    # def_id → (name, scope_id) (used for qualified_name walk).
-    def_meta_by_id: dict[int, tuple[str, int | None]] = {module_def_id: (module_name, None)}
-    # (scope_def_id, name) → def_id (scope-chain lookup index).
+    # In-memory scope tables — populated below either by walking + emitting
+    # (cold path) or by querying the DB (hydrate path).
+    pending_defs: list[tuple[int, int, int, str, str, str, int | None, str | None]] = []
+    scope_def_id_by_ts: dict[int, int] = {}
+    def_kind_by_id: dict[int, str] = {}
+    def_meta_by_id: dict[int, tuple[str, int | None]] = {}
     defs_by_scope_and_name: dict[tuple[int, str], int] = {}
-    # Every def_id in this file (used by Phase 6).
-    file_def_ids: list[int] = [module_def_id]
+    file_def_ids: list[int] = []
+    module_def_id: int
+
+    if hydrate_mode:
+        # Load existing defs and reconstruct in-memory state.
+        existing_defs = await conn.fetch(
+            """
+            SELECT id, node_id, name, qualified_name, kind, scope_id
+            FROM definitions
+            WHERE file_version_id=$1
+            """,
+            file_version_id,
+        )
+        # Reverse map: db_node_id → ts.id, used to populate scope_def_id_by_ts.
+        ts_id_for_db = {db_id: ts_id for ts_id, db_id in db_id_for.items()}
+        # Scope-ownership is a property of the def's *rule* (`scope_boundary`)
+        # plus the module def itself, NOT a property of whether the def
+        # happens to have children referenced as scope_id. We derive it from
+        # the language config — the same source of truth P1 uses on the cold
+        # path. Without this, function-kind defs with no nested children
+        # would be missing from scope_def_id_by_ts and P5's enclosing-scope
+        # walk would attribute calls to the enclosing class/module instead of
+        # the function.
+        scope_boundary_kinds = {r.kind for r in config.definitions if r.scope_boundary}
+        for d in existing_defs:
+            if d["kind"] == "module":
+                module_def_id = d["id"]
+        for d in existing_defs:
+            def_kind_by_id[d["id"]] = d["kind"]
+            def_meta_by_id[d["id"]] = (d["name"], d["scope_id"])
+            if d["scope_id"] is not None:
+                defs_by_scope_and_name[(d["scope_id"], d["name"])] = d["id"]
+            file_def_ids.append(d["id"])
+            is_scope_owner = d["kind"] == "module" or d["kind"] in scope_boundary_kinds
+            if is_scope_owner:
+                ts_id = ts_id_for_db.get(d["node_id"])
+                if ts_id is not None:
+                    scope_def_id_by_ts[ts_id] = d["id"]
+    else:
+        # Cold path: walk + emit.
+        #
+        # Performance: we reserve a contiguous block of definition IDs from the
+        # sequence and PREDICT each new def's id as we walk, instead of doing
+        # `INSERT … RETURNING id` per row. All in-memory lookup tables
+        # (scope_def_id_by_ts, def_meta_by_id, etc.) are populated with the
+        # predicted ids, which are guaranteed to match the rows we batch-insert
+        # at the end. A safe upper bound on the count is `len(ts_walk) + 1`
+        # (one def per ts_node plus the synthetic module). Wasted ids inside the
+        # reserved block become harmless sequence gaps.
+        reserved_first = await reserve_definition_ids(conn, len(ts_walk) + 1)
+        next_def_id = reserved_first
+
+        # Module / source_file root definition.
+        module_db_node_id = db_id_for[tree.root_node.id]
+        module_name = _module_name(rel_path)
+        module_def_id = next_def_id
+        next_def_id += 1
+
+        pending_defs.append(
+            (module_def_id, module_db_node_id, file_version_id, "module", module_name, module_name, None, None),
+        )
+        scope_def_id_by_ts[tree.root_node.id] = module_def_id
+        def_kind_by_id[module_def_id] = "module"
+        def_meta_by_id[module_def_id] = (module_name, None)
+        file_def_ids.append(module_def_id)
+
+        def _enclosing_scope_def_id_cold(ts_node) -> int | None:
+            cur = ts_node.parent
+            while cur is not None:
+                db_did = scope_def_id_by_ts.get(cur.id)
+                if db_did is not None:
+                    return db_did
+                cur = cur.parent
+            return scope_def_id_by_ts.get(tree.root_node.id)
+
+        # Walk in DFS preorder; an enclosing scope's def_id is always set before
+        # children are processed, so scope_id resolution is straightforward.
+        for ts in ts_walk:
+            if ts.id in test_skip_ts_ids:
+                continue
+            rule = def_rules.get(ts.type)
+            if rule is None:
+                continue
+            scope_id = _enclosing_scope_def_id_cold(ts)
+            if rule.require_enclosing_scope_kind:
+                allowed = set(rule.require_enclosing_scope_kind)
+                scope_kind = def_kind_by_id.get(scope_id) if scope_id is not None else None
+                if scope_kind not in allowed:
+                    continue
+
+            # One def node usually emits one definition row, but Go's `var a, b int`
+            # / `const x, y = …` is a single var_spec/const_spec with multiple
+            # identifier children in the `name` field. `definitions.node_id` is
+            # UNIQUE, so each name gets its own identifier-child node_id rather
+            # than reusing the spec's.
+            named_targets: list[tuple[str, int]] = []  # (name, db_node_id)
+            if rule.name_field_multiple and rule.name_field is not None:
+                for i in range(ts.child_count):
+                    if ts.field_name_for_child(i) != rule.name_field:
+                        continue
+                    child = ts.children[i]
+                    if child.type in ("identifier", "type_identifier", "field_identifier"):
+                        named_targets.append((_text(child), db_id_for[child.id]))
+            else:
+                if rule.name_field is not None or ts.type == "constructor_definition":
+                    name = _extract_name_from_field(ts, rule.name_field)
+                else:
+                    name = None
+                if name is None and rule.kind == "constructor":
+                    # Constructors carry their contract's name implicitly.
+                    owner = def_meta_by_id.get(scope_id) if scope_id is not None else None
+                    name = owner[0] if owner else "constructor"
+                if name is not None:
+                    named_targets.append((name, db_id_for[ts.id]))
+            if not named_targets:
+                continue
+
+            # qualified_name prefix from a field on the def node — Go method
+            # receivers: `func (d *Dog) Bark()` → segment `Dog` inserted before
+            # the method name so qualified_name becomes `<file>.Dog.Bark`.
+            prefix_segment: str | None = None
+            if rule.qualified_name_prefix_from_field:
+                field_node = ts.child_by_field_name(rule.qualified_name_prefix_from_field)
+                if field_node is not None:
+                    stack = [field_node]
+                    while stack:
+                        n = stack.pop()
+                        if n.type == "type_identifier":
+                            prefix_segment = _text(n)
+                            break
+                        for i in range(n.child_count - 1, -1, -1):
+                            stack.append(n.children[i])
+
+            # Rust-specific: a `function_item` whose AST grandparent is an
+            # `impl_item` is a method; prefix its qualified_name with the impl's
+            # target type (`Counter::new`). impl_item is intentionally not a
+            # definition of its own — see configs/rust.yaml — so the prefix has
+            # to come from the AST, not the scope chain.
+            if (
+                config.language == "rust"
+                and prefix_segment is None
+                and ts.type == "function_item"
+            ):
+                parent = ts.parent
+                if parent is not None and parent.type == "declaration_list":
+                    gp = parent.parent
+                    if gp is not None and gp.type == "impl_item":
+                        type_field = gp.child_by_field_name("type")
+                        if type_field is not None:
+                            prefix_segment = _terminal_identifier(type_field)
+
+            visibility: str | None = None
+            if rule.visibility_field:
+                vnode = ts.child_by_field_name(rule.visibility_field)
+                if vnode is None:
+                    for child in ts.children:
+                        if child.type == rule.visibility_field:
+                            vnode = child
+                            break
+                if vnode is not None:
+                    visibility = _text(vnode)
+
+            for name, name_node_id in named_targets:
+                # Build qualified name by walking up scope chain via def_meta_by_id.
+                parts = [name]
+                if prefix_segment is not None:
+                    parts.append(prefix_segment)
+                cur = scope_id
+                while cur is not None:
+                    parent_name, parent_scope = def_meta_by_id[cur]
+                    parts.append(parent_name)
+                    cur = parent_scope
+                qualified_name = ".".join(reversed(parts))
+
+                new_def_id = next_def_id
+                next_def_id += 1
+                pending_defs.append((
+                    new_def_id, name_node_id, file_version_id, rule.kind, name, qualified_name,
+                    scope_id, visibility,
+                ))
+                def_kind_by_id[new_def_id] = rule.kind
+                def_meta_by_id[new_def_id] = (name, scope_id)
+                if scope_id is not None:
+                    defs_by_scope_and_name[(scope_id, name)] = new_def_id
+                if rule.scope_boundary:
+                    # Multi-name + scope_boundary doesn't make sense; `var_spec` and
+                    # `const_spec` have scope_boundary=False so this maps cleanly to
+                    # the single-name case where ts.id is the spec node.
+                    scope_def_id_by_ts[ts.id] = new_def_id
+                file_def_ids.append(new_def_id)
+
+        # Flush all definitions for this file in a single round-trip. The UNNEST
+        # arrays must align with the column list and tuple shape used above.
+        if pending_defs:
+            await conn.execute(
+                """
+                INSERT INTO definitions
+                    (id, node_id, file_version_id, kind, name, qualified_name, scope_id, visibility)
+                SELECT * FROM UNNEST(
+                    $1::bigint[], $2::bigint[], $3::bigint[], $4::text[],
+                    $5::text[],   $6::text[],   $7::bigint[], $8::text[]
+                )
+                """,
+                [d[0] for d in pending_defs],
+                [d[1] for d in pending_defs],
+                [d[2] for d in pending_defs],
+                [d[3] for d in pending_defs],
+                [d[4] for d in pending_defs],
+                [d[5] for d in pending_defs],
+                [d[6] for d in pending_defs],
+                [d[7] for d in pending_defs],
+            )
 
     def _enclosing_scope_def_id(ts_node) -> int | None:
         cur = ts_node.parent
@@ -641,145 +860,7 @@ async def resolve_file(
             cur = cur.parent
         return scope_def_id_by_ts.get(tree.root_node.id)
 
-    # Walk in DFS preorder; an enclosing scope's def_id is always set before
-    # children are processed, so scope_id resolution is straightforward.
-    for ts in ts_walk:
-        if ts.id in test_skip_ts_ids:
-            continue
-        rule = def_rules.get(ts.type)
-        if rule is None:
-            continue
-        scope_id = _enclosing_scope_def_id(ts)
-        if rule.require_enclosing_scope_kind:
-            allowed = set(rule.require_enclosing_scope_kind)
-            scope_kind = def_kind_by_id.get(scope_id) if scope_id is not None else None
-            if scope_kind not in allowed:
-                continue
-
-        # One def node usually emits one definition row, but Go's `var a, b int`
-        # / `const x, y = …` is a single var_spec/const_spec with multiple
-        # identifier children in the `name` field. `definitions.node_id` is
-        # UNIQUE, so each name gets its own identifier-child node_id rather
-        # than reusing the spec's.
-        named_targets: list[tuple[str, int]] = []  # (name, db_node_id)
-        if rule.name_field_multiple and rule.name_field is not None:
-            for i in range(ts.child_count):
-                if ts.field_name_for_child(i) != rule.name_field:
-                    continue
-                child = ts.children[i]
-                if child.type in ("identifier", "type_identifier", "field_identifier"):
-                    named_targets.append((_text(child), db_id_for[child.id]))
-        else:
-            if rule.name_field is not None or ts.type == "constructor_definition":
-                name = _extract_name_from_field(ts, rule.name_field)
-            else:
-                name = None
-            if name is None and rule.kind == "constructor":
-                # Constructors carry their contract's name implicitly.
-                owner = def_meta_by_id.get(scope_id) if scope_id is not None else None
-                name = owner[0] if owner else "constructor"
-            if name is not None:
-                named_targets.append((name, db_id_for[ts.id]))
-        if not named_targets:
-            continue
-
-        # qualified_name prefix from a field on the def node — Go method
-        # receivers: `func (d *Dog) Bark()` → segment `Dog` inserted before
-        # the method name so qualified_name becomes `<file>.Dog.Bark`.
-        prefix_segment: str | None = None
-        if rule.qualified_name_prefix_from_field:
-            field_node = ts.child_by_field_name(rule.qualified_name_prefix_from_field)
-            if field_node is not None:
-                stack = [field_node]
-                while stack:
-                    n = stack.pop()
-                    if n.type == "type_identifier":
-                        prefix_segment = _text(n)
-                        break
-                    for i in range(n.child_count - 1, -1, -1):
-                        stack.append(n.children[i])
-
-        # Rust-specific: a `function_item` whose AST grandparent is an
-        # `impl_item` is a method; prefix its qualified_name with the impl's
-        # target type (`Counter::new`). impl_item is intentionally not a
-        # definition of its own — see configs/rust.yaml — so the prefix has
-        # to come from the AST, not the scope chain.
-        if (
-            config.language == "rust"
-            and prefix_segment is None
-            and ts.type == "function_item"
-        ):
-            parent = ts.parent
-            if parent is not None and parent.type == "declaration_list":
-                gp = parent.parent
-                if gp is not None and gp.type == "impl_item":
-                    type_field = gp.child_by_field_name("type")
-                    if type_field is not None:
-                        prefix_segment = _terminal_identifier(type_field)
-
-        visibility: str | None = None
-        if rule.visibility_field:
-            vnode = ts.child_by_field_name(rule.visibility_field)
-            if vnode is None:
-                for child in ts.children:
-                    if child.type == rule.visibility_field:
-                        vnode = child
-                        break
-            if vnode is not None:
-                visibility = _text(vnode)
-
-        for name, name_node_id in named_targets:
-            # Build qualified name by walking up scope chain via def_meta_by_id.
-            parts = [name]
-            if prefix_segment is not None:
-                parts.append(prefix_segment)
-            cur = scope_id
-            while cur is not None:
-                parent_name, parent_scope = def_meta_by_id[cur]
-                parts.append(parent_name)
-                cur = parent_scope
-            qualified_name = ".".join(reversed(parts))
-
-            new_def_id = next_def_id
-            next_def_id += 1
-            pending_defs.append((
-                new_def_id, name_node_id, file_id, rule.kind, name, qualified_name,
-                scope_id, visibility,
-            ))
-            def_kind_by_id[new_def_id] = rule.kind
-            def_meta_by_id[new_def_id] = (name, scope_id)
-            if scope_id is not None:
-                defs_by_scope_and_name[(scope_id, name)] = new_def_id
-            if rule.scope_boundary:
-                # Multi-name + scope_boundary doesn't make sense; `var_spec` and
-                # `const_spec` have scope_boundary=False so this maps cleanly to
-                # the single-name case where ts.id is the spec node.
-                scope_def_id_by_ts[ts.id] = new_def_id
-            file_def_ids.append(new_def_id)
-
-    # Flush all definitions for this file in a single round-trip. The UNNEST
-    # arrays must align with the column list and tuple shape used above.
-    if pending_defs:
-        await conn.execute(
-            """
-            INSERT INTO definitions
-                (id, node_id, file_id, kind, name, qualified_name, scope_id, visibility)
-            SELECT * FROM UNNEST(
-                $1::bigint[], $2::bigint[], $3::bigint[], $4::text[],
-                $5::text[],   $6::text[],   $7::bigint[], $8::text[]
-            )
-            """,
-            [d[0] for d in pending_defs],
-            [d[1] for d in pending_defs],
-            [d[2] for d in pending_defs],
-            [d[3] for d in pending_defs],
-            [d[4] for d in pending_defs],
-            [d[5] for d in pending_defs],
-            [d[6] for d in pending_defs],
-            [d[7] for d in pending_defs],
-        )
-
-    # ── P2.5: inheritance edges (intra-file resolution) ──
+    # ── P2.5: inheritance edges (intra-file resolution; per-branch row) ──
     # `config.inheritance` is a tuple of rules. A single parent node may match
     # more than one rule (Go: `type_spec` is the parent for both interface
     # embedding and struct embedding). Bases from each rule are concatenated
@@ -870,10 +951,10 @@ async def resolve_file(
     if inh_records:
         await conn.executemany(
             """
-            INSERT INTO inherits_edges (child_def_id, base_name, ord, base_def_id, confidence)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO inherits_edges (branch_id, child_def_id, base_name, ord, base_def_id, confidence)
+            VALUES ($1, $2, $3, $4, $5, $6)
             """,
-            inh_records,
+            [(branch_id, *t) for t in inh_records],
         )
 
     # ── P3 + P5 + P6: references, calls, data_access ──
@@ -941,7 +1022,7 @@ async def resolve_file(
         ref_records.append(
             _RefRecord(
                 db_node_id=db_id_for[ts.id],
-                file_id=file_id,
+                file_version_id=file_version_id,
                 name=name,
                 confidence=rule.confidence,
                 target_def_id=target,
@@ -950,21 +1031,19 @@ async def resolve_file(
         ref_ts_for.append(ts)
 
     # Insert references; we need ids back for data_access rows.
-    ref_ids: list[int] = []
     if ref_records:
-        ref_rows = await conn.fetch(
+        await conn.execute(
             """
-            INSERT INTO "references" (node_id, file_id, name, target_def_id, resolution_confidence)
-            SELECT * FROM UNNEST($1::bigint[], $2::bigint[], $3::text[], $4::bigint[], $5::float[])
-            RETURNING id
+            INSERT INTO "references" (branch_id, node_id, file_version_id, name, target_def_id, resolution_confidence)
+            SELECT $1, * FROM UNNEST($2::bigint[], $3::bigint[], $4::text[], $5::bigint[], $6::float[])
             """,
+            branch_id,
             [r.db_node_id for r in ref_records],
-            [r.file_id for r in ref_records],
+            [r.file_version_id for r in ref_records],
             [r.name for r in ref_records],
             [r.target_def_id for r in ref_records],
             [_confidence_score(r.confidence) for r in ref_records],
         )
-        ref_ids = [r["id"] for r in ref_rows]
 
     # ── P5: call edges ──
     call_records: list[_CallRecord] = []
@@ -1016,11 +1095,11 @@ async def resolve_file(
     if call_records:
         await conn.executemany(
             """
-            INSERT INTO call_edges (callsite_node_id, caller_def_id, callee_def_id, callee_name, confidence)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO call_edges (branch_id, callsite_node_id, caller_def_id, callee_def_id, callee_name, confidence)
+            VALUES ($1, $2, $3, $4, $5, $6)
             """,
             [
-                (r.callsite_db_node_id, r.caller_def_id, r.callee_def_id, r.callee_name, r.confidence)
+                (branch_id, r.callsite_db_node_id, r.caller_def_id, r.callee_def_id, r.callee_name, r.confidence)
                 for r in call_records
             ],
         )
@@ -1056,14 +1135,14 @@ async def resolve_file(
     if da_records:
         await conn.executemany(
             """
-            INSERT INTO data_access (accessor_def_id, target_def_id, access_type, node_id)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO data_access (branch_id, accessor_def_id, target_def_id, access_type, node_id)
+            VALUES ($1, $2, $3, $4, $5)
             """,
-            [(r.accessor_def_id, r.target_def_id, r.access_type, r.db_node_id) for r in da_records],
+            [(branch_id, r.accessor_def_id, r.target_def_id, r.access_type, r.db_node_id) for r in da_records],
         )
 
     return ResolveFileResult(
-        file_id=file_id,
+        file_version_id=file_version_id,
         language=config.language,
         n_definitions=len(file_def_ids),
         n_references=len(ref_records),
@@ -1085,25 +1164,39 @@ def _confidence_score(level: str) -> float:
 async def resolve_repo(
     pool: asyncpg.Pool,
     repo_id: int,
+    branch_id: int,
     *,
-    only_file_ids: list[int] | None = None,
+    only_file_version_ids: list[int] | None = None,
 ) -> list[ResolveFileResult]:
-    """Run the resolver on every file in `repo_id` whose language has a YAML config.
+    """Run the resolver on every (path, file_version) mapped by branch_id
+    whose language has a YAML config.
 
-    `only_file_ids` restricts to a subset (used by the indexer to skip files
-    whose CST didn't change).
+    `only_file_version_ids` restricts to a subset (used by the indexer to skip
+    files whose CST didn't change).
     """
     async with pool.acquire() as conn:
-        if only_file_ids is None:
+        if only_file_version_ids is None:
             rows = await conn.fetch(
-                "SELECT id, language FROM files WHERE repo_id=$1 ORDER BY id",
-                repo_id,
+                """
+                SELECT bf.path, fv.id AS file_version_id, fv.language
+                FROM branch_files bf
+                JOIN file_versions fv ON fv.id = bf.file_version_id
+                WHERE bf.branch_id = $1
+                ORDER BY fv.id
+                """,
+                branch_id,
             )
         else:
             rows = await conn.fetch(
-                "SELECT id, language FROM files WHERE repo_id=$1 AND id = ANY($2::bigint[]) ORDER BY id",
-                repo_id,
-                only_file_ids,
+                """
+                SELECT bf.path, fv.id AS file_version_id, fv.language
+                FROM branch_files bf
+                JOIN file_versions fv ON fv.id = bf.file_version_id
+                WHERE bf.branch_id = $1 AND fv.id = ANY($2::bigint[])
+                ORDER BY fv.id
+                """,
+                branch_id,
+                only_file_version_ids,
             )
 
     configs: dict[str, LanguageConfig] = {}
@@ -1118,15 +1211,19 @@ async def resolve_repo(
                     continue
             cfg = configs[lang]
             async with conn.transaction():
-                results.append(await resolve_file(conn, row["id"], cfg))
+                results.append(
+                    await resolve_file(conn, branch_id, row["file_version_id"], row["path"], cfg)
+                )
     return results
 
 
-def resolve_repo_sync(repo_id: int, dsn: str | None = None) -> list[ResolveFileResult]:
+def resolve_repo_sync(
+    repo_id: int, branch_id: int, dsn: str | None = None,
+) -> list[ResolveFileResult]:
     from db.connection import pool_ctx
 
     async def _run():
         async with pool_ctx(dsn) as pool:
-            return await resolve_repo(pool, repo_id)
+            return await resolve_repo(pool, repo_id, branch_id)
 
     return asyncio.run(_run())

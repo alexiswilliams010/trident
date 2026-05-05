@@ -8,9 +8,11 @@ OpenAI-compat endpoint, OpenAI itself) can be slotted in:
     EMBEDDING_MODEL      e.g. text-embedding-3-large, voyage-code-3, nomic-embed-code
     EMBEDDING_DIM        defaults to 1024 (matches schema vector(1024))
 
-For models with native dim != 1024, the gateway/SDK is expected to truncate
-or project to 1024 (OpenAI v3 supports `dimensions=1024`; Voyage code 3 is
-natively 1024).
+Branch model: `chunk_embeddings` is keyed by chunk content_hash. Two
+chunks (across branches) with byte-identical content share one embedding
+row. When indexing a feature branch whose content is mostly identical to
+main, the SELECT below finds existing embeddings and the API call count
+drops to zero for the unchanged chunks.
 """
 
 from __future__ import annotations
@@ -104,13 +106,6 @@ class EmbedStats:
 
 
 # Outer ceiling that filters chunks before sending to the embedder gateway.
-# Sized to comfortably exceed our per-granularity `HARD_OUTPUT_CAP` (largest
-# is cross-module at 8000) while staying under typical model context windows
-# (qwen3-embedding-8b: 32k, OpenAI v3: 8191, Voyage: 32k). Chunks above this
-# are skipped rather than failing the whole run; in practice they come from
-# vendored minified bundles or pathological generated code that has no
-# semantic value to index anyway. Override via `EMBEDDING_MAX_INPUT_TOKENS`
-# for models with smaller context (e.g. OpenAI v3 at 8191).
 DEFAULT_MAX_INPUT_TOKENS = int(os.environ.get("EMBEDDING_MAX_INPUT_TOKENS", "16000"))
 
 
@@ -119,9 +114,9 @@ def _vector_literal(values: list[float]) -> str:
     return "[" + ",".join(f"{v:.7g}" for v in values) + "]"
 
 
-async def embed_repo_chunks(
+async def embed_branch_chunks(
     pool: asyncpg.Pool,
-    repo_id: int,
+    branch_id: int,
     embed_fn: EmbedFn,
     model_name: str,
     *,
@@ -129,28 +124,36 @@ async def embed_repo_chunks(
     batch_size: int = 64,
     max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS,
 ) -> EmbedStats:
-    """Embed every chunk in `repo_id` that doesn't already have an embedding.
+    """Embed every chunk in `branch_id` whose content_hash isn't yet in
+    chunk_embeddings.
+
+    `chunk_embeddings` is keyed by content_hash (not chunk_id), so two
+    chunks with the same content text — typical across branches that share
+    most files — produce a single embedding row. Re-running this on a
+    feature branch identical to main yields zero API calls.
 
     `embed_fn(texts) -> vectors` is the abstraction; production passes
     `OpenAICompatibleEmbedder(...).embed`, tests pass a deterministic stub.
 
     Chunks whose `token_count` exceeds `max_input_tokens` are skipped rather
     than sent to the gateway: most embedding endpoints reject inputs above
-    their context window with HTTP 422, which would otherwise abort the
-    whole run. Skipped chunks are reported on `EmbedStats.skipped_oversize`.
+    their context window with HTTP 422.
     """
     stats = EmbedStats()
     async with pool.acquire() as conn:
+        # DISTINCT ON content_hash so each unique chunk text is embedded once
+        # even if multiple chunks in this branch share it (rare — typically
+        # only the trivial-empty case — but easy to handle).
         rows = await conn.fetch(
             """
-            SELECT c.id, c.content, c.token_count
+            SELECT DISTINCT ON (c.content_hash)
+                   c.id, c.content, c.token_count, c.content_hash
             FROM chunks c
-            JOIN files f ON f.id = c.file_id
-            LEFT JOIN chunk_embeddings ce ON ce.chunk_id = c.id
-            WHERE f.repo_id = $1 AND ce.id IS NULL
-            ORDER BY c.id
+            LEFT JOIN chunk_embeddings ce ON ce.content_hash = c.content_hash
+            WHERE c.branch_id = $1 AND ce.id IS NULL
+            ORDER BY c.content_hash, c.id
             """,
-            repo_id,
+            branch_id,
         )
         stats.chunks_seen = len(rows)
         if not rows:
@@ -188,18 +191,25 @@ async def embed_repo_chunks(
                     raise RuntimeError(
                         f"embedding dim mismatch: got {len(vec)}, expected {dim} (chunk {r['id']})"
                     )
-                insert_rows.append((r["id"], _vector_literal(vec), model_name))
+                insert_rows.append((r["content_hash"], _vector_literal(vec), model_name))
             await conn.executemany(
-                "INSERT INTO chunk_embeddings (chunk_id, embedding, model_name) "
-                "VALUES ($1, $2::vector, $3)",
+                """
+                INSERT INTO chunk_embeddings (content_hash, embedding, model_name)
+                VALUES ($1, $2::vector, $3)
+                ON CONFLICT (content_hash) DO NOTHING
+                """,
                 insert_rows,
             )
             stats.embedded += len(batch)
     return stats
 
 
-def embed_repo_sync(
-    repo_id: int,
+# Backwards-compatible alias for the old name.
+embed_repo_chunks = embed_branch_chunks
+
+
+def embed_branch_sync(
+    branch_id: int,
     embed_fn: EmbedFn,
     model_name: str,
     *,
@@ -210,9 +220,13 @@ def embed_repo_sync(
 
     async def _run():
         async with pool_ctx(dsn) as pool:
-            return await embed_repo_chunks(pool, repo_id, embed_fn, model_name, dim=dim)
+            return await embed_branch_chunks(pool, branch_id, embed_fn, model_name, dim=dim)
 
     return asyncio.run(_run())
+
+
+# Backwards-compatible alias.
+embed_repo_sync = embed_branch_sync
 
 
 # ────────────────────────────────────────────────────────────────────

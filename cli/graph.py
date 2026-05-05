@@ -25,7 +25,7 @@ from cli._output import (
     import_to_json,
     inheritance_node_to_json,
 )
-from cli._repo import resolve_repo_id, resolve_repo_ids
+from cli._repo import resolve_repo_and_branch, resolve_repo_branch_pairs
 from core.graph import (
     ancestors,
     callers_of,
@@ -43,16 +43,33 @@ from core.graph import (
 from db.connection import pool_ctx
 
 
-async def _resolve_repo_ids(pool, args: argparse.Namespace) -> list[int]:
+async def _resolve_branch_ids(pool, args: argparse.Namespace) -> list[int]:
+    """Either --repo-name [+ --branch] (single) or --repos a:branch,b:branch."""
     if args.repos:
-        names = [s.strip() for s in args.repos.split(",") if s.strip()]
-        return await resolve_repo_ids(pool, names)
-    repo_id = await resolve_repo_id(pool, name=args.repo_name, create=False)
-    return [repo_id]
+        pairs: list[tuple[str, str | None]] = []
+        for chunk in args.repos.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if ":" in chunk:
+                repo, branch = chunk.split(":", 1)
+                pairs.append((repo.strip(), branch.strip() or None))
+            else:
+                pairs.append((chunk, None))
+        resolved = await resolve_repo_branch_pairs(pool, pairs)
+        return [bid for (_, bid) in resolved]
+    _repo_id, branch_id = await resolve_repo_and_branch(
+        pool, repo_name=args.repo_name, branch_name=args.branch, create=False,
+    )
+    return [branch_id]
 
 
 def _repo_label(args: argparse.Namespace) -> str:
-    return args.repos if args.repos else args.repo_name
+    if args.repos:
+        return args.repos
+    if args.branch:
+        return f"{args.repo_name}:{args.branch}"
+    return args.repo_name
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -239,8 +256,8 @@ async def _cmd_inheritance(pool, rids, args) -> int:
 
 async def _run(args: argparse.Namespace) -> int:
     async with pool_ctx(args.dsn) as pool:
-        rids = await _resolve_repo_ids(pool, args)
-        return await args.func(pool, rids, args)
+        bids = await _resolve_branch_ids(pool, args)
+        return await args.func(pool, bids, args)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -250,7 +267,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     repo_group = parser.add_mutually_exclusive_group(required=True)
     repo_group.add_argument("--repo-name", type=str, help="Repo name (must already be indexed)")
-    repo_group.add_argument("--repos", type=str, help="Comma-separated repo names")
+    repo_group.add_argument("--repos", type=str,
+                            help="Comma-separated repo names. Each entry may optionally be "
+                                 "`repo:branch` (without `:branch`, uses each repo's default).")
+    parser.add_argument("--branch", type=str, default=None,
+                        help="Branch name for --repo-name (defaults to the repo's default branch)")
     parser.add_argument("--dsn", type=str, default=None)
 
     # Common flags shared by all subcommands via parents=

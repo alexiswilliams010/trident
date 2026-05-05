@@ -1,11 +1,17 @@
 """Phase 3: heuristic cross-file import resolution (Architecture §5.3.5).
 
-Pipeline (per repo):
-    1. extract_imports         — walk each file's CST, insert rows into `imports`
-    2. build_repo_index        — file_index, name_index, package_index, path_index
+Pipeline (per branch — branches are the unit of cross-file resolution):
+    1. extract_imports         — walk each file_version's CST, insert rows into `imports`
+    2. build_branch_index      — file_index, name_index, package_index, path_index
     3. resolve_imports         — language-specific path math + external classification
     4. link_cross_file         — UPDATE `"references"` and `call_edges` where the
                                  imported name now resolves cross-file
+
+Branch-aware model: file_versions / nodes / definitions are content-shared
+across branches, but cross-file resolution outputs (imports, refs/call_edges
+target_def_id fills, inherits_resolutions, overrides_edges, external_deps)
+are per-branch because they depend on the set of files visible in the branch.
+Every row this module writes is stamped with `branch_id`.
 
 The Deno resolver sandbox (Phase 6+) replaces the language-specific path math
 with native resolvers; the table shapes do not change.
@@ -66,10 +72,10 @@ def _dfs(root):
 class ImportEntry:
     """One import statement worth of info, before resolution."""
 
-    file_id: int                # importer file
+    file_version_id: int        # importer file_version
     node_id: int                # DB id of the import node
     language: str
-    source_rel_path: str        # importer's repo-relative path
+    source_rel_path: str        # importer's repo-relative path (within the branch)
     import_path: str            # raw text path: "mypackage.utils", "./Token.sol", "..", "@oz/..."
     imported_names: list[str]   # specific symbols imported (e.g. ["helper", "double"])
     is_relative: bool           # Python: starts with "." ; Solidity: starts with "./" or "../"
@@ -80,25 +86,32 @@ class ImportEntry:
 class ResolvedImport:
     entry: ImportEntry
     dep_class: str              # 'intra_repo' | 'external' | 'unresolved'
-    resolved_file_id: int | None = None
+    resolved_file_version_id: int | None = None
     package_name: str | None = None
     external_dep_id: int | None = None
 
 
 @dataclass
-class RepoIndex:
-    """In-memory indexes built from the repo's `files` + `definitions` tables."""
+class BranchIndex:
+    """In-memory indexes built from the branch's `branch_files` + `definitions` tables.
 
-    file_index: dict[str, int]                          # rel_path → file_id (intra-repo only)
-    name_index: dict[str, list[tuple[int, int]]]        # def_name → [(file_id, def_id), ...]
-    qualified_to_def: dict[tuple[int, str], int]        # (file_id, def_name) → def_id
-    package_index_python: dict[str, int]                # dotted module path → file_id
-    package_index_go: dict[str, int]                    # module-relative pkg dir → representative file_id
-    go_pkg_files: dict[str, list[int]]                  # module-relative pkg dir → every file_id in that pkg
-    go_module_path: str | None                          # value from `module …` line in go.mod, if present
-    files_by_id: dict[int, str]                         # file_id → rel_path
-    file_languages: dict[int, str]                      # file_id → language
+    Every dict is keyed by file_version_id (since branches are mappings from
+    paths to file_version_ids). Two repos / branches won't collide because
+    file_version_ids are globally unique and we only load ones reachable from
+    this branch.
+    """
+
+    branch_id: int
     repo_id: int
+    file_index: dict[str, int]                          # rel_path → file_version_id (intra-repo only)
+    name_index: dict[str, list[tuple[int, int]]]        # def_name → [(file_version_id, def_id), ...]
+    qualified_to_def: dict[tuple[int, str], int]        # (file_version_id, def_name) → def_id
+    package_index_python: dict[str, int]                # dotted module path → file_version_id
+    package_index_go: dict[str, int]                    # module-relative pkg dir → representative file_version_id
+    go_pkg_files: dict[str, list[int]]                  # module-relative pkg dir → every file_version_id in that pkg
+    go_module_path: str | None                          # value from `module …` line in go.mod, if present
+    files_by_id: dict[int, str]                         # file_version_id → rel_path
+    file_languages: dict[int, str]                      # file_version_id → language
     # JS/TS only: parsed `compilerOptions.paths` from tsconfig.json (None if no
     # tsconfig present or no JS/TS files in the repo).
     node_tsconfig: TsconfigPaths | None = None
@@ -112,6 +125,10 @@ class RepoIndex:
     # Set of all workspace member crate names seen. Used to classify
     # `use other_crate::…` as intra-repo when it names a sibling member.
     rust_crate_names: frozenset[str] = field(default_factory=frozenset)
+
+
+# Backwards-compatible alias for the old name; some test code may reference it.
+RepoIndex = BranchIndex
 
 
 @dataclass
@@ -129,7 +146,7 @@ class ResolutionStats:
 # ────────────────────────────────────────────────────────────────────
 
 
-def _extract_imports_python(file_id: int, source_rel_path: str, ts_root, db_id_for) -> list[ImportEntry]:
+def _extract_imports_python(file_version_id: int, source_rel_path: str, ts_root, db_id_for) -> list[ImportEntry]:
     """Pull import statements from a Python CST."""
     out: list[ImportEntry] = []
     for ts in _dfs(ts_root):
@@ -141,7 +158,7 @@ def _extract_imports_python(file_id: int, source_rel_path: str, ts_root, db_id_f
                 dotted = _text(ts.children[i])
                 out.append(
                     ImportEntry(
-                        file_id=file_id,
+                        file_version_id=file_version_id,
                         node_id=db_id_for[ts.id],
                         language="python",
                         source_rel_path=source_rel_path,
@@ -175,7 +192,7 @@ def _extract_imports_python(file_id: int, source_rel_path: str, ts_root, db_id_f
                     names.append(_text(ts.children[i]))
             out.append(
                 ImportEntry(
-                    file_id=file_id,
+                    file_version_id=file_version_id,
                     node_id=db_id_for[ts.id],
                     language="python",
                     source_rel_path=source_rel_path,
@@ -188,7 +205,7 @@ def _extract_imports_python(file_id: int, source_rel_path: str, ts_root, db_id_f
     return out
 
 
-def _extract_imports_go(file_id: int, source_rel_path: str, ts_root, db_id_for) -> list[ImportEntry]:
+def _extract_imports_go(file_version_id: int, source_rel_path: str, ts_root, db_id_for) -> list[ImportEntry]:
     """Pull import_spec nodes (one per imported path) from a Go CST.
 
     Both `import "fmt"` and grouped `import ( "fmt"; alias "x/y" )` produce
@@ -214,7 +231,7 @@ def _extract_imports_go(file_id: int, source_rel_path: str, ts_root, db_id_for) 
             imported = raw.rsplit("/", 1)[-1]
         out.append(
             ImportEntry(
-                file_id=file_id,
+                file_version_id=file_version_id,
                 node_id=db_id_for[ts.id],
                 language="go",
                 source_rel_path=source_rel_path,
@@ -226,7 +243,7 @@ def _extract_imports_go(file_id: int, source_rel_path: str, ts_root, db_id_for) 
     return out
 
 
-def _extract_imports_solidity(file_id: int, source_rel_path: str, ts_root, db_id_for) -> list[ImportEntry]:
+def _extract_imports_solidity(file_version_id: int, source_rel_path: str, ts_root, db_id_for) -> list[ImportEntry]:
     """Pull import_directive nodes from a Solidity CST."""
     out: list[ImportEntry] = []
     for ts in _dfs(ts_root):
@@ -244,7 +261,7 @@ def _extract_imports_solidity(file_id: int, source_rel_path: str, ts_root, db_id
         is_relative = raw_path.startswith("./") or raw_path.startswith("../")
         out.append(
             ImportEntry(
-                file_id=file_id,
+                file_version_id=file_version_id,
                 node_id=db_id_for[ts.id],
                 language="solidity",
                 source_rel_path=source_rel_path,
@@ -373,7 +390,7 @@ def _rust_inside_test_subtree(ts) -> bool:
     return False
 
 
-def _extract_imports_rust(file_id: int, source_rel_path: str, ts_root, db_id_for) -> list[ImportEntry]:
+def _extract_imports_rust(file_version_id: int, source_rel_path: str, ts_root, db_id_for) -> list[ImportEntry]:
     """Walk `use_declaration` nodes; flatten grouped/nested forms into one
     ImportEntry per leaf path. Each entry's import_path includes the trailing
     item name; _resolve_rust strips it to find the containing module file.
@@ -382,7 +399,7 @@ def _extract_imports_rust(file_id: int, source_rel_path: str, ts_root, db_id_for
     are skipped so the imports table mirrors the semantic-layer skip and
     test-only crate dependencies don't surface in retrieval. Files in
     `tests/` / `benches/` / `examples/` directories are skipped at the
-    resolver-loop level (see resolve_repo_imports).
+    resolver-loop level (see resolve_branch_imports).
 
     Other limitations the future Deno resolver phase will fix:
       - `#[path = "..."]` module attributes are ignored; we assume the
@@ -415,7 +432,7 @@ def _extract_imports_rust(file_id: int, source_rel_path: str, ts_root, db_id_for
             names = [last_name] if last_name else []
             out.append(
                 ImportEntry(
-                    file_id=file_id,
+                    file_version_id=file_version_id,
                     node_id=db_id_for[ts.id],
                     language="rust",
                     source_rel_path=source_rel_path,
@@ -486,7 +503,7 @@ def _make_node_extractor(language: str):
     JS and TS share parsing logic; the per-call language tag is what
     `_resolve_one` keys off."""
 
-    def extract(file_id: int, source_rel_path: str, ts_root, db_id_for) -> list[ImportEntry]:
+    def extract(file_version_id: int, source_rel_path: str, ts_root, db_id_for) -> list[ImportEntry]:
         out: list[ImportEntry] = []
         for ts in _dfs(ts_root):
             if ts.type == "import_statement":
@@ -497,7 +514,7 @@ def _make_node_extractor(language: str):
                 names = _collect_node_import_clause_names(ts)
                 out.append(
                     ImportEntry(
-                        file_id=file_id,
+                        file_version_id=file_version_id,
                         node_id=db_id_for[ts.id],
                         language=language,
                         source_rel_path=source_rel_path,
@@ -515,7 +532,7 @@ def _make_node_extractor(language: str):
                 names = _collect_node_export_names(ts)
                 out.append(
                     ImportEntry(
-                        file_id=file_id,
+                        file_version_id=file_version_id,
                         node_id=db_id_for[ts.id],
                         language=language,
                         source_rel_path=source_rel_path,
@@ -541,7 +558,7 @@ def _make_node_extractor(language: str):
                 raw = _strip_quotes(_text(str_node))
                 out.append(
                     ImportEntry(
-                        file_id=file_id,
+                        file_version_id=file_version_id,
                         node_id=db_id_for[ts.id],
                         language=language,
                         source_rel_path=source_rel_path,
@@ -724,19 +741,33 @@ def _crate_for_file(rel_path: str, crates: list[RustCrate]) -> RustCrate | None:
     return best
 
 
-async def build_repo_index(conn: asyncpg.Connection, repo_id: int) -> RepoIndex:
+async def build_branch_index(
+    conn: asyncpg.Connection, repo_id: int, branch_id: int,
+) -> BranchIndex:
+    """Build an in-memory index of the branch's intra-repo files + their defs.
+
+    All file lookups are scoped to `branch_files` for `branch_id` to ensure
+    cross-file resolution sees only the file_versions visible in the branch.
+    Definitions are content-shared, but we only load the ones whose
+    file_version is mapped by this branch.
+    """
     files = await conn.fetch(
-        "SELECT id, path, language FROM files "
-        "WHERE repo_id=$1 AND from_dependency=FALSE",
-        repo_id,
+        """
+        SELECT fv.id, bf.path, fv.language
+        FROM branch_files bf
+        JOIN file_versions fv ON fv.id = bf.file_version_id
+        WHERE bf.branch_id = $1 AND bf.from_dependency = FALSE
+        """,
+        branch_id,
     )
     defs = await conn.fetch(
         """
-        SELECT d.id, d.file_id, d.name
-        FROM definitions d JOIN files f ON f.id=d.file_id
-        WHERE f.repo_id=$1 AND f.from_dependency=FALSE
+        SELECT d.id, d.file_version_id, d.name
+        FROM definitions d
+        JOIN branch_files bf ON bf.file_version_id = d.file_version_id
+        WHERE bf.branch_id = $1 AND bf.from_dependency = FALSE
         """,
-        repo_id,
+        branch_id,
     )
     repo_row = await conn.fetchrow(
         "SELECT root_path FROM repos WHERE id=$1", repo_id,
@@ -749,33 +780,34 @@ async def build_repo_index(conn: asyncpg.Connection, repo_id: int) -> RepoIndex:
     pkg_index: dict[str, int] = {}
     pkg_index_go: dict[str, int] = {}
     pkg_files_go: dict[str, list[int]] = {}
-    rust_files: list[tuple[int, str]] = []  # (file_id, rel_path); built first, indexed below once we know the crate root
+    rust_files: list[tuple[int, str]] = []  # (file_version_id, rel_path); built first, indexed below once we know the crate root
     has_go = False
     has_node = False
     has_rust = False
     for f in files:
-        fid = f["id"]
-        file_index[f["path"]] = fid
-        files_by_id[fid] = f["path"]
-        file_languages[fid] = f["language"]
+        fvid = f["id"]
+        file_index[f["path"]] = fvid
+        files_by_id[fvid] = f["path"]
+        file_languages[fvid] = f["language"]
         if f["language"] == "python":
             dotted = _python_dotted_for(f["path"])
             if dotted:
-                pkg_index[dotted] = fid
+                pkg_index[dotted] = fvid
         elif f["language"] == "go":
             has_go = True
             # Package dir = parent directory. `pkg_index_go` maps to one
-            # representative for the imports.resolved_file_id FK (which is
-            # singular); `pkg_files_go` keeps the full list so Phase 3's
-            # cross-file linker can fuzzy-match across the whole package.
+            # representative for the imports.resolved_file_version_id FK
+            # (which is singular); `pkg_files_go` keeps the full list so
+            # Phase 3's cross-file linker can fuzzy-match across the whole
+            # package.
             pkg_dir = "/".join(f["path"].split("/")[:-1])
-            pkg_index_go.setdefault(pkg_dir, fid)
-            pkg_files_go.setdefault(pkg_dir, []).append(fid)
+            pkg_index_go.setdefault(pkg_dir, fvid)
+            pkg_files_go.setdefault(pkg_dir, []).append(fvid)
         elif f["language"] in ("javascript", "typescript"):
             has_node = True
         elif f["language"] == "rust":
             has_rust = True
-            rust_files.append((fid, f["path"]))
+            rust_files.append((fvid, f["path"]))
 
     # Read go.mod once if any Go file is present and a root_path is known.
     go_module_path: str | None = None
@@ -809,23 +841,25 @@ async def build_repo_index(conn: asyncpg.Connection, repo_id: int) -> RepoIndex:
         # have to special-case missing keys for known crates.
         for c in crates:
             rust_pkg_index.setdefault(c.name, {})
-        for fid, rel in rust_files:
+        for fvid, rel in rust_files:
             owner = _crate_for_file(rel, crates)
             if owner is None:
                 continue
             mod_path = _rust_module_path_for(rel, owner.root_path)
             if mod_path is None:
                 continue
-            rust_pkg_index[owner.name].setdefault(mod_path, fid)
-            rust_module_for_file[fid] = (owner.name, mod_path)
+            rust_pkg_index[owner.name].setdefault(mod_path, fvid)
+            rust_module_for_file[fvid] = (owner.name, mod_path)
 
     name_index: dict[str, list[tuple[int, int]]] = {}
     qualified_to_def: dict[tuple[int, str], int] = {}
     for d in defs:
-        name_index.setdefault(d["name"], []).append((d["file_id"], d["id"]))
-        qualified_to_def[(d["file_id"], d["name"])] = d["id"]
+        name_index.setdefault(d["name"], []).append((d["file_version_id"], d["id"]))
+        qualified_to_def[(d["file_version_id"], d["name"])] = d["id"]
 
-    return RepoIndex(
+    return BranchIndex(
+        branch_id=branch_id,
+        repo_id=repo_id,
         file_index=file_index,
         name_index=name_index,
         qualified_to_def=qualified_to_def,
@@ -835,7 +869,6 @@ async def build_repo_index(conn: asyncpg.Connection, repo_id: int) -> RepoIndex:
         go_module_path=go_module_path,
         files_by_id=files_by_id,
         file_languages=file_languages,
-        repo_id=repo_id,
         node_tsconfig=node_tsconfig,
         package_index_rust=rust_pkg_index,
         rust_module_for_file=rust_module_for_file,
@@ -843,12 +876,16 @@ async def build_repo_index(conn: asyncpg.Connection, repo_id: int) -> RepoIndex:
     )
 
 
+# Backwards-compatible alias for the old name.
+build_repo_index = build_branch_index
+
+
 # ────────────────────────────────────────────────────────────────────
 # Resolution (per language)
 # ────────────────────────────────────────────────────────────────────
 
 
-def _resolve_python(entry: ImportEntry, idx: RepoIndex) -> ResolvedImport:
+def _resolve_python(entry: ImportEntry, idx: BranchIndex) -> ResolvedImport:
     if entry.is_relative:
         # `from .foo import x` from a/b/main.py → a/b/foo
         # `from ..foo import x` from a/b/main.py → a/foo
@@ -865,23 +902,23 @@ def _resolve_python(entry: ImportEntry, idx: RepoIndex) -> ResolvedImport:
         if tail_parts:
             cand = "/".join(base_parts + tail_parts) + ".py"
             if cand in idx.file_index:
-                return ResolvedImport(entry, "intra_repo", resolved_file_id=idx.file_index[cand])
+                return ResolvedImport(entry, "intra_repo", resolved_file_version_id=idx.file_index[cand])
             # Try as package __init__.py
             cand = "/".join(base_parts + tail_parts) + "/__init__.py"
             if cand in idx.file_index:
-                return ResolvedImport(entry, "intra_repo", resolved_file_id=idx.file_index[cand])
+                return ResolvedImport(entry, "intra_repo", resolved_file_version_id=idx.file_index[cand])
             # Try: each imported name is itself a sibling module (`from . import siblings`)
             # falls through if tail was given but didn't resolve — leave unresolved.
         else:
             # `from . import name` — each imported name is a sibling module.
-            # Resolve the FIRST name to populate resolved_file_id (full multi-name handled below).
+            # Resolve the FIRST name to populate resolved_file_version_id (full multi-name handled below).
             for name in entry.imported_names:
                 cand = "/".join(base_parts + [name]) + ".py"
                 if cand in idx.file_index:
-                    return ResolvedImport(entry, "intra_repo", resolved_file_id=idx.file_index[cand])
+                    return ResolvedImport(entry, "intra_repo", resolved_file_version_id=idx.file_index[cand])
                 cand = "/".join(base_parts + [name]) + "/__init__.py"
                 if cand in idx.file_index:
-                    return ResolvedImport(entry, "intra_repo", resolved_file_id=idx.file_index[cand])
+                    return ResolvedImport(entry, "intra_repo", resolved_file_version_id=idx.file_index[cand])
         return ResolvedImport(entry, "unresolved")
 
     # Absolute import: try the full dotted path + parent dotted prefixes.
@@ -889,7 +926,7 @@ def _resolve_python(entry: ImportEntry, idx: RepoIndex) -> ResolvedImport:
     while parts:
         cand = ".".join(parts)
         if cand in idx.package_index_python:
-            return ResolvedImport(entry, "intra_repo", resolved_file_id=idx.package_index_python[cand])
+            return ResolvedImport(entry, "intra_repo", resolved_file_version_id=idx.package_index_python[cand])
         parts.pop()
 
     # Top-level segment isn't local → external (e.g., `import requests`).
@@ -897,7 +934,7 @@ def _resolve_python(entry: ImportEntry, idx: RepoIndex) -> ResolvedImport:
     return ResolvedImport(entry, "external", package_name=top)
 
 
-def _resolve_solidity(entry: ImportEntry, idx: RepoIndex, cfg: LanguageConfig) -> ResolvedImport:
+def _resolve_solidity(entry: ImportEntry, idx: BranchIndex, cfg: LanguageConfig) -> ResolvedImport:
     raw = entry.import_path
     external_prefixes = cfg.imports.external_prefixes if cfg.imports else ()
     dep_dirs = set(cfg.dependency_paths or ())
@@ -913,12 +950,12 @@ def _resolve_solidity(entry: ImportEntry, idx: RepoIndex, cfg: LanguageConfig) -
         src_dir = PurePosixPath(entry.source_rel_path).parent
         target = _normalize_relative_posix((src_dir / raw).as_posix())
         if target in idx.file_index:
-            return ResolvedImport(entry, "intra_repo", resolved_file_id=idx.file_index[target])
+            return ResolvedImport(entry, "intra_repo", resolved_file_version_id=idx.file_index[target])
         return ResolvedImport(entry, "unresolved")
 
     # Bare repo-relative path that names a real file (rare but valid).
     if raw in idx.file_index:
-        return ResolvedImport(entry, "intra_repo", resolved_file_id=idx.file_index[raw])
+        return ResolvedImport(entry, "intra_repo", resolved_file_version_id=idx.file_index[raw])
 
     # Path begins with a configured dependency dir ("lib/forge-std/src/Test.sol")
     # → external, with package = the segment immediately after the dep dir.
@@ -950,7 +987,7 @@ def _normalize_relative_posix(path: str) -> str:
     return "/".join(parts)
 
 
-def _resolve_go(entry: ImportEntry, idx: RepoIndex) -> ResolvedImport:
+def _resolve_go(entry: ImportEntry, idx: BranchIndex) -> ResolvedImport:
     """Classify a Go import path.
 
     Three buckets, in priority order:
@@ -967,7 +1004,7 @@ def _resolve_go(entry: ImportEntry, idx: RepoIndex) -> ResolvedImport:
         suffix = "" if raw == mod else raw[len(mod) + 1 :]
         target = idx.package_index_go.get(suffix)
         if target is not None:
-            return ResolvedImport(entry, "intra_repo", resolved_file_id=target)
+            return ResolvedImport(entry, "intra_repo", resolved_file_version_id=target)
         return ResolvedImport(entry, "unresolved")
 
     first = raw.split("/", 1)[0]
@@ -997,15 +1034,15 @@ def _try_rust_module_path(
         cand = "::".join(parts)
         target = crate_index.get(cand)
         if target is not None:
-            return ResolvedImport(entry, "intra_repo", resolved_file_id=target)
+            return ResolvedImport(entry, "intra_repo", resolved_file_version_id=target)
         parts = parts[:-1]
     crate_root = crate_index.get("")
     if crate_root is not None:
-        return ResolvedImport(entry, "intra_repo", resolved_file_id=crate_root)
+        return ResolvedImport(entry, "intra_repo", resolved_file_version_id=crate_root)
     return ResolvedImport(entry, "unresolved")
 
 
-def _resolve_rust(entry: ImportEntry, idx: RepoIndex) -> ResolvedImport:
+def _resolve_rust(entry: ImportEntry, idx: BranchIndex) -> ResolvedImport:
     """Classify a Rust use-path.
 
     Buckets, in priority order:
@@ -1030,7 +1067,7 @@ def _resolve_rust(entry: ImportEntry, idx: RepoIndex) -> ResolvedImport:
         return ResolvedImport(entry, "unresolved")
     parts = raw.split("::")
 
-    src_owner = idx.rust_module_for_file.get(entry.file_id)
+    src_owner = idx.rust_module_for_file.get(entry.file_version_id)
 
     if entry.is_relative:
         if src_owner is None:
@@ -1083,7 +1120,7 @@ def _resolve_rust(entry: ImportEntry, idx: RepoIndex) -> ResolvedImport:
     return ResolvedImport(entry, "external", package_name=head)
 
 
-def _resolve_node_import(entry: ImportEntry, idx: RepoIndex) -> ResolvedImport:
+def _resolve_node_import(entry: ImportEntry, idx: BranchIndex) -> ResolvedImport:
     """Classify a JS/TS import.
 
     Order:
@@ -1103,19 +1140,19 @@ def _resolve_node_import(entry: ImportEntry, idx: RepoIndex) -> ResolvedImport:
     if idx.node_tsconfig is not None:
         target = _resolve_tsconfig_alias(raw, idx.node_tsconfig, idx.file_index)
         if target is not None:
-            return ResolvedImport(entry, "intra_repo", resolved_file_id=target)
+            return ResolvedImport(entry, "intra_repo", resolved_file_version_id=target)
 
     if entry.is_relative:
         target = _resolve_relative_node(entry.source_rel_path, raw, idx.file_index)
         if target is not None:
-            return ResolvedImport(entry, "intra_repo", resolved_file_id=target)
+            return ResolvedImport(entry, "intra_repo", resolved_file_version_id=target)
         return ResolvedImport(entry, "unresolved")
 
     pkg = package_name_for_specifier(raw)
     return ResolvedImport(entry, "external", package_name=pkg)
 
 
-def _resolve_one(entry: ImportEntry, idx: RepoIndex, cfg: LanguageConfig) -> ResolvedImport:
+def _resolve_one(entry: ImportEntry, idx: BranchIndex, cfg: LanguageConfig) -> ResolvedImport:
     if entry.language == "python":
         return _resolve_python(entry, idx)
     if entry.language == "solidity":
@@ -1134,28 +1171,27 @@ def _resolve_one(entry: ImportEntry, idx: RepoIndex, cfg: LanguageConfig) -> Res
 # ────────────────────────────────────────────────────────────────────
 
 
-async def _clear_imports_for_repo(conn: asyncpg.Connection, repo_id: int) -> None:
-    await conn.execute(
-        "DELETE FROM imports WHERE file_id IN (SELECT id FROM files WHERE repo_id=$1)",
-        repo_id,
-    )
-    await conn.execute("DELETE FROM external_dependencies WHERE repo_id=$1", repo_id)
+async def _clear_imports_for_branch(conn: asyncpg.Connection, branch_id: int) -> None:
+    """Drop all imports + external_dependencies rows for a branch. Called at
+    the start of each cross-file resolution pass so re-runs are idempotent."""
+    await conn.execute("DELETE FROM imports WHERE branch_id=$1", branch_id)
+    await conn.execute("DELETE FROM external_dependencies WHERE branch_id=$1", branch_id)
 
 
 async def _ensure_external_dep(
     conn: asyncpg.Connection,
-    repo_id: int,
+    branch_id: int,
     package_name: str,
     language: str,
 ) -> int:
     row = await conn.fetchrow(
         """
-        INSERT INTO external_dependencies (repo_id, package_name, language)
+        INSERT INTO external_dependencies (branch_id, package_name, language)
         VALUES ($1, $2, $3)
-        ON CONFLICT (repo_id, package_name, language) DO UPDATE SET package_name = EXCLUDED.package_name
+        ON CONFLICT (branch_id, package_name, language) DO UPDATE SET package_name = EXCLUDED.package_name
         RETURNING id
         """,
-        repo_id,
+        branch_id,
         package_name,
         language,
     )
@@ -1164,7 +1200,7 @@ async def _ensure_external_dep(
 
 async def _insert_imports(
     conn: asyncpg.Connection,
-    repo_id: int,
+    branch_id: int,
     resolved: Iterable[ResolvedImport],
 ) -> None:
     rows: list[tuple] = []
@@ -1175,14 +1211,15 @@ async def _insert_imports(
             key = (r.package_name, r.entry.language)
             ext_id = ext_cache.get(key)
             if ext_id is None:
-                ext_id = await _ensure_external_dep(conn, repo_id, r.package_name, r.entry.language)
+                ext_id = await _ensure_external_dep(conn, branch_id, r.package_name, r.entry.language)
                 ext_cache[key] = ext_id
         rows.append(
             (
-                r.entry.file_id,
+                branch_id,
+                r.entry.file_version_id,
                 r.entry.node_id,
                 r.entry.import_path,
-                r.resolved_file_id,
+                r.resolved_file_version_id,
                 r.entry.imported_names,
                 r.dep_class,
                 ext_id,
@@ -1192,8 +1229,8 @@ async def _insert_imports(
         return
     await conn.executemany(
         """
-        INSERT INTO imports (file_id, node_id, import_path, resolved_file_id, imported_names, dep_class, external_dep_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO imports (branch_id, file_version_id, node_id, import_path, resolved_file_version_id, imported_names, dep_class, external_dep_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         """,
         rows,
     )
@@ -1206,10 +1243,10 @@ async def _insert_imports(
 
 async def _link_cross_file(
     conn: asyncpg.Connection,
-    repo_id: int,
-    idx: RepoIndex,
+    branch_id: int,
+    idx: BranchIndex,
 ) -> tuple[int, int, dict[int, set[int]]]:
-    """Two-tier cross-file linking:
+    """Two-tier cross-file linking, scoped to one branch:
 
     Tier A (certain) — direct imports: each name in `imports.imported_names`
     is matched against the resolved target file's definitions. Hit → set
@@ -1222,18 +1259,21 @@ async def _link_cross_file(
     like `token.transfer(...)` where `transfer` lives in an imported file
     but is not itself an `imported_name`.
 
-    Returns (refs_updated, call_edges_updated) totals across both tiers.
+    Returns (refs_updated, call_edges_updated, imported_files_by) where
+    imported_files_by is keyed by importer file_version_id and gives the set
+    of intra-repo-imported file_version_ids visible to that importer in this
+    branch.
     """
     intra_imports = await conn.fetch(
         """
-        SELECT i.file_id, i.resolved_file_id, i.imported_names
-        FROM imports i JOIN files f ON f.id=i.file_id
-        WHERE f.repo_id=$1 AND i.dep_class='intra_repo' AND i.resolved_file_id IS NOT NULL
+        SELECT i.file_version_id, i.resolved_file_version_id, i.imported_names
+        FROM imports i
+        WHERE i.branch_id=$1 AND i.dep_class='intra_repo' AND i.resolved_file_version_id IS NOT NULL
         """,
-        repo_id,
+        branch_id,
     )
 
-    # importer_file_id → set(imported_file_ids)
+    # importer_file_version_id → set(imported_file_version_ids)
     imported_files_by: dict[int, set[int]] = {}
 
     # Go: files in the same package share scope without an explicit import. Seed
@@ -1241,14 +1281,14 @@ async def _link_cross_file(
     # linking can find symbols declared by a sibling file.
     for pkg_dir, peers in idx.go_pkg_files.items():
         peer_set = set(peers)
-        for fid in peers:
-            imported_files_by.setdefault(fid, set()).update(peer_set - {fid})
+        for fvid in peers:
+            imported_files_by.setdefault(fvid, set()).update(peer_set - {fvid})
 
-    # importer_file_id → name → target_def_id (Tier A direct hits)
+    # importer_file_version_id → name → target_def_id (Tier A direct hits)
     direct_by: dict[int, dict[str, int]] = {}
     for row in intra_imports:
-        importer = row["file_id"]
-        target_file = row["resolved_file_id"]
+        importer = row["file_version_id"]
+        target_file = row["resolved_file_version_id"]
         # Go: an `import "x/y/z"` references a package, not a single file.
         # Expand to every sibling .go file so Tier-B fuzzy matching can find
         # symbols defined in any peer file of the imported package.
@@ -1278,45 +1318,46 @@ async def _link_cross_file(
             UPDATE "references" AS r
             SET target_def_id = u.target_def_id,
                 resolution_confidence = 0.7
-            FROM UNNEST($2::text[], $3::bigint[]) AS u(name, target_def_id)
-            WHERE r.file_id = $1 AND r.target_def_id IS NULL AND r.name = u.name
+            FROM UNNEST($3::text[], $4::bigint[]) AS u(name, target_def_id)
+            WHERE r.branch_id = $1 AND r.file_version_id = $2
+              AND r.target_def_id IS NULL AND r.name = u.name
             """,
-            importer, names, defs,
+            branch_id, importer, names, defs,
         ))
         calls_updated += _affected_rows(await conn.execute(
             """
             UPDATE call_edges AS ce
             SET callee_def_id = u.target_def_id, confidence = 'certain'
-            FROM UNNEST($2::text[], $3::bigint[]) AS u(name, target_def_id)
-            WHERE ce.callee_def_id IS NULL AND ce.callee_name = u.name
-              AND ce.callsite_node_id IN (SELECT id FROM nodes WHERE file_id = $1)
+            FROM UNNEST($3::text[], $4::bigint[]) AS u(name, target_def_id)
+            WHERE ce.branch_id = $1 AND ce.callee_def_id IS NULL AND ce.callee_name = u.name
+              AND ce.callsite_node_id IN (SELECT id FROM nodes WHERE file_version_id = $2)
             """,
-            importer, names, defs,
+            branch_id, importer, names, defs,
         ))
 
     # ── Tier B: fuzzy match in imported files (inferred) ──
     for importer, imported_file_ids in imported_files_by.items():
         if not imported_file_ids:
             continue
-        # Gather still-unresolved names in this file.
+        # Gather still-unresolved names in this file (within this branch).
         ref_rows = await conn.fetch(
             'SELECT DISTINCT name FROM "references" '
-            "WHERE file_id=$1 AND target_def_id IS NULL",
-            importer,
+            "WHERE branch_id=$1 AND file_version_id=$2 AND target_def_id IS NULL",
+            branch_id, importer,
         )
         call_rows = await conn.fetch(
             "SELECT DISTINCT ce.callee_name "
             "FROM call_edges ce "
-            "WHERE ce.callee_def_id IS NULL AND ce.callee_name IS NOT NULL "
-            "  AND ce.callsite_node_id IN (SELECT id FROM nodes WHERE file_id=$1)",
-            importer,
+            "WHERE ce.branch_id=$1 AND ce.callee_def_id IS NULL AND ce.callee_name IS NOT NULL "
+            "  AND ce.callsite_node_id IN (SELECT id FROM nodes WHERE file_version_id=$2)",
+            branch_id, importer,
         )
         unresolved_names = {r["name"] for r in ref_rows} | {r["callee_name"] for r in call_rows}
 
         fuzzy_pairs: dict[str, int] = {}
         for name in unresolved_names:
             cands = idx.name_index.get(name, [])
-            in_imported = [(fid, did) for fid, did in cands if fid in imported_file_ids]
+            in_imported = [(fvid, did) for fvid, did in cands if fvid in imported_file_ids]
             if len(in_imported) == 1:
                 fuzzy_pairs[name] = in_imported[0][1]
 
@@ -1329,20 +1370,21 @@ async def _link_cross_file(
             UPDATE "references" AS r
             SET target_def_id = u.target_def_id,
                 resolution_confidence = 0.5
-            FROM UNNEST($2::text[], $3::bigint[]) AS u(name, target_def_id)
-            WHERE r.file_id = $1 AND r.target_def_id IS NULL AND r.name = u.name
+            FROM UNNEST($3::text[], $4::bigint[]) AS u(name, target_def_id)
+            WHERE r.branch_id = $1 AND r.file_version_id = $2
+              AND r.target_def_id IS NULL AND r.name = u.name
             """,
-            importer, names, defs,
+            branch_id, importer, names, defs,
         ))
         calls_updated += _affected_rows(await conn.execute(
             """
             UPDATE call_edges AS ce
             SET callee_def_id = u.target_def_id, confidence = 'inferred'
-            FROM UNNEST($2::text[], $3::bigint[]) AS u(name, target_def_id)
-            WHERE ce.callee_def_id IS NULL AND ce.callee_name = u.name
-              AND ce.callsite_node_id IN (SELECT id FROM nodes WHERE file_id = $1)
+            FROM UNNEST($3::text[], $4::bigint[]) AS u(name, target_def_id)
+            WHERE ce.branch_id = $1 AND ce.callee_def_id IS NULL AND ce.callee_name = u.name
+              AND ce.callsite_node_id IN (SELECT id FROM nodes WHERE file_version_id = $2)
             """,
-            importer, names, defs,
+            branch_id, importer, names, defs,
         ))
 
     return refs_updated, calls_updated, imported_files_by
@@ -1350,8 +1392,8 @@ async def _link_cross_file(
 
 async def _link_cross_file_inheritance(
     conn: asyncpg.Connection,
-    repo_id: int,
-    idx: RepoIndex,
+    branch_id: int,
+    idx: BranchIndex,
     imported_files_by: dict[int, set[int]],
 ) -> int:
     """Resolve `inherits_edges.base_def_id` for rows where the base definition
@@ -1369,36 +1411,36 @@ async def _link_cross_file_inheritance(
     """
     pending = await conn.fetch(
         """
-        SELECT ie.id, ie.child_def_id, ie.base_name, d.file_id AS child_file_id
+        SELECT ie.id, ie.child_def_id, ie.base_name, d.file_version_id AS child_file_version_id
         FROM inherits_edges ie
         JOIN definitions d ON d.id = ie.child_def_id
-        JOIN files f ON f.id = d.file_id
-        WHERE f.repo_id = $1 AND ie.base_def_id IS NULL
+        WHERE ie.branch_id = $1 AND ie.base_def_id IS NULL
         """,
-        repo_id,
+        branch_id,
     )
     if not pending:
         return 0
 
     target_rows = await conn.fetch(
         """
-        SELECT d.id, d.file_id, d.name
-        FROM definitions d JOIN files f ON f.id = d.file_id
-        WHERE f.repo_id = $1 AND d.kind IN ('contract', 'interface', 'class', 'type')
+        SELECT d.id, d.file_version_id, d.name
+        FROM definitions d
+        JOIN branch_files bf ON bf.file_version_id = d.file_version_id
+        WHERE bf.branch_id = $1 AND d.kind IN ('contract', 'interface', 'class', 'type')
         """,
-        repo_id,
+        branch_id,
     )
     targets_by_name: dict[str, list[tuple[int, int]]] = {}
     for r in target_rows:
-        targets_by_name.setdefault(r["name"], []).append((r["file_id"], r["id"]))
+        targets_by_name.setdefault(r["name"], []).append((r["file_version_id"], r["id"]))
 
     updates: list[tuple[int, int, str]] = []  # (edge_id, base_def_id, confidence)
     for r in pending:
         name = r["base_name"]
-        child_file = r["child_file_id"]
+        child_file = r["child_file_version_id"]
         imported = imported_files_by.get(child_file, set())
         cands = targets_by_name.get(name, [])
-        in_imported = [(fid, did) for fid, did in cands if fid in imported]
+        in_imported = [(fvid, did) for fvid, did in cands if fvid in imported]
         if len(in_imported) == 1:
             updates.append((r["id"], in_imported[0][1], "certain"))
         elif len(in_imported) > 1:
@@ -1415,36 +1457,28 @@ async def _link_cross_file_inheritance(
 
 async def _generate_overrides(
     conn: asyncpg.Connection,
-    repo_id: int,
+    branch_id: int,
 ) -> int:
-    """For each resolved (child_class, base_class) inheritance pair, find
-    method/function/modifier defs inside the child whose `name` matches one in
-    the base (or any transitive ancestor — closest match wins). Insert into
-    overrides_edges. Pre-clears repo's overrides so re-runs are idempotent.
+    """For each resolved (child_class, base_class) inheritance pair in this
+    branch, find method/function/modifier defs inside the child whose `name`
+    matches one in the base (or any transitive ancestor — closest match wins).
+    Insert into overrides_edges tagged with branch_id. Pre-clears the branch's
+    overrides so re-runs are idempotent.
     """
-    # Drop any pre-existing rows scoped to this repo.
+    # Drop any pre-existing rows scoped to this branch.
     await conn.execute(
-        """
-        DELETE FROM overrides_edges
-        WHERE child_def_id IN (
-            SELECT d.id FROM definitions d
-            JOIN files f ON f.id = d.file_id
-            WHERE f.repo_id = $1
-        )
-        """,
-        repo_id,
+        "DELETE FROM overrides_edges WHERE branch_id = $1",
+        branch_id,
     )
 
     inh_resolved = await conn.fetch(
         """
         SELECT ie.child_def_id AS child_class, ie.base_def_id AS base_class
         FROM inherits_edges ie
-        JOIN definitions d ON d.id = ie.child_def_id
-        JOIN files f ON f.id = d.file_id
-        WHERE f.repo_id = $1 AND ie.base_def_id IS NOT NULL
+        WHERE ie.branch_id = $1 AND ie.base_def_id IS NOT NULL
         ORDER BY ie.child_def_id, ie.ord
         """,
-        repo_id,
+        branch_id,
     )
     if not inh_resolved:
         return 0
@@ -1455,16 +1489,18 @@ async def _generate_overrides(
         direct_bases.setdefault(r["child_class"], []).append(r["base_class"])
 
     # Per-class methods: scope_id → [(name, kind, def_id), ...].
+    # Definitions are content-shared, so we only restrict to those whose
+    # file_version is mapped by this branch.
     method_rows = await conn.fetch(
         """
         SELECT d.id, d.name, d.kind, d.scope_id
         FROM definitions d
-        JOIN files f ON f.id = d.file_id
-        WHERE f.repo_id = $1
+        JOIN branch_files bf ON bf.file_version_id = d.file_version_id
+        WHERE bf.branch_id = $1
           AND d.kind IN ('function', 'method', 'modifier', 'constructor')
           AND d.scope_id IS NOT NULL
         """,
-        repo_id,
+        branch_id,
     )
     methods_by_class: dict[int, list[asyncpg.Record]] = {}
     for m in method_rows:
@@ -1507,9 +1543,9 @@ async def _generate_overrides(
     if not pairs:
         return 0
     await conn.executemany(
-        "INSERT INTO overrides_edges (child_def_id, base_def_id) VALUES ($1, $2) "
-        "ON CONFLICT (child_def_id, base_def_id) DO NOTHING",
-        pairs,
+        "INSERT INTO overrides_edges (branch_id, child_def_id, base_def_id) VALUES ($1, $2, $3) "
+        "ON CONFLICT (branch_id, child_def_id, base_def_id) DO NOTHING",
+        [(branch_id, c, b) for c, b in pairs],
     )
     return len(pairs)
 
@@ -1530,18 +1566,24 @@ def _affected_rows(execute_status: str) -> int:
 # ────────────────────────────────────────────────────────────────────
 
 
-async def resolve_repo_imports(pool: asyncpg.Pool, repo_id: int) -> ResolutionStats:
+async def resolve_branch_imports(
+    pool: asyncpg.Pool, repo_id: int, branch_id: int,
+) -> ResolutionStats:
     stats = ResolutionStats()
     configs: dict[str, LanguageConfig] = {}
 
     async with pool.acquire() as conn:
         files = await conn.fetch(
-            "SELECT id, path, language, raw_content FROM files "
-            "WHERE repo_id=$1 AND from_dependency=FALSE",
-            repo_id,
+            """
+            SELECT fv.id, bf.path, fv.language, fv.raw_content
+            FROM branch_files bf
+            JOIN file_versions fv ON fv.id = bf.file_version_id
+            WHERE bf.branch_id = $1 AND bf.from_dependency = FALSE
+            """,
+            branch_id,
         )
 
-        await _clear_imports_for_repo(conn, repo_id)
+        await _clear_imports_for_branch(conn, branch_id)
 
         all_entries: list[ImportEntry] = []
         for f in files:
@@ -1565,7 +1607,7 @@ async def resolve_repo_imports(pool: asyncpg.Pool, repo_id: int) -> ResolutionSt
             # Pair ts_nodes to DB ids via the same DFS preorder used by Tier 1.
             ts_walk = list(_dfs(tree.root_node))
             db_ids = await conn.fetch(
-                "SELECT id FROM nodes WHERE file_id=$1 ORDER BY id",
+                "SELECT id FROM nodes WHERE file_version_id=$1 ORDER BY id",
                 f["id"],
             )
             if len(ts_walk) != len(db_ids):
@@ -1576,7 +1618,7 @@ async def resolve_repo_imports(pool: asyncpg.Pool, repo_id: int) -> ResolutionSt
             entries = extractor(f["id"], f["path"], tree.root_node, db_id_for)
             all_entries.extend(entries)
 
-        idx = await build_repo_index(conn, repo_id)
+        idx = await build_branch_index(conn, repo_id, branch_id)
 
         resolved: list[ResolvedImport] = []
         for entry in all_entries:
@@ -1587,27 +1629,38 @@ async def resolve_repo_imports(pool: asyncpg.Pool, repo_id: int) -> ResolutionSt
             if resolved[-1].dep_class == "unresolved":
                 stats.unresolved_paths.append(f"{entry.source_rel_path}: {entry.import_path}")
 
-        await _insert_imports(conn, repo_id, resolved)
-        refs_updated, calls_updated, imported_files_by = await _link_cross_file(conn, repo_id, idx)
+        await _insert_imports(conn, branch_id, resolved)
+        refs_updated, calls_updated, imported_files_by = await _link_cross_file(conn, branch_id, idx)
         stats.cross_file_refs_resolved = refs_updated
         stats.cross_file_calls_resolved = calls_updated
 
         # Inheritance: cross-file linking + override generation. Both are
-        # repo-scoped (semantic_resolver wrote the rows with intra-file
+        # branch-scoped (semantic_resolver wrote the rows with intra-file
         # base_def_id where possible; we fill in the rest).
         stats.cross_file_inherits_resolved = await _link_cross_file_inheritance(
-            conn, repo_id, idx, imported_files_by,
+            conn, branch_id, idx, imported_files_by,
         )
-        stats.overrides_inserted = await _generate_overrides(conn, repo_id)
+        stats.overrides_inserted = await _generate_overrides(conn, branch_id)
 
     return stats
 
 
-def resolve_repo_imports_sync(repo_id: int, dsn: str | None = None) -> ResolutionStats:
+# Backwards-compatible alias for the old name (callers passing only repo_id
+# would now also need branch_id; keep the old name as a typo trap).
+resolve_repo_imports = resolve_branch_imports
+
+
+def resolve_branch_imports_sync(
+    repo_id: int, branch_id: int, dsn: str | None = None,
+) -> ResolutionStats:
     from db.connection import pool_ctx
 
     async def _run() -> ResolutionStats:
         async with pool_ctx(dsn) as pool:
-            return await resolve_repo_imports(pool, repo_id)
+            return await resolve_branch_imports(pool, repo_id, branch_id)
 
     return asyncio.run(_run())
+
+
+# Backwards-compatible alias.
+resolve_repo_imports_sync = resolve_branch_imports_sync

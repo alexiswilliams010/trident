@@ -1,12 +1,18 @@
 """Graph traversal queries over the semantic code graph.
 
 Pure SQL against Tier 2 tables (definitions, call_edges, inherits_edges,
-overrides_edges, imports, files, nodes). Returns definition metadata, not
-chunks — complementary to core/retrieval.py which is embedding-focused.
+overrides_edges, imports, file_versions, branch_files, nodes). Returns
+definition metadata, not chunks — complementary to core/retrieval.py which
+is embedding-focused.
+
+Branch model: every public function takes a list of `branch_ids`. Definitions
+are content-shared so a single def can be visible in multiple branches;
+results are de-duped by def_id. Edge tables (call_edges, inherits_edges,
+overrides_edges, imports) are per-branch and filtered by branch_id, so a
+walk's results reflect the union of those branches' resolution context.
 
 All queries run inside a transaction with a configurable statement timeout
-(default 120s). No internal depth limits are imposed; the timeout is the
-only guardrail. An optional max_depth can be passed to recursive traversals.
+(default 120s).
 """
 
 from __future__ import annotations
@@ -23,7 +29,7 @@ class DefInfo:
     qualified_name: str
     kind: str
     file_path: str
-    file_id: int
+    file_version_id: int
     start_line: int
     end_line: int
     visibility: str | None
@@ -32,7 +38,7 @@ class DefInfo:
     depth: int | None = None
 
 
-def _norm_repo_ids(x: int | list[int]) -> list[int]:
+def _norm_branch_ids(x: int | list[int]) -> list[int]:
     if isinstance(x, int):
         return [x]
     return list(x)
@@ -45,7 +51,7 @@ def _row_to_def(r: asyncpg.Record) -> DefInfo:
         qualified_name=r["qualified_name"],
         kind=r["kind"],
         file_path=r["file_path"],
-        file_id=r["file_id"],
+        file_version_id=r["file_version_id"],
         start_line=r["start_row"],
         end_line=r["end_row"],
         visibility=r.get("visibility"),
@@ -53,10 +59,23 @@ def _row_to_def(r: asyncpg.Record) -> DefInfo:
     )
 
 
+# Common SELECT-fragment for definitions joined with their nodes and the path
+# they have in the current branch set. `bf.path` is the per-branch path
+# mapping; using `DISTINCT ON (d.id)` and ordering by branch_id keeps a
+# single representative row per def even when the same def is visible in
+# multiple of the requested branches.
 _DEF_COLS = """\
 d.id AS def_id, d.name, d.qualified_name, d.kind, d.visibility,
-f.path AS file_path, f.id AS file_id, f.repo_id,
+bf.path AS file_path, fv.id AS file_version_id, b.repo_id,
 n.start_row, n.end_row, n.start_byte, n.end_byte"""
+
+# Standard JOIN suffix that reaches branch_files + branches + file_versions
+# from a definitions row. Caller adds the WHERE on bf.branch_id.
+_DEF_JOINS = """\
+JOIN nodes n ON n.id = d.node_id
+JOIN file_versions fv ON fv.id = d.file_version_id
+JOIN branch_files bf ON bf.file_version_id = fv.id
+JOIN branches b ON b.id = bf.branch_id"""
 
 
 async def _set_timeout(conn: asyncpg.Connection, timeout_s: int) -> None:
@@ -70,15 +89,15 @@ async def _set_timeout(conn: asyncpg.Connection, timeout_s: int) -> None:
 
 async def resolve_definitions(
     pool: asyncpg.Pool,
-    repo_ids: int | list[int],
+    branch_ids: int | list[int],
     name: str,
     *,
     kind: str | None = None,
     timeout_s: int = 120,
 ) -> list[DefInfo]:
-    rids = _norm_repo_ids(repo_ids)
+    bids = _norm_branch_ids(branch_ids)
     kind_clause = "AND d.kind = $3" if kind else ""
-    params: list = [rids, name]
+    params: list = [bids, name]
     if kind:
         params.append(kind)
     async with pool.acquire() as conn:
@@ -86,15 +105,14 @@ async def resolve_definitions(
             await _set_timeout(conn, timeout_s)
             rows = await conn.fetch(
                 f"""
-                SELECT {_DEF_COLS}
+                SELECT DISTINCT ON (d.id) {_DEF_COLS}
                 FROM definitions d
-                JOIN nodes n ON n.id = d.node_id
-                JOIN files f ON f.id = d.file_id
-                WHERE f.repo_id = ANY($1::bigint[])
+                {_DEF_JOINS}
+                WHERE bf.branch_id = ANY($1::bigint[])
                   AND (d.name = $2 OR d.qualified_name = $2
                        OR d.qualified_name LIKE '%%.' || $2)
                   {kind_clause}
-                ORDER BY d.qualified_name
+                ORDER BY d.id, bf.branch_id
                 """,
                 *params,
             )
@@ -103,18 +121,18 @@ async def resolve_definitions(
 
 async def _resolve_def_ids(
     conn: asyncpg.Connection,
-    repo_ids: list[int],
+    branch_ids: list[int],
     name: str,
 ) -> list[int]:
     rows = await conn.fetch(
         """
-        SELECT d.id FROM definitions d
-        JOIN files f ON f.id = d.file_id
-        WHERE f.repo_id = ANY($1::bigint[])
+        SELECT DISTINCT d.id FROM definitions d
+        JOIN branch_files bf ON bf.file_version_id = d.file_version_id
+        WHERE bf.branch_id = ANY($1::bigint[])
           AND (d.name = $2 OR d.qualified_name = $2
                OR d.qualified_name LIKE '%.' || $2)
         """,
-        repo_ids, name,
+        branch_ids, name,
     )
     return [r["id"] for r in rows]
 
@@ -126,15 +144,15 @@ async def _resolve_def_ids(
 
 async def callers_of(
     pool: asyncpg.Pool,
-    repo_ids: int | list[int],
+    branch_ids: int | list[int],
     name: str,
     *,
     confidence: str | None = None,
     timeout_s: int = 120,
 ) -> list[DefInfo]:
-    rids = _norm_repo_ids(repo_ids)
+    bids = _norm_branch_ids(branch_ids)
     conf_clause = "AND ce.confidence = $3" if confidence else ""
-    params: list = [rids, name]
+    params: list = [bids, name]
     if confidence:
         params.append(confidence)
     async with pool.acquire() as conn:
@@ -145,15 +163,14 @@ async def callers_of(
                 SELECT DISTINCT ON (d.id) {_DEF_COLS}
                 FROM call_edges ce
                 JOIN definitions target ON target.id = ce.callee_def_id
-                JOIN files tf ON tf.id = target.file_id
                 JOIN definitions d ON d.id = ce.caller_def_id
-                JOIN nodes n ON n.id = d.node_id
-                JOIN files f ON f.id = d.file_id
-                WHERE tf.repo_id = ANY($1::bigint[])
+                {_DEF_JOINS}
+                WHERE ce.branch_id = ANY($1::bigint[])
+                  AND bf.branch_id = ANY($1::bigint[])
                   AND (target.name = $2 OR target.qualified_name = $2
                        OR target.qualified_name LIKE '%%.' || $2)
                   {conf_clause}
-                ORDER BY d.id
+                ORDER BY d.id, bf.branch_id
                 """,
                 *params,
             )
@@ -162,15 +179,15 @@ async def callers_of(
 
 async def callees_of(
     pool: asyncpg.Pool,
-    repo_ids: int | list[int],
+    branch_ids: int | list[int],
     name: str,
     *,
     confidence: str | None = None,
     timeout_s: int = 120,
 ) -> list[DefInfo]:
-    rids = _norm_repo_ids(repo_ids)
+    bids = _norm_branch_ids(branch_ids)
     conf_clause = "AND ce.confidence = $3" if confidence else ""
-    params: list = [rids, name]
+    params: list = [bids, name]
     if confidence:
         params.append(confidence)
     async with pool.acquire() as conn:
@@ -181,15 +198,14 @@ async def callees_of(
                 SELECT DISTINCT ON (d.id) {_DEF_COLS}
                 FROM call_edges ce
                 JOIN definitions caller ON caller.id = ce.caller_def_id
-                JOIN files cf ON cf.id = caller.file_id
                 JOIN definitions d ON d.id = ce.callee_def_id
-                JOIN nodes n ON n.id = d.node_id
-                JOIN files f ON f.id = d.file_id
-                WHERE cf.repo_id = ANY($1::bigint[])
+                {_DEF_JOINS}
+                WHERE ce.branch_id = ANY($1::bigint[])
+                  AND bf.branch_id = ANY($1::bigint[])
                   AND (caller.name = $2 OR caller.qualified_name = $2
                        OR caller.qualified_name LIKE '%%.' || $2)
                   {conf_clause}
-                ORDER BY d.id
+                ORDER BY d.id, bf.branch_id
                 """,
                 *params,
             )
@@ -203,7 +219,7 @@ async def callees_of(
 
 async def ancestors(
     pool: asyncpg.Pool,
-    repo_ids: int | list[int],
+    branch_ids: int | list[int],
     name: str,
     *,
     max_depth: int | None = None,
@@ -211,18 +227,20 @@ async def ancestors(
     timeout_s: int = 120,
 ) -> list[DefInfo]:
     """Transitive callers — upward call-graph slice."""
-    rids = _norm_repo_ids(repo_ids)
+    bids = _norm_branch_ids(branch_ids)
     depth_clause = f"AND anc.depth < {max_depth}" if max_depth is not None else ""
-    conf_clause = "AND ce.confidence = $2" if confidence else ""
-    params: list = [rids]
+    conf_clause_param_idx = 3
+    conf_clause = f"AND ce.confidence = ${conf_clause_param_idx}" if confidence else ""
+    params: list = [None, bids]  # placeholder; filled in below
     if confidence:
         params.append(confidence)
     async with pool.acquire() as conn:
         async with conn.transaction():
             await _set_timeout(conn, timeout_s)
-            seed_ids = await _resolve_def_ids(conn, rids, name)
+            seed_ids = await _resolve_def_ids(conn, bids, name)
             if not seed_ids:
                 return []
+            params[0] = seed_ids
             rows = await conn.fetch(
                 f"""
                 WITH RECURSIVE anc AS (
@@ -230,24 +248,26 @@ async def ancestors(
                     FROM call_edges ce
                     WHERE ce.callee_def_id = ANY($1::bigint[])
                       AND ce.caller_def_id IS NOT NULL
-                      {conf_clause.replace('$2', '$' + str(len(params) + 1)) if confidence else ''}
+                      AND ce.branch_id = ANY($2::bigint[])
+                      {conf_clause}
                     UNION
                     SELECT ce.caller_def_id, anc.depth + 1
                     FROM call_edges ce
                     JOIN anc ON anc.def_id = ce.callee_def_id
                     WHERE ce.caller_def_id IS NOT NULL
                       AND ce.caller_def_id != ALL($1::bigint[])
+                      AND ce.branch_id = ANY($2::bigint[])
                       {depth_clause}
-                      {conf_clause.replace('$2', '$' + str(len(params) + 1)) if confidence else ''}
+                      {conf_clause}
                 )
                 SELECT DISTINCT ON (d.id) {_DEF_COLS}, anc.depth
                 FROM anc
                 JOIN definitions d ON d.id = anc.def_id
-                JOIN nodes n ON n.id = d.node_id
-                JOIN files f ON f.id = d.file_id
-                ORDER BY d.id, anc.depth
+                {_DEF_JOINS}
+                WHERE bf.branch_id = ANY($2::bigint[])
+                ORDER BY d.id, anc.depth, bf.branch_id
                 """,
-                seed_ids, *params[1:],
+                *params,
             )
     result = []
     for r in rows:
@@ -259,7 +279,7 @@ async def ancestors(
 
 async def reachable_from(
     pool: asyncpg.Pool,
-    repo_ids: int | list[int],
+    branch_ids: int | list[int],
     name: str,
     *,
     max_depth: int | None = None,
@@ -267,18 +287,20 @@ async def reachable_from(
     timeout_s: int = 120,
 ) -> list[DefInfo]:
     """Transitive callees — downward call-graph slice (blast radius)."""
-    rids = _norm_repo_ids(repo_ids)
+    bids = _norm_branch_ids(branch_ids)
     depth_clause = f"AND reach.depth < {max_depth}" if max_depth is not None else ""
-    conf_clause = "AND ce.confidence = $2" if confidence else ""
-    params: list = [rids]
+    conf_clause_param_idx = 3
+    conf_clause = f"AND ce.confidence = ${conf_clause_param_idx}" if confidence else ""
+    params: list = [None, bids]
     if confidence:
         params.append(confidence)
     async with pool.acquire() as conn:
         async with conn.transaction():
             await _set_timeout(conn, timeout_s)
-            seed_ids = await _resolve_def_ids(conn, rids, name)
+            seed_ids = await _resolve_def_ids(conn, bids, name)
             if not seed_ids:
                 return []
+            params[0] = seed_ids
             rows = await conn.fetch(
                 f"""
                 WITH RECURSIVE reach AS (
@@ -286,24 +308,26 @@ async def reachable_from(
                     FROM call_edges ce
                     WHERE ce.caller_def_id = ANY($1::bigint[])
                       AND ce.callee_def_id IS NOT NULL
-                      {conf_clause.replace('$2', '$' + str(len(params) + 1)) if confidence else ''}
+                      AND ce.branch_id = ANY($2::bigint[])
+                      {conf_clause}
                     UNION
                     SELECT ce.callee_def_id, reach.depth + 1
                     FROM call_edges ce
                     JOIN reach ON reach.def_id = ce.caller_def_id
                     WHERE ce.callee_def_id IS NOT NULL
                       AND ce.callee_def_id != ALL($1::bigint[])
+                      AND ce.branch_id = ANY($2::bigint[])
                       {depth_clause}
-                      {conf_clause.replace('$2', '$' + str(len(params) + 1)) if confidence else ''}
+                      {conf_clause}
                 )
                 SELECT DISTINCT ON (d.id) {_DEF_COLS}, reach.depth
                 FROM reach
                 JOIN definitions d ON d.id = reach.def_id
-                JOIN nodes n ON n.id = d.node_id
-                JOIN files f ON f.id = d.file_id
-                ORDER BY d.id, reach.depth
+                {_DEF_JOINS}
+                WHERE bf.branch_id = ANY($2::bigint[])
+                ORDER BY d.id, reach.depth, bf.branch_id
                 """,
-                seed_ids, *params[1:],
+                *params,
             )
     result = []
     for r in rows:
@@ -320,7 +344,7 @@ async def reachable_from(
 
 async def paths_between(
     pool: asyncpg.Pool,
-    repo_ids: int | list[int],
+    branch_ids: int | list[int],
     source_name: str,
     target_name: str,
     *,
@@ -328,8 +352,8 @@ async def paths_between(
     max_paths: int = 50,
     timeout_s: int = 120,
 ) -> list[list[DefInfo]]:
-    """All simple call paths between two definitions."""
-    rids = _norm_repo_ids(repo_ids)
+    """All simple call paths between two definitions, scoped to branch set."""
+    bids = _norm_branch_ids(branch_ids)
     depth_clause = (
         f"AND array_length(p.path, 1) < {max_depth}"
         if max_depth is not None else ""
@@ -337,8 +361,8 @@ async def paths_between(
     async with pool.acquire() as conn:
         async with conn.transaction():
             await _set_timeout(conn, timeout_s)
-            src_ids = await _resolve_def_ids(conn, rids, source_name)
-            dst_ids = await _resolve_def_ids(conn, rids, target_name)
+            src_ids = await _resolve_def_ids(conn, bids, source_name)
+            dst_ids = await _resolve_def_ids(conn, bids, target_name)
             if not src_ids or not dst_ids:
                 return []
             path_rows = await conn.fetch(
@@ -348,19 +372,21 @@ async def paths_between(
                     FROM call_edges ce
                     WHERE ce.caller_def_id = ANY($1::bigint[])
                       AND ce.callee_def_id IS NOT NULL
+                      AND ce.branch_id = ANY($4::bigint[])
                     UNION ALL
                     SELECT p.path || ce.callee_def_id
                     FROM paths p
                     JOIN call_edges ce ON ce.caller_def_id = p.path[array_length(p.path, 1)]
                     WHERE ce.callee_def_id IS NOT NULL
                       AND NOT p.path @> ARRAY[ce.callee_def_id]
+                      AND ce.branch_id = ANY($4::bigint[])
                       {depth_clause}
                 )
                 SELECT path FROM paths
                 WHERE path[array_length(path, 1)] = ANY($2::bigint[])
                 LIMIT $3
                 """,
-                src_ids, dst_ids, max_paths,
+                src_ids, dst_ids, max_paths, bids,
             )
             if not path_rows:
                 return []
@@ -369,13 +395,14 @@ async def paths_between(
                 all_ids.update(pr["path"])
             def_rows = await conn.fetch(
                 f"""
-                SELECT {_DEF_COLS}
+                SELECT DISTINCT ON (d.id) {_DEF_COLS}
                 FROM definitions d
-                JOIN nodes n ON n.id = d.node_id
-                JOIN files f ON f.id = d.file_id
+                {_DEF_JOINS}
                 WHERE d.id = ANY($1::bigint[])
+                  AND bf.branch_id = ANY($2::bigint[])
+                ORDER BY d.id, bf.branch_id
                 """,
-                list(all_ids),
+                list(all_ids), bids,
             )
     defs_by_id = {r["def_id"]: _row_to_def(r) for r in def_rows}
     result: list[list[DefInfo]] = []
@@ -393,22 +420,18 @@ async def paths_between(
 
 async def entrypoints(
     pool: asyncpg.Pool,
-    repo_ids: int | list[int],
+    branch_ids: int | list[int],
     *,
     kind: str | None = None,
     file_path: str | None = None,
     include_internal: bool = False,
     timeout_s: int = 120,
 ) -> list[DefInfo]:
-    """Functions/methods with no internal callers and no override relationships.
-
-    By default excludes constructors, internal/private visibility, and
-    interface file stubs. Pass --kind constructor to include constructors,
-    or include_internal=True to include internal/private functions.
-    """
-    rids = _norm_repo_ids(repo_ids)
+    """Functions/methods with no internal callers and no override relationships,
+    visible in the given branches."""
+    bids = _norm_branch_ids(branch_ids)
     clauses: list[str] = []
-    params: list = [rids]
+    params: list = [bids]
     idx = 2
     if kind:
         clauses.append(f"AND d.kind = ${idx}")
@@ -417,30 +440,31 @@ async def entrypoints(
     else:
         clauses.append("AND d.kind IN ('function', 'method')")
     if file_path:
-        clauses.append(f"AND f.path LIKE '%%' || ${idx}")
+        clauses.append(f"AND bf.path LIKE '%%' || ${idx}")
         params.append(file_path)
         idx += 1
     if not include_internal:
         clauses.append("AND (d.visibility IS NULL OR d.visibility NOT IN ('internal', 'private'))")
-        clauses.append("AND f.path NOT LIKE '%%/interfaces/%%'")
-        clauses.append("AND f.path NOT LIKE '%%/interface/%%'")
+        clauses.append("AND bf.path NOT LIKE '%%/interfaces/%%'")
+        clauses.append("AND bf.path NOT LIKE '%%/interface/%%'")
     extra = "\n                  ".join(clauses)
     async with pool.acquire() as conn:
         async with conn.transaction():
             await _set_timeout(conn, timeout_s)
             rows = await conn.fetch(
                 f"""
-                SELECT {_DEF_COLS}
+                SELECT DISTINCT ON (d.id) {_DEF_COLS}
                 FROM definitions d
-                JOIN nodes n ON n.id = d.node_id
-                JOIN files f ON f.id = d.file_id
-                LEFT JOIN call_edges ce ON ce.callee_def_id = d.id
-                LEFT JOIN overrides_edges oe ON oe.child_def_id = d.id
-                WHERE f.repo_id = ANY($1::bigint[])
+                {_DEF_JOINS}
+                LEFT JOIN call_edges ce
+                    ON ce.callee_def_id = d.id AND ce.branch_id = ANY($1::bigint[])
+                LEFT JOIN overrides_edges oe
+                    ON oe.child_def_id = d.id AND oe.branch_id = ANY($1::bigint[])
+                WHERE bf.branch_id = ANY($1::bigint[])
                   AND ce.id IS NULL
                   AND oe.id IS NULL
                   {extra}
-                ORDER BY f.path, d.qualified_name
+                ORDER BY d.id, bf.branch_id
                 """,
                 *params,
             )
@@ -449,7 +473,7 @@ async def entrypoints(
 
 async def entrypoint_paths(
     pool: asyncpg.Pool,
-    repo_ids: int | list[int],
+    branch_ids: int | list[int],
     target_name: str,
     *,
     max_depth: int | None = None,
@@ -457,8 +481,8 @@ async def entrypoint_paths(
     timeout_s: int = 120,
 ) -> list[list[DefInfo]]:
     """Call paths from entrypoints to a target definition."""
-    anc = await ancestors(pool, repo_ids, target_name, max_depth=max_depth, timeout_s=timeout_s)
-    ep = await entrypoints(pool, repo_ids, timeout_s=timeout_s)
+    anc = await ancestors(pool, branch_ids, target_name, max_depth=max_depth, timeout_s=timeout_s)
+    ep = await entrypoints(pool, branch_ids, timeout_s=timeout_s)
     ep_ids = {e.def_id for e in ep}
     entry_ancestors = [a for a in anc if a.def_id in ep_ids]
     if not entry_ancestors:
@@ -466,7 +490,7 @@ async def entrypoint_paths(
     result: list[list[DefInfo]] = []
     for ea in entry_ancestors:
         p = await paths_between(
-            pool, repo_ids, ea.qualified_name, target_name,
+            pool, branch_ids, ea.qualified_name, target_name,
             max_depth=max_depth, max_paths=max(1, max_paths // len(entry_ancestors)),
             timeout_s=timeout_s,
         )
@@ -483,16 +507,16 @@ async def entrypoint_paths(
 
 async def get_source(
     pool: asyncpg.Pool,
-    repo_ids: int | list[int],
+    branch_ids: int | list[int],
     name: str,
     *,
     kind: str | None = None,
     timeout_s: int = 120,
 ) -> list[DefInfo]:
     """Resolve definitions and populate source from raw file content."""
-    rids = _norm_repo_ids(repo_ids)
+    bids = _norm_branch_ids(branch_ids)
     kind_clause = "AND d.kind = $3" if kind else ""
-    params: list = [rids, name]
+    params: list = [bids, name]
     if kind:
         params.append(kind)
     async with pool.acquire() as conn:
@@ -500,15 +524,14 @@ async def get_source(
             await _set_timeout(conn, timeout_s)
             rows = await conn.fetch(
                 f"""
-                SELECT {_DEF_COLS}, f.raw_content
+                SELECT DISTINCT ON (d.id) {_DEF_COLS}, fv.raw_content
                 FROM definitions d
-                JOIN nodes n ON n.id = d.node_id
-                JOIN files f ON f.id = d.file_id
-                WHERE f.repo_id = ANY($1::bigint[])
+                {_DEF_JOINS}
+                WHERE bf.branch_id = ANY($1::bigint[])
                   AND (d.name = $2 OR d.qualified_name = $2
                        OR d.qualified_name LIKE '%%.' || $2)
                   {kind_clause}
-                ORDER BY d.qualified_name
+                ORDER BY d.id, bf.branch_id
                 """,
                 *params,
             )
@@ -533,23 +556,23 @@ class ImportInfo:
     dep_class: str
     resolved_file: str | None
     file_path: str
-    file_id: int
+    file_version_id: int
 
 
 async def file_imports(
     pool: asyncpg.Pool,
-    repo_ids: int | list[int],
+    branch_ids: int | list[int],
     *,
     file_path: str | None = None,
     dep_class: str | None = None,
     timeout_s: int = 120,
 ) -> list[ImportInfo]:
-    rids = _norm_repo_ids(repo_ids)
+    bids = _norm_branch_ids(branch_ids)
     clauses: list[str] = []
-    params: list = [rids]
+    params: list = [bids]
     idx = 2
     if file_path:
-        clauses.append(f"AND f.path = ${idx}")
+        clauses.append(f"AND bf.path = ${idx}")
         params.append(file_path)
         idx += 1
     if dep_class:
@@ -563,14 +586,18 @@ async def file_imports(
             rows = await conn.fetch(
                 f"""
                 SELECT i.import_path, i.imported_names, i.dep_class,
-                       rf.path AS resolved_file,
-                       f.path AS file_path, f.id AS file_id
+                       rbf.path AS resolved_file,
+                       bf.path AS file_path, fv.id AS file_version_id
                 FROM imports i
-                JOIN files f ON f.id = i.file_id
-                LEFT JOIN files rf ON rf.id = i.resolved_file_id
-                WHERE f.repo_id = ANY($1::bigint[])
+                JOIN file_versions fv ON fv.id = i.file_version_id
+                JOIN branch_files bf
+                    ON bf.file_version_id = fv.id AND bf.branch_id = i.branch_id
+                LEFT JOIN branch_files rbf
+                    ON rbf.file_version_id = i.resolved_file_version_id
+                       AND rbf.branch_id = i.branch_id
+                WHERE i.branch_id = ANY($1::bigint[])
                   {extra}
-                ORDER BY f.path, i.import_path
+                ORDER BY bf.path, i.import_path
                 """,
                 *params,
             )
@@ -581,7 +608,7 @@ async def file_imports(
             dep_class=r["dep_class"],
             resolved_file=r["resolved_file"],
             file_path=r["file_path"],
-            file_id=r["file_id"],
+            file_version_id=r["file_version_id"],
         )
         for r in rows
     ]
@@ -589,29 +616,33 @@ async def file_imports(
 
 async def file_dependents(
     pool: asyncpg.Pool,
-    repo_ids: int | list[int],
+    branch_ids: int | list[int],
     file_path: str,
     *,
     timeout_s: int = 120,
 ) -> list[ImportInfo]:
     """Files that import a given file (reverse import lookup)."""
-    rids = _norm_repo_ids(repo_ids)
+    bids = _norm_branch_ids(branch_ids)
     async with pool.acquire() as conn:
         async with conn.transaction():
             await _set_timeout(conn, timeout_s)
             rows = await conn.fetch(
                 """
                 SELECT i.import_path, i.imported_names, i.dep_class,
-                       target.path AS resolved_file,
-                       f.path AS file_path, f.id AS file_id
+                       tbf.path AS resolved_file,
+                       bf.path AS file_path, fv.id AS file_version_id
                 FROM imports i
-                JOIN files f ON f.id = i.file_id
-                JOIN files target ON target.id = i.resolved_file_id
-                WHERE f.repo_id = ANY($1::bigint[])
-                  AND target.path = $2
-                ORDER BY f.path
+                JOIN file_versions fv ON fv.id = i.file_version_id
+                JOIN branch_files bf
+                    ON bf.file_version_id = fv.id AND bf.branch_id = i.branch_id
+                JOIN branch_files tbf
+                    ON tbf.file_version_id = i.resolved_file_version_id
+                       AND tbf.branch_id = i.branch_id
+                WHERE i.branch_id = ANY($1::bigint[])
+                  AND tbf.path = $2
+                ORDER BY bf.path
                 """,
-                rids, file_path,
+                bids, file_path,
             )
     return [
         ImportInfo(
@@ -620,7 +651,7 @@ async def file_dependents(
             dep_class=r["dep_class"],
             resolved_file=r["resolved_file"],
             file_path=r["file_path"],
-            file_id=r["file_id"],
+            file_version_id=r["file_version_id"],
         )
         for r in rows
     ]
@@ -640,28 +671,30 @@ class InheritanceNode:
 
 async def inheritance_tree(
     pool: asyncpg.Pool,
-    repo_ids: int | list[int],
+    branch_ids: int | list[int],
     name: str,
     *,
     timeout_s: int = 120,
 ) -> list[InheritanceNode]:
-    """Full inheritance hierarchy (up and down) from a named class."""
-    rids = _norm_repo_ids(repo_ids)
+    """Full inheritance hierarchy (up and down) from a named class, scoped to
+    the given branches."""
+    bids = _norm_branch_ids(branch_ids)
     async with pool.acquire() as conn:
         async with conn.transaction():
             await _set_timeout(conn, timeout_s)
-            seed_ids = await _resolve_def_ids(conn, rids, name)
+            seed_ids = await _resolve_def_ids(conn, bids, name)
             if not seed_ids:
                 return []
             rows = await conn.fetch(
                 f"""
                 WITH RECURSIVE tree AS (
-                    -- seed: both sides of edges touching the seed
                     SELECT child_def_id AS def_id FROM inherits_edges
-                    WHERE child_def_id = ANY($1::bigint[]) OR base_def_id = ANY($1::bigint[])
+                    WHERE branch_id = ANY($2::bigint[])
+                      AND (child_def_id = ANY($1::bigint[]) OR base_def_id = ANY($1::bigint[]))
                     UNION
                     SELECT base_def_id FROM inherits_edges
-                    WHERE (child_def_id = ANY($1::bigint[]) OR base_def_id = ANY($1::bigint[]))
+                    WHERE branch_id = ANY($2::bigint[])
+                      AND (child_def_id = ANY($1::bigint[]) OR base_def_id = ANY($1::bigint[]))
                       AND base_def_id IS NOT NULL
                 ),
                 walk_up AS (
@@ -671,6 +704,7 @@ async def inheritance_tree(
                     FROM inherits_edges ie
                     JOIN walk_up w ON w.def_id = ie.child_def_id
                     WHERE ie.base_def_id IS NOT NULL
+                      AND ie.branch_id = ANY($2::bigint[])
                 ),
                 walk_down AS (
                     SELECT def_id FROM tree
@@ -678,41 +712,44 @@ async def inheritance_tree(
                     SELECT ie.child_def_id
                     FROM inherits_edges ie
                     JOIN walk_down w ON w.def_id = ie.base_def_id
+                    WHERE ie.branch_id = ANY($2::bigint[])
                 ),
                 all_ids AS (
                     SELECT def_id FROM walk_up
                     UNION
                     SELECT def_id FROM walk_down
                 )
-                SELECT DISTINCT {_DEF_COLS}
+                SELECT DISTINCT ON (d.id) {_DEF_COLS}
                 FROM all_ids a
                 JOIN definitions d ON d.id = a.def_id
-                JOIN nodes n ON n.id = d.node_id
-                JOIN files f ON f.id = d.file_id
-                ORDER BY d.qualified_name
+                {_DEF_JOINS}
+                WHERE bf.branch_id = ANY($2::bigint[])
+                ORDER BY d.id, bf.branch_id
                 """,
-                seed_ids,
+                seed_ids, bids,
             )
             all_ids = [r["def_id"] for r in rows]
             if not all_ids:
                 all_ids = seed_ids
                 rows = await conn.fetch(
                     f"""
-                    SELECT {_DEF_COLS}
+                    SELECT DISTINCT ON (d.id) {_DEF_COLS}
                     FROM definitions d
-                    JOIN nodes n ON n.id = d.node_id
-                    JOIN files f ON f.id = d.file_id
+                    {_DEF_JOINS}
                     WHERE d.id = ANY($1::bigint[])
+                      AND bf.branch_id = ANY($2::bigint[])
+                    ORDER BY d.id, bf.branch_id
                     """,
-                    all_ids,
+                    all_ids, bids,
                 )
             edge_rows = await conn.fetch(
                 """
                 SELECT child_def_id, base_def_id, base_name
                 FROM inherits_edges
-                WHERE child_def_id = ANY($1::bigint[]) OR base_def_id = ANY($1::bigint[])
+                WHERE branch_id = ANY($2::bigint[])
+                  AND (child_def_id = ANY($1::bigint[]) OR base_def_id = ANY($1::bigint[]))
                 """,
-                all_ids,
+                all_ids, bids,
             )
 
     defs_by_id = {r["def_id"]: _row_to_def(r) for r in rows}

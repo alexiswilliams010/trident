@@ -1,19 +1,19 @@
 """CLI: retrieve chunks from an indexed repo.
 
     python -m cli.query --repo-name myrepo --semantic "how does helper resolve?"
+    python -m cli.query --repo-name myrepo --branch feature/x --hybrid "..."
     python -m cli.query --repo-name myrepo --structural withdraw --depth 2
     python -m cli.query --repos repoA,repoB --hybrid "user data flow"
-    python -m cli.query --repo-name myrepo --semantic "..." --fake   # deterministic stub
+    python -m cli.query --repos repoA:main,repoB:feature/x --hybrid "..."
 
 By default the semantic / hybrid modes use the OpenAI-compatible gateway
 configured by EMBEDDING_BASE_URL / EMBEDDING_API_KEY / EMBEDDING_MODEL.
-Pass --fake to use the deterministic stub embedder (handy for sanity checks
-before signing up for an API key).
+Pass --fake to use the deterministic stub embedder.
 
-Cross-repo: pass --repos a,b,c (comma-separated names) to span multiple
-repos; --repo-name is sugar for the single-repo case. The hybrid query
-applies an MMR re-rank to keep results from collapsing into one repo when
-multiple are queried.
+Branch handling: each repo has a default branch. Pass --branch to scope
+the query to a specific branch. For cross-repo queries, --repos accepts
+`repo_name:branch_name` per entry; the branch part is optional and
+defaults to that repo's default branch.
 """
 
 
@@ -23,7 +23,7 @@ import argparse
 import asyncio
 import sys
 
-from cli._repo import resolve_repo_id, resolve_repo_ids
+from cli._repo import resolve_repo_and_branch, resolve_repo_branch_pairs
 from core.embedder import EmbedderConfig, OpenAICompatibleEmbedder, make_fake_embedder
 from core.retrieval import (
     RetrievedChunk,
@@ -47,13 +47,29 @@ def _print_chunks(chunks: list[RetrievedChunk], show_content: bool, content_char
             print("─" * 80)
 
 
-async def _resolve_repo_ids(pool, args: argparse.Namespace) -> list[int]:
-    """Either --repo-name (single, sugar) or --repos (comma-separated list)."""
+async def _resolve_branch_ids(pool, args: argparse.Namespace) -> list[int]:
+    """Either --repo-name [+ --branch] (single) or --repos a:branch,b:branch (cross-repo).
+
+    `--repos a,b` (no colons) defaults each repo to its own default branch.
+    Mixed entries (`a:main,b`) work too.
+    """
     if args.repos:
-        names = [s.strip() for s in args.repos.split(",") if s.strip()]
-        return await resolve_repo_ids(pool, names)
-    repo_id = await resolve_repo_id(pool, name=args.repo_name, create=False)
-    return [repo_id]
+        pairs: list[tuple[str, str | None]] = []
+        for chunk in args.repos.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if ":" in chunk:
+                repo, branch = chunk.split(":", 1)
+                pairs.append((repo.strip(), branch.strip() or None))
+            else:
+                pairs.append((chunk, None))
+        resolved = await resolve_repo_branch_pairs(pool, pairs)
+        return [bid for (_, bid) in resolved]
+    _repo_id, branch_id = await resolve_repo_and_branch(
+        pool, repo_name=args.repo_name, branch_name=args.branch, create=False,
+    )
+    return [branch_id]
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -71,30 +87,30 @@ async def _run(args: argparse.Namespace) -> int:
         embed_fn = None
 
     async with pool_ctx(args.dsn) as pool:
-        repo_ids = await _resolve_repo_ids(pool, args)
+        branch_ids = await _resolve_branch_ids(pool, args)
         if args.structural:
             chunks = await structural_query(
-                pool, repo_ids, args.structural,
+                pool, branch_ids, args.structural,
                 depth=args.depth, granularity=args.granularity,
             )
         elif args.semantic:
             assert embed_fn is not None
             chunks = await semantic_query(
-                pool, repo_ids, args.semantic, embed_fn,
+                pool, branch_ids, args.semantic, embed_fn,
                 top_k=args.top_k,
                 granularities=tuple(args.granularity.split(",")) if args.granularity else None,
             )
         elif args.hybrid:
             assert embed_fn is not None
             chunks = await hybrid_query(
-                pool, repo_ids, args.hybrid, embed_fn,
+                pool, branch_ids, args.hybrid, embed_fn,
                 top_k=args.top_k,
                 mmr_repo_lambda=args.mmr_repo_lambda,
                 mmr_file_lambda=args.mmr_file_lambda,
             )
         elif args.lexical:
             chunks = await lexical_query(
-                pool, repo_ids, args.lexical,
+                pool, branch_ids, args.lexical,
                 top_k=args.top_k,
                 granularities=tuple(args.granularity.split(",")) if args.granularity else None,
             )
@@ -125,7 +141,11 @@ def main(argv: list[str] | None = None) -> int:
     repo_group.add_argument("--repo-name", type=str,
                             help="Repo name (single-repo sugar; must already be indexed)")
     repo_group.add_argument("--repos", type=str,
-                            help="Comma-separated repo names for cross-repo queries")
+                            help="Comma-separated repo names for cross-repo queries. "
+                                 "Each entry may optionally be `repo:branch`; without "
+                                 "`:branch` each repo's default branch is used.")
+    parser.add_argument("--branch", type=str, default=None,
+                        help="Branch name for --repo-name. Defaults to the repo's default branch.")
     parser.add_argument("--dsn", type=str, default=None)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--semantic", type=str, help="natural-language query")

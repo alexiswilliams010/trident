@@ -12,6 +12,11 @@
                                      rerank.
     assemble_context(chunks, budget) — dedupe overlapping byte ranges,
                                        greedy fit under token budget.
+
+Branch model: every retrieval is scoped to a list of branch_ids. Each chunk
+is per-branch (the inlined skeleton encodes branch-resolved cross-file
+targets). chunk_embeddings is content-hash keyed and shared across branches
+so identical chunk text reuses one vector.
 """
 
 from __future__ import annotations
@@ -33,17 +38,16 @@ class RetrievedChunk:
     qualified_name: str | None
     granularity: str
     file_path: str
-    file_id: int
+    file_version_id: int
+    branch_id: int
     token_count: int
     content: str
     score: float                     # higher is better; meaning depends on query mode
     repo_id: int | None = None       # which repo this chunk came from (multi-repo aware)
 
 
-def _norm_repo_ids(x: int | list[int]) -> list[int]:
-    """`semantic_query(repo_ids=42)` is sugar for `repo_ids=[42]`. A single
-    int is by far the most common shape; the list form is what cross-repo
-    callers pass."""
+def _norm_branch_ids(x: int | list[int]) -> list[int]:
+    """`semantic_query(branch_ids=42)` is sugar for `branch_ids=[42]`."""
     if isinstance(x, int):
         return [x]
     return list(x)
@@ -56,32 +60,32 @@ def _norm_repo_ids(x: int | list[int]) -> list[int]:
 
 async def structural_query(
     pool: asyncpg.Pool,
-    repo_ids: int | list[int],
+    branch_ids: int | list[int],
     definition_name: str,
     *,
     depth: int = 2,
     granularity: str = "function",
 ) -> list[RetrievedChunk]:
     """Find a definition by name (or qualified_name suffix) and return its
-    chunk plus chunks for transitive callees up to `depth` hops.
+    chunk plus chunks for transitive callees up to `depth` hops, scoped to
+    the given branches. Score = 1.0 at hop 0, halved per hop.
 
-    Score = 1.0 at hop 0, halved per hop.
-
-    `repo_ids` can be a single int or a list. Cross-repo callers pass a
-    list; the seed lookup spans all listed repos. Graph walks are intra-repo
-    by construction (def IDs are globally unique and edges are created by
-    intra-repo resolution), so no extra filter is needed during the walk.
+    Definitions are content-shared across branches but the caller is asking
+    for results visible in `branch_ids`, so we restrict the seed lookup to
+    defs whose file_version is mapped by at least one of those branches.
+    Graph walks over `call_edges` are filtered by branch_id too — calls
+    can resolve to different callees in different branches.
     """
-    rids = _norm_repo_ids(repo_ids)
+    bids = _norm_branch_ids(branch_ids)
     async with pool.acquire() as conn:
         seeds = await conn.fetch(
             """
-            SELECT d.id FROM definitions d
-            JOIN files f ON f.id = d.file_id
-            WHERE f.repo_id = ANY($1::bigint[])
+            SELECT DISTINCT d.id FROM definitions d
+            JOIN branch_files bf ON bf.file_version_id = d.file_version_id
+            WHERE bf.branch_id = ANY($1::bigint[])
               AND (d.name = $2 OR d.qualified_name = $2 OR d.qualified_name LIKE '%.' || $2)
             """,
-            rids, definition_name,
+            bids, definition_name,
         )
         if not seeds:
             return []
@@ -91,9 +95,12 @@ async def structural_query(
             next_frontier: set[int] = set()
             for caller in frontier:
                 edges = await conn.fetch(
-                    "SELECT callee_def_id FROM call_edges "
-                    "WHERE caller_def_id=$1 AND callee_def_id IS NOT NULL",
-                    caller,
+                    """
+                    SELECT DISTINCT callee_def_id FROM call_edges
+                    WHERE caller_def_id=$1 AND callee_def_id IS NOT NULL
+                      AND branch_id = ANY($2::bigint[])
+                    """,
+                    caller, bids,
                 )
                 for e in edges:
                     cid = e["callee_def_id"]
@@ -106,7 +113,7 @@ async def structural_query(
             frontier = next_frontier
 
         return await _fetch_chunks_for_anchors(
-            conn, list(scores.keys()), scores, granularity, repo_ids=rids,
+            conn, list(scores.keys()), scores, granularity, branch_ids=bids,
         )
 
 
@@ -115,18 +122,6 @@ async def structural_query(
 # ────────────────────────────────────────────────────────────────────
 
 
-# Skeleton-penalty knobs. We deprioritize chunks whose anchor def has no
-# outgoing graph signal — declarations without bodies have zero rows in
-# `call_edges WHERE caller_def_id = anchor` and zero rows in
-# `data_access WHERE accessor_def_id = anchor`, while real implementations
-# accumulate at least a few. The check is purely structural: a def with no
-# outgoing graph edges *is* a skeleton by definition, regardless of how the
-# source language spells the construct.
-#
-# For module-granularity chunks (whose anchor is the synthetic module def —
-# file-level, no edges of its own), we use the SUM of all defs' outgoing
-# edges across the file. A file containing only declarations ends up at
-# zero; a normal implementation file has dozens. Same penalty applies.
 SKELETON_PENALTY_FLOOR = 0.3
 SKELETON_GRAPH_REF = 3       # def-level signal at which the factor reaches 1.0
 SKELETON_FILE_GRAPH_REF = 10 # file-level signal threshold for module chunks
@@ -141,40 +136,46 @@ _SKELETON_FACTOR_SQL = (
     f"                    LEAST(1.0, {_GRAPH_SIGNAL_SQL}::float / {SKELETON_GRAPH_REF})) END)"
 )
 # JOIN block reused by every retriever that applies the skeleton factor.
-# `out_calls` / `out_data` give the per-anchor (def-level) signal; `file_sig`
-# gives the per-file signal used by the module branch above. The latter is
-# computed once per query as a UNION ALL aggregate over the two edge tables.
+# Aggregations are keyed by (def_id, branch_id) / (file_version_id, branch_id)
+# so we can JOIN on the outer chunk's branch_id without needing LATERAL.
+# Postgres lazily evaluates subqueries with predicate pushdown; the WHERE
+# branch_id = ANY($BRANCHES) on the outer query effectively restricts these
+# aggregations to the queried branches via the join key.
 _SKELETON_JOINS_SQL = """
                 LEFT JOIN (
-                    SELECT caller_def_id AS did, COUNT(*) AS n
+                    SELECT caller_def_id AS did, branch_id, COUNT(*) AS n
                     FROM call_edges
                     WHERE caller_def_id IS NOT NULL
-                    GROUP BY caller_def_id
-                ) out_calls ON out_calls.did = d.id
+                    GROUP BY caller_def_id, branch_id
+                ) out_calls ON out_calls.did = d.id AND out_calls.branch_id = c.branch_id
                 LEFT JOIN (
-                    SELECT accessor_def_id AS did, COUNT(*) AS n
+                    SELECT accessor_def_id AS did, branch_id, COUNT(*) AS n
                     FROM data_access
-                    GROUP BY accessor_def_id
-                ) out_data ON out_data.did = d.id
+                    GROUP BY accessor_def_id, branch_id
+                ) out_data ON out_data.did = d.id AND out_data.branch_id = c.branch_id
                 LEFT JOIN (
-                    SELECT defs.file_id, COUNT(*) AS n
+                    SELECT defs.file_version_id, defs.branch_id, COUNT(*) AS n
                     FROM (
-                        SELECT d.file_id FROM call_edges ce
-                        JOIN definitions d ON d.id = ce.caller_def_id
-                        WHERE ce.caller_def_id IS NOT NULL
+                        SELECT d2.file_version_id, ce2.branch_id
+                        FROM call_edges ce2
+                        JOIN definitions d2 ON d2.id = ce2.caller_def_id
+                        WHERE ce2.caller_def_id IS NOT NULL
                         UNION ALL
-                        SELECT d.file_id FROM data_access da
-                        JOIN definitions d ON d.id = da.accessor_def_id
+                        SELECT d2.file_version_id, da2.branch_id
+                        FROM data_access da2
+                        JOIN definitions d2 ON d2.id = da2.accessor_def_id
                     ) AS defs
-                    GROUP BY defs.file_id
-                ) file_sig ON file_sig.file_id = c.file_id
+                    GROUP BY defs.file_version_id, defs.branch_id
+                ) file_sig
+                    ON file_sig.file_version_id = c.file_version_id
+                       AND file_sig.branch_id = c.branch_id
 """
 _SCORE_EXPR = f"(1.0 - (ce.embedding <=> $1::vector)) * {_SKELETON_FACTOR_SQL}"
 
 
 async def semantic_query(
     pool: asyncpg.Pool,
-    repo_ids: int | list[int],
+    branch_ids: int | list[int],
     query: str,
     embed_fn: EmbedFn,
     *,
@@ -188,44 +189,48 @@ async def semantic_query(
     if not vectors:
         return []
     qvec = _vector_literal(vectors[0])
-    rids = _norm_repo_ids(repo_ids)
+    bids = _norm_branch_ids(branch_ids)
 
     async with pool.acquire() as conn:
         if granularities:
             rows = await conn.fetch(
                 f"""
                 SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
-                       d.qualified_name, f.path AS file_path, f.id AS file_id,
-                       f.repo_id AS repo_id,
+                       c.branch_id, c.file_version_id,
+                       d.qualified_name, bf.path AS file_path,
+                       b.repo_id AS repo_id,
                        {_SCORE_EXPR} AS score
                 FROM chunks c
-                JOIN files f ON f.id = c.file_id
+                JOIN branches b ON b.id = c.branch_id
+                JOIN branch_files bf ON bf.branch_id = c.branch_id AND bf.file_version_id = c.file_version_id
                 LEFT JOIN definitions d ON d.id = c.anchor_def_id
                 {_SKELETON_JOINS_SQL}
-                JOIN chunk_embeddings ce ON ce.chunk_id = c.id
-                WHERE f.repo_id = ANY($2::bigint[]) AND c.granularity = ANY($3::text[])
+                JOIN chunk_embeddings ce ON ce.content_hash = c.content_hash
+                WHERE c.branch_id = ANY($2::bigint[]) AND c.granularity = ANY($3::text[])
                 ORDER BY score DESC
                 LIMIT $4
                 """,
-                qvec, rids, list(granularities), top_k,
+                qvec, bids, list(granularities), top_k,
             )
         else:
             rows = await conn.fetch(
                 f"""
                 SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
-                       d.qualified_name, f.path AS file_path, f.id AS file_id,
-                       f.repo_id AS repo_id,
+                       c.branch_id, c.file_version_id,
+                       d.qualified_name, bf.path AS file_path,
+                       b.repo_id AS repo_id,
                        {_SCORE_EXPR} AS score
                 FROM chunks c
-                JOIN files f ON f.id = c.file_id
+                JOIN branches b ON b.id = c.branch_id
+                JOIN branch_files bf ON bf.branch_id = c.branch_id AND bf.file_version_id = c.file_version_id
                 LEFT JOIN definitions d ON d.id = c.anchor_def_id
                 {_SKELETON_JOINS_SQL}
-                JOIN chunk_embeddings ce ON ce.chunk_id = c.id
-                WHERE f.repo_id = ANY($2::bigint[])
+                JOIN chunk_embeddings ce ON ce.content_hash = c.content_hash
+                WHERE c.branch_id = ANY($2::bigint[])
                 ORDER BY score DESC
                 LIMIT $3
                 """,
-                qvec, rids, top_k,
+                qvec, bids, top_k,
             )
     return [_row_to_chunk(r) for r in rows]
 
@@ -240,25 +245,7 @@ _LEX_SCORE_EXPR = f"ts_rank_cd(c.fts_doc, to_tsquery('english', $1)) * {_SKELETO
 
 
 def _build_tsquery(query: str) -> str | None:
-    """Sanitize a free-text query into an OR'd `tsquery` string. Returns None
-    if no valid tokens.
-
-    Each token is suffixed with `:*` for prefix matching, and compound
-    identifiers are fanned out to mirror the indexer (`chunk_assembler.
-    _expand_idents`): `getUserById` becomes `getuserbyid:* | get:* |
-    user:* | by:* | id:*`, so a body containing `getUserById` matches
-    a query for any of those parts and vice-versa.
-
-    OR semantics (rather than `plainto_tsquery`'s implicit AND) because
-    multi-word queries often mention several alternative terms — a query
-    like "user permission check" should still surface chunks that match
-    `permission` even without `user` or `check` present. The cover-density
-    rank function will rank chunks matching multiple terms above
-    single-term hits.
-
-    Tokens are constrained to `[A-Za-z0-9_]` so user-supplied content can't
-    inject tsquery operators (`!`, `&`, `|`, parens).
-    """
+    """Sanitize a free-text query into an OR'd `tsquery` string."""
     raw_tokens = _TSQUERY_TOKEN_RE.findall(query)
     if not raw_tokens:
         return None
@@ -283,63 +270,58 @@ def _build_tsquery(query: str) -> str | None:
 
 async def lexical_query(
     pool: asyncpg.Pool,
-    repo_ids: int | list[int],
+    branch_ids: int | list[int],
     query: str,
     *,
     top_k: int = 10,
     granularities: tuple[str, ...] | None = None,
 ) -> list[RetrievedChunk]:
-    """Lexical retrieval via Postgres full-text search. Uses `ts_rank_cd`
-    (cover density — weights term-proximity highly) over the precomputed
-    `chunks.fts_doc` column. Same skeleton-penalty multiplier as
-    `semantic_query` so this path doesn't surface signature-only defs
-    either.
-
-    Lexical retrieval is single-channel by design (no view aggregation):
-    `chunks.fts_doc` is one tsvector per chunk, populated at chunk-assembly
-    time with body-identifier fan-out (see `chunk_assembler._fts_text`).
-    """
+    """Lexical retrieval via Postgres full-text search."""
     tsq = _build_tsquery(query)
     if tsq is None:
         return []
-    rids = _norm_repo_ids(repo_ids)
+    bids = _norm_branch_ids(branch_ids)
 
     async with pool.acquire() as conn:
         if granularities:
             rows = await conn.fetch(
                 f"""
                 SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
-                       d.qualified_name, f.path AS file_path, f.id AS file_id,
-                       f.repo_id AS repo_id,
+                       c.branch_id, c.file_version_id,
+                       d.qualified_name, bf.path AS file_path,
+                       b.repo_id AS repo_id,
                        {_LEX_SCORE_EXPR} AS score
                 FROM chunks c
-                JOIN files f ON f.id = c.file_id
+                JOIN branches b ON b.id = c.branch_id
+                JOIN branch_files bf ON bf.branch_id = c.branch_id AND bf.file_version_id = c.file_version_id
                 LEFT JOIN definitions d ON d.id = c.anchor_def_id
                 {_SKELETON_JOINS_SQL}
-                WHERE f.repo_id = ANY($2::bigint[]) AND c.granularity = ANY($3::text[])
+                WHERE c.branch_id = ANY($2::bigint[]) AND c.granularity = ANY($3::text[])
                   AND c.fts_doc @@ to_tsquery('english', $1)
                 ORDER BY score DESC
                 LIMIT $4
                 """,
-                tsq, rids, list(granularities), top_k,
+                tsq, bids, list(granularities), top_k,
             )
         else:
             rows = await conn.fetch(
                 f"""
                 SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
-                       d.qualified_name, f.path AS file_path, f.id AS file_id,
-                       f.repo_id AS repo_id,
+                       c.branch_id, c.file_version_id,
+                       d.qualified_name, bf.path AS file_path,
+                       b.repo_id AS repo_id,
                        {_LEX_SCORE_EXPR} AS score
                 FROM chunks c
-                JOIN files f ON f.id = c.file_id
+                JOIN branches b ON b.id = c.branch_id
+                JOIN branch_files bf ON bf.branch_id = c.branch_id AND bf.file_version_id = c.file_version_id
                 LEFT JOIN definitions d ON d.id = c.anchor_def_id
                 {_SKELETON_JOINS_SQL}
-                WHERE f.repo_id = ANY($2::bigint[])
+                WHERE c.branch_id = ANY($2::bigint[])
                   AND c.fts_doc @@ to_tsquery('english', $1)
                 ORDER BY score DESC
                 LIMIT $3
                 """,
-                tsq, rids, top_k,
+                tsq, bids, top_k,
             )
     return [_row_to_chunk(r) for r in rows]
 
@@ -349,34 +331,16 @@ async def lexical_query(
 # ────────────────────────────────────────────────────────────────────
 
 
-RRF_K = 60        # Standard constant from the RRF paper. Damps the head-of-list
-                  # advantage so rank 1 isn't disproportionately above rank 2.
-SEM_WEIGHT = 0.5  # Per-retriever weight on the RRF contribution. Equal weights
-LEX_WEIGHT = 0.5  # by default; bump SEM > LEX for prose-y queries, LEX > SEM
-                  # for identifier-heavy queries.
+RRF_K = 60
+SEM_WEIGHT = 0.5
+LEX_WEIGHT = 0.5
 
 
 def _fuse_scores(
     sem_results: list[RetrievedChunk],
     lex_results: list[RetrievedChunk],
 ) -> tuple[dict[int, RetrievedChunk], dict[int, float]]:
-    """Reciprocal Rank Fusion. Each retriever contributes
-        weight_i / (RRF_K + rank_i)
-    per chunk it returned (1-indexed ranks). Chunks present in both
-    retrievers sum the contributions; chunks in one still get that
-    retriever's contribution.
-
-    Robust to score-distribution skew: a single dominant cosine hit no
-    longer drowns out the lexical retriever, which was the failure mode
-    that the previous score-fusion variant kept tripping under the
-    deterministic test embedder.
-
-    Final scores are normalized to [0, 1] (divide by the max) so downstream
-    graph bonuses (`graph_weight=0.3`, `override_weight=0.5`) keep their
-    "fraction of the seed's rank" meaning. Without this normalization the
-    raw RRF values are tiny (head of list ≈ 1/61 ≈ 0.016) and the bonus
-    constants would need re-tuning.
-    """
+    """Reciprocal Rank Fusion."""
     by_id: dict[int, RetrievedChunk] = {}
     score: dict[int, float] = {}
 
@@ -399,7 +363,7 @@ def _fuse_scores(
 
 async def hybrid_query(
     pool: asyncpg.Pool,
-    repo_ids: int | list[int],
+    branch_ids: int | list[int],
     query: str,
     embed_fn: EmbedFn,
     *,
@@ -412,57 +376,24 @@ async def hybrid_query(
 ) -> list[RetrievedChunk]:
     """Pull `candidate_pool` candidates from BOTH the semantic (cosine) and
     lexical (BM25 / FTS) retrievers, fuse via Reciprocal Rank Fusion, then
-    expand each anchor via:
-
-      - call_edges, 1 hop outbound (caller → callees);
-      - inherits_edges, bidirectional (children of a high-ranking base, bases
-        of a high-ranking child) — `graph_weight`;
-      - overrides_edges, bidirectional (overrides of a base method, base of an
-        override) — `override_weight`, higher than `graph_weight` because an
-        override IS the implementation of the base, not just structurally
-        related.
-
-    Then MMR-rerank with per-repo and per-file diversity penalties so the
-    top-k spans repos and files instead of collapsing into the most-cosine-
-    similar cluster. `mmr_repo_lambda` / `mmr_file_lambda` control the
-    penalty magnitudes; both are no-ops when only one repo/file appears in
-    the candidate pool.
-
-    The lexical layer fixes the case where rare domain identifiers don't
-    embed into recognizable neighbours but a plain keyword search nails
-    them. Bonuses are blended additively, then results are re-ranked.
-    Bidirectional walking on inheritance is what surfaces a child override
-    when the query happens to match the base first, and vice versa.
-
-    `repo_ids` may be a single int (single-repo query, sugar) or a list
-    (cross-repo query).
+    expand each anchor via call_edges + inherits_edges + overrides_edges
+    (all branch-scoped), then MMR-rerank for repo/file diversity.
     """
-    rids = _norm_repo_ids(repo_ids)
-    # Run cosine + lexical concurrently — they hit different indexes and
-    # don't share state, so the second one is essentially free in wall time.
+    bids = _norm_branch_ids(branch_ids)
     sem_results, lex_results = await asyncio.gather(
-        semantic_query(pool, rids, query, embed_fn, top_k=candidate_pool),
-        lexical_query(pool, rids, query, top_k=candidate_pool),
+        semantic_query(pool, bids, query, embed_fn, top_k=candidate_pool),
+        lexical_query(pool, bids, query, top_k=candidate_pool),
     )
     if not sem_results and not lex_results:
         return []
 
     by_id, scores = _fuse_scores(sem_results, lex_results)
-    # `scores` is already in [0, 1] by construction (each retriever
-    # contributes ≤ its weight). Sort the candidate pool by fused score
-    # for the graph-expansion seeding step below.
     candidates = sorted(by_id.values(), key=lambda c: scores[c.chunk_id], reverse=True)
     for c in candidates:
         c.score = scores[c.chunk_id]
 
-    # Cosine score by chunk_id, default 0 for chunks the cosine path didn't
-    # surface. Used only for anchor_scores → bonus magnitudes; the final
-    # ranking still goes through fused (normalized RRF) + bonuses.
     cosine_by_chunk: dict[int, float] = {c.chunk_id: c.score for c in sem_results}
 
-    # Take the MAX cosine score per anchor (a function chunk and its
-    # cross-module chunk share an anchor_def_id; we must not let the lower
-    # one win). Anchor_scores feeds bonus computation only.
     anchor_scores: dict[int, float] = {}
     for c in candidates:
         if c.anchor_def_id is None:
@@ -483,7 +414,6 @@ async def hybrid_query(
     anchor_ids = list(anchor_scores.keys())
     conf_weight = {"certain": 1.0, "inferred": 0.7, "uncertain": 0.4}
 
-    # related_def_id → max bonus across all incoming edges from the candidate pool.
     related_bonus: dict[int, float] = {}
 
     def _add_bonus(target_def_id: int, source_anchor: int, weight: float) -> None:
@@ -498,29 +428,16 @@ async def hybrid_query(
             SELECT caller_def_id, callee_def_id, confidence
             FROM call_edges
             WHERE caller_def_id = ANY($1::bigint[]) AND callee_def_id IS NOT NULL
+              AND branch_id = ANY($2::bigint[])
             """,
-            anchor_ids,
+            anchor_ids, bids,
         )
         for r in call_rows:
             _add_bonus(r["callee_def_id"], r["caller_def_id"],
                        conf_weight.get(r["confidence"], 0.5))
 
-        # Promote call callees into the anchor set for the inheritance/override
-        # passes below. Without this, a query that hits the public dispatcher
-        # (e.g. `Policy.onExecute`) never reaches the virtual hook's overrides
-        # (`Policy._onExecute → SingleExecutorPolicy._onExecute`), since the
-        # override chain hangs off the *callee*, not the seed.
-        #
-        # Use the *effective* caller score (raw seed + any inbound call bonus
-        # already accumulated in this pass) so that a callee transitively
-        # dispatching to overrides receives a magnitude comparable to its
-        # caller's effective rank. Without the effective score, a chain like
-        # `top_candidate → onExecute → _onExecute → override_impl` collapses to
-        # noise by the time it reaches the override.
         effective_anchor_scores = dict(anchor_scores)
         for cid, bonus in related_bonus.items():
-            # If an anchor was also a call target from another anchor, its
-            # effective score is the max(raw_semantic, raw_semantic + bonus).
             if cid in effective_anchor_scores:
                 effective_anchor_scores[cid] = effective_anchor_scores[cid] + bonus
         callee_seed_score: dict[int, float] = {}
@@ -535,17 +452,15 @@ async def hybrid_query(
         expanded_ids = list(expanded_scores.keys())
 
         # ── 2. inherits_edges: bidirectional ──
-        # Downward (base in pool → its children): "show me the overrides of
-        # this base." Upward (child in pool → its bases): "show me what this
-        # inherits from."
         inh_rows = await conn.fetch(
             """
             SELECT child_def_id, base_def_id, confidence
             FROM inherits_edges
             WHERE base_def_id IS NOT NULL
+              AND branch_id = ANY($2::bigint[])
               AND (base_def_id = ANY($1::bigint[]) OR child_def_id = ANY($1::bigint[]))
             """,
-            expanded_ids,
+            expanded_ids, bids,
         )
         for r in inh_rows:
             w = conf_weight.get(r["confidence"], 0.5)
@@ -560,14 +475,15 @@ async def hybrid_query(
                 if bonus > related_bonus.get(r["base_def_id"], 0.0):
                     related_bonus[r["base_def_id"]] = bonus
 
-        # ── 3. overrides_edges: bidirectional, weighted higher than calls/inherits ──
+        # ── 3. overrides_edges: bidirectional ──
         ovr_rows = await conn.fetch(
             """
             SELECT child_def_id, base_def_id
             FROM overrides_edges
-            WHERE child_def_id = ANY($1::bigint[]) OR base_def_id = ANY($1::bigint[])
+            WHERE branch_id = ANY($2::bigint[])
+              AND (child_def_id = ANY($1::bigint[]) OR base_def_id = ANY($1::bigint[]))
             """,
-            expanded_ids,
+            expanded_ids, bids,
         )
         for r in ovr_rows:
             if r["base_def_id"] in expanded_scores:
@@ -585,7 +501,7 @@ async def hybrid_query(
             related_ids = sorted(related_bonus.keys())
             related_chunks = await _fetch_chunks_for_anchors(
                 conn, related_ids, scores={cid: 1.0 for cid in related_ids},
-                granularity="function", repo_ids=rids,
+                granularity="function", branch_ids=bids,
             )
             for nc in related_chunks:
                 bonus = related_bonus.get(nc.anchor_def_id or -1, 0.0)
@@ -614,21 +530,11 @@ def _mmr_rerank(
     repo_lambda: float = 0.3,
     file_lambda: float = 0.15,
 ) -> list[RetrievedChunk]:
-    """Greedy MMR with per-repo + per-file diversity penalties.
-
-    At each pick:
-        adjusted = base_score - repo_lambda*n_repo_picked - file_lambda*n_file_picked
-
-    `n_repo_picked` / `n_file_picked` are counts of items already chosen
-    sharing the same repo / file. Returns up to `top_k`.
-
-    No-op when the candidate pool spans only one repo and one file — the
-    natural single-repo, single-file case shouldn't shuffle results.
-    """
+    """Greedy MMR with per-repo + per-file diversity penalties."""
     if not candidates:
         return []
     distinct_repos = {c.repo_id for c in candidates if c.repo_id is not None}
-    distinct_files = {c.file_id for c in candidates}
+    distinct_files = {c.file_version_id for c in candidates}
     if len(distinct_repos) <= 1 and len(distinct_files) <= 1:
         return candidates[:top_k]
 
@@ -643,7 +549,7 @@ def _mmr_rerank(
         for i, c in enumerate(remaining):
             penalty = (
                 repo_lambda * repo_count.get(c.repo_id, 0)
-                + file_lambda * file_count.get(c.file_id, 0)
+                + file_lambda * file_count.get(c.file_version_id, 0)
             )
             adj = scores.get(c.chunk_id, 0.0) - penalty
             if adj > best_adj:
@@ -652,7 +558,7 @@ def _mmr_rerank(
         chosen = remaining.pop(best_idx)
         picked.append(chosen)
         repo_count[chosen.repo_id] = repo_count.get(chosen.repo_id, 0) + 1
-        file_count[chosen.file_id] = file_count.get(chosen.file_id, 0) + 1
+        file_count[chosen.file_version_id] = file_count.get(chosen.file_version_id, 0) + 1
     return picked
 
 
@@ -663,7 +569,7 @@ def _mmr_rerank(
 
 def assemble_context(chunks: list[RetrievedChunk], token_budget: int) -> str:
     """Greedy fit chunks under `token_budget`, deduping overlapping chunks
-    that share the same anchor file path."""
+    that share the same anchor."""
     seen_anchors: set[tuple[int, str]] = set()
     used: list[RetrievedChunk] = []
     remaining = token_budget
@@ -685,8 +591,6 @@ def assemble_context(chunks: list[RetrievedChunk], token_budget: int) -> str:
 
 
 def _row_to_chunk(r: asyncpg.Record) -> RetrievedChunk:
-    # `r.keys()` returns a one-shot iterator on asyncpg.Record, so materialize
-    # to a set before doing repeated containment checks.
     keys = set(r.keys())
     return RetrievedChunk(
         chunk_id=r["id"],
@@ -694,7 +598,8 @@ def _row_to_chunk(r: asyncpg.Record) -> RetrievedChunk:
         qualified_name=r["qualified_name"],
         granularity=r["granularity"],
         file_path=r["file_path"],
-        file_id=r["file_id"],
+        file_version_id=r["file_version_id"],
+        branch_id=r["branch_id"],
         token_count=r["token_count"] or 0,
         content=r["content"],
         score=float(r["score"]) if "score" in keys else 0.0,
@@ -708,34 +613,38 @@ async def _fetch_chunks_for_anchors(
     scores: dict[int, float],
     granularity: str,
     *,
-    repo_ids: list[int] | None = None,
+    branch_ids: list[int] | None = None,
 ) -> list[RetrievedChunk]:
     if not anchor_ids:
         return []
-    if repo_ids:
+    if branch_ids:
         rows = await conn.fetch(
             """
             SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
-                   d.qualified_name, f.path AS file_path, f.id AS file_id,
-                   f.repo_id AS repo_id,
+                   c.branch_id, c.file_version_id,
+                   d.qualified_name, bf.path AS file_path,
+                   b.repo_id AS repo_id,
                    0::float AS score
             FROM chunks c
-            JOIN files f ON f.id = c.file_id
+            JOIN branches b ON b.id = c.branch_id
+            JOIN branch_files bf ON bf.branch_id = c.branch_id AND bf.file_version_id = c.file_version_id
             LEFT JOIN definitions d ON d.id = c.anchor_def_id
             WHERE c.anchor_def_id = ANY($1::bigint[]) AND c.granularity = $2
-              AND f.repo_id = ANY($3::bigint[])
+              AND c.branch_id = ANY($3::bigint[])
             """,
-            anchor_ids, granularity, repo_ids,
+            anchor_ids, granularity, branch_ids,
         )
     else:
         rows = await conn.fetch(
             """
             SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
-                   d.qualified_name, f.path AS file_path, f.id AS file_id,
-                   f.repo_id AS repo_id,
+                   c.branch_id, c.file_version_id,
+                   d.qualified_name, bf.path AS file_path,
+                   b.repo_id AS repo_id,
                    0::float AS score
             FROM chunks c
-            JOIN files f ON f.id = c.file_id
+            JOIN branches b ON b.id = c.branch_id
+            JOIN branch_files bf ON bf.branch_id = c.branch_id AND bf.file_version_id = c.file_version_id
             LEFT JOIN definitions d ON d.id = c.anchor_def_id
             WHERE c.anchor_def_id = ANY($1::bigint[]) AND c.granularity = $2
             """,

@@ -1,7 +1,8 @@
-"""CLI: print resolution stats for a repo.
+"""CLI: print resolution stats for a repo branch.
 
 Usage:
     python -m cli.diagnose --repo-name myrepo
+    python -m cli.diagnose --repo-name myrepo --branch feature/x
     python -m cli.diagnose --repo-name myrepo --unresolved        # list unresolved imports
     python -m cli.diagnose --repo-name myrepo --top-callers 10    # top callers by # of edges
 """
@@ -14,55 +15,62 @@ import asyncio
 from db.connection import pool_ctx
 
 
-async def _print_stats(pool, repo_id: int, show_unresolved: bool, top_callers: int) -> int:
+async def _print_stats(
+    pool, repo_id: int, branch_id: int, show_unresolved: bool, top_callers: int,
+) -> int:
     async with pool.acquire() as conn:
-        files = await conn.fetchval("SELECT COUNT(*) FROM files WHERE repo_id=$1", repo_id)
+        files = await conn.fetchval(
+            "SELECT COUNT(*) FROM branch_files WHERE branch_id=$1", branch_id,
+        )
         if not files:
-            print(f"no files for repo_id={repo_id}; nothing to diagnose")
+            print(f"no files mapped for branch_id={branch_id}; nothing to diagnose")
             return 1
         nodes = await conn.fetchval(
-            "SELECT COUNT(*) FROM nodes n JOIN files f ON f.id=n.file_id WHERE f.repo_id=$1",
-            repo_id,
+            """
+            SELECT COUNT(*) FROM nodes n
+            JOIN branch_files bf ON bf.file_version_id = n.file_version_id
+            WHERE bf.branch_id=$1
+            """,
+            branch_id,
         )
         defs = await conn.fetchval(
-            "SELECT COUNT(*) FROM definitions d JOIN files f ON f.id=d.file_id WHERE f.repo_id=$1",
-            repo_id,
+            """
+            SELECT COUNT(*) FROM definitions d
+            JOIN branch_files bf ON bf.file_version_id = d.file_version_id
+            WHERE bf.branch_id=$1
+            """,
+            branch_id,
         )
         refs_total = await conn.fetchval(
-            'SELECT COUNT(*) FROM "references" r JOIN files f ON f.id=r.file_id WHERE f.repo_id=$1',
-            repo_id,
+            'SELECT COUNT(*) FROM "references" r WHERE r.branch_id=$1',
+            branch_id,
         )
         refs_resolved = await conn.fetchval(
-            'SELECT COUNT(*) FROM "references" r JOIN files f ON f.id=r.file_id '
-            "WHERE f.repo_id=$1 AND r.target_def_id IS NOT NULL",
-            repo_id,
+            'SELECT COUNT(*) FROM "references" r '
+            "WHERE r.branch_id=$1 AND r.target_def_id IS NOT NULL",
+            branch_id,
         )
 
         imp_classes = await conn.fetch(
             "SELECT i.dep_class, COUNT(*) AS n "
-            "FROM imports i JOIN files f ON f.id=i.file_id "
-            "WHERE f.repo_id=$1 GROUP BY i.dep_class",
-            repo_id,
+            "FROM imports i WHERE i.branch_id=$1 GROUP BY i.dep_class",
+            branch_id,
         )
         imp_by = {r["dep_class"]: r["n"] for r in imp_classes}
         imp_total = sum(imp_by.values()) or 1
 
         ce_total = await conn.fetchval(
-            "SELECT COUNT(*) FROM call_edges ce "
-            "JOIN definitions caller ON caller.id=ce.caller_def_id "
-            "JOIN files f ON f.id=caller.file_id WHERE f.repo_id=$1",
-            repo_id,
+            "SELECT COUNT(*) FROM call_edges ce WHERE ce.branch_id=$1",
+            branch_id,
         )
         ce_by_conf = await conn.fetch(
             "SELECT ce.confidence, COUNT(*) AS n FROM call_edges ce "
-            "JOIN definitions caller ON caller.id=ce.caller_def_id "
-            "JOIN files f ON f.id=caller.file_id WHERE f.repo_id=$1 "
-            "GROUP BY ce.confidence",
-            repo_id,
+            "WHERE ce.branch_id=$1 GROUP BY ce.confidence",
+            branch_id,
         )
         ce_conf = {r["confidence"]: r["n"] for r in ce_by_conf}
 
-        print(f"=== repo_id={repo_id} ===")
+        print(f"=== repo_id={repo_id} branch_id={branch_id} ===")
         print(f"files:        {files}")
         print(f"nodes:        {nodes}")
         print(f"definitions:  {defs}")
@@ -84,8 +92,8 @@ async def _print_stats(pool, repo_id: int, show_unresolved: bool, top_callers: i
 
         ext = await conn.fetch(
             "SELECT package_name, language FROM external_dependencies "
-            "WHERE repo_id=$1 ORDER BY language, package_name",
-            repo_id,
+            "WHERE branch_id=$1 ORDER BY language, package_name",
+            branch_id,
         )
         if ext:
             print("external_dependencies:")
@@ -94,11 +102,14 @@ async def _print_stats(pool, repo_id: int, show_unresolved: bool, top_callers: i
 
         if show_unresolved:
             unresolved = await conn.fetch(
-                "SELECT f.path, i.import_path FROM imports i "
-                "JOIN files f ON f.id=i.file_id "
-                "WHERE f.repo_id=$1 AND i.dep_class='unresolved' "
-                "ORDER BY f.path, i.import_path",
-                repo_id,
+                """
+                SELECT bf.path, i.import_path FROM imports i
+                JOIN branch_files bf
+                    ON bf.file_version_id = i.file_version_id AND bf.branch_id = i.branch_id
+                WHERE i.branch_id=$1 AND i.dep_class='unresolved'
+                ORDER BY bf.path, i.import_path
+                """,
+                branch_id,
             )
             print(f"unresolved imports ({len(unresolved)}):")
             for row in unresolved:
@@ -110,12 +121,11 @@ async def _print_stats(pool, repo_id: int, show_unresolved: bool, top_callers: i
                 SELECT caller.qualified_name AS caller, COUNT(*) AS n
                 FROM call_edges ce
                 JOIN definitions caller ON caller.id=ce.caller_def_id
-                JOIN files f ON f.id=caller.file_id
-                WHERE f.repo_id=$1
+                WHERE ce.branch_id=$1
                 GROUP BY caller.qualified_name
                 ORDER BY n DESC LIMIT $2
                 """,
-                repo_id,
+                branch_id,
                 top_callers,
             )
             if rows:
@@ -130,16 +140,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="trident — diagnostics for an indexed repo")
     parser.add_argument("--repo-name", type=str, required=True,
                         help="Repo name (must already be indexed)")
+    parser.add_argument("--branch", type=str, default=None,
+                        help="Branch name (defaults to the repo's default branch)")
     parser.add_argument("--dsn", type=str, default=None)
     parser.add_argument("--unresolved", action="store_true", help="List unresolved imports")
     parser.add_argument("--top-callers", type=int, default=0, help="Show N most-active callers")
     args = parser.parse_args(argv)
 
     async def _run() -> int:
-        from cli._repo import resolve_repo_id
+        from cli._repo import resolve_repo_and_branch
         async with pool_ctx(args.dsn) as pool:
-            repo_id = await resolve_repo_id(pool, name=args.repo_name, create=False)
-            return await _print_stats(pool, repo_id, args.unresolved, args.top_callers)
+            repo_id, branch_id = await resolve_repo_and_branch(
+                pool, repo_name=args.repo_name, branch_name=args.branch, create=False,
+            )
+            return await _print_stats(pool, repo_id, branch_id, args.unresolved, args.top_callers)
 
     return asyncio.run(_run())
 
