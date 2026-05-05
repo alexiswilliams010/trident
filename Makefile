@@ -6,7 +6,8 @@
         query-multi-repo-semantic query-multi-repo-hybrid \
         index embed \
         index-isolated embed-isolated query-isolated-semantic query-isolated-lexical query-isolated-hybrid \
-        db-ensure-isolated
+        db-ensure-isolated \
+        branches branch-set-default branch-drop gc
 
 UV ?= uv
 PYTHON := .venv/bin/python
@@ -112,11 +113,11 @@ db-reset: db-drop db-create db-migrate ## Drop and recreate $(PG_DB) from scratc
 db-psql: ## Open a psql shell on $(PG_DB).
 	@psql -d $(PG_DB)
 
-graph: ## Graph exploration command. REPO_NAME=name CMD="callers-of foo"
+graph: ## Graph exploration command. REPO_NAME=name CMD="callers-of foo" [BRANCH=name]
 	@if [ -z "$(REPO_NAME)" ] || [ -z "$(CMD)" ]; then \
-		echo 'usage: make graph REPO_NAME=name CMD="callers-of foo"'; exit 2; \
+		echo 'usage: make graph REPO_NAME=name CMD="callers-of foo" [BRANCH=name]'; exit 2; \
 	fi
-	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.graph --repo-name $(REPO_NAME) $(CMD)
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.graph --repo-name $(REPO_NAME) $(BRANCH_FLAG) $(CMD)
 
 # ------------------------------------------------------------------------------
 # trident CLI helpers
@@ -130,6 +131,7 @@ REPO_NAME ?=
 REPOS     ?=
 QUERY     ?=
 EXCLUDE   ?=
+BRANCH    ?=
 
 # Knobs exposed by the new retrieval features. All optional — only get
 # threaded into the CLI invocation when set, so existing usage is unchanged.
@@ -140,6 +142,10 @@ MMR_FILE_LAMBDA  ?=    # hybrid only; default 0.15 inside the CLI
 # When EXCLUDE is set, expand to a single --exclude flag carrying the
 # comma-separated value (argparse splits on comma).
 EXCLUDE_FLAG := $(if $(EXCLUDE),--exclude '$(EXCLUDE)',)
+
+# When BRANCH is set, pass it through to the CLI. Omitted = the repo's
+# designated default branch (auto-created as `main` on first index).
+BRANCH_FLAG := $(if $(BRANCH),--branch $(BRANCH),)
 
 # Force semantic re-resolution even when Tier-1 says nothing changed. Use
 # this after editing core/semantic_resolver.py / configs/*.yaml etc., where
@@ -153,60 +159,81 @@ MMR_FILE_LAMBDA_FLAG  := $(if $(MMR_FILE_LAMBDA),--mmr-file-lambda $(MMR_FILE_LA
 
 # Generic targets — any repo into $(DB) (default `trident`).
 #   make index REPO_PATH=/path REPO_NAME=name [DB=trident_other]
-index: ## Index any repo into $(DB). REPO_PATH=/path REPO_NAME=name [EXCLUDE='pat1,pat2']
+index: ## Index any repo into $(DB). REPO_PATH=/path REPO_NAME=name [BRANCH=name] [EXCLUDE='pat1,pat2']
 	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
-		echo 'usage: make index REPO_PATH=/path REPO_NAME=name [EXCLUDE=...]'; exit 2; \
+		echo 'usage: make index REPO_PATH=/path REPO_NAME=name [BRANCH=name] [EXCLUDE=...]'; exit 2; \
 	fi
-	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) $(EXCLUDE_FLAG) $(FORCE_RESOLVE_FLAG)
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) $(BRANCH_FLAG) $(EXCLUDE_FLAG) $(FORCE_RESOLVE_FLAG)
 
-embed: ## Index + embed any repo into $(DB) (real embedder, secrets via pass-cli). REPO_PATH=/path REPO_NAME=name [EXCLUDE='pat1,pat2'] [FORCE_RESOLVE=1]
+embed: ## Index + embed any repo into $(DB) (real embedder, secrets via pass-cli). REPO_PATH=/path REPO_NAME=name [BRANCH=name] [EXCLUDE='pat1,pat2'] [FORCE_RESOLVE=1]
 	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
-		echo 'usage: make embed REPO_PATH=/path REPO_NAME=name [EXCLUDE=...] [FORCE_RESOLVE=1]'; exit 2; \
+		echo 'usage: make embed REPO_PATH=/path REPO_NAME=name [BRANCH=name] [EXCLUDE=...] [FORCE_RESOLVE=1]'; exit 2; \
 	fi
-	$(call inject_and_run,$(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) --embed real $(EXCLUDE_FLAG) $(FORCE_RESOLVE_FLAG))
+	$(call inject_and_run,$(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) --embed real $(BRANCH_FLAG) $(EXCLUDE_FLAG) $(FORCE_RESOLVE_FLAG))
 
-query-semantic: ## Semantic query. QUERY="..." REPO_NAME=name [TOP_K=10]
+query-semantic: ## Semantic query. QUERY="..." REPO_NAME=name [BRANCH=name] [TOP_K=10]
 	@if [ -z "$(QUERY)" ] || [ -z "$(REPO_NAME)" ]; then \
-		echo 'usage: make query-semantic QUERY="..." REPO_NAME=name [TOP_K=...]'; exit 2; \
+		echo 'usage: make query-semantic QUERY="..." REPO_NAME=name [BRANCH=name] [TOP_K=...]'; exit 2; \
 	fi
-	$(call inject_and_run,$(PYTHON) -m cli.query --repo-name $(REPO_NAME) --semantic "$(QUERY)" --top-k $(TOP_K))
+	$(call inject_and_run,$(PYTHON) -m cli.query --repo-name $(REPO_NAME) $(BRANCH_FLAG) --semantic "$(QUERY)" --top-k $(TOP_K))
 
-query-lexical: ## Lexical (FTS) query. QUERY="..." REPO_NAME=name [TOP_K=10]. No embedder needed.
+query-lexical: ## Lexical (FTS) query. QUERY="..." REPO_NAME=name [BRANCH=name] [TOP_K=10]. No embedder needed.
 	@if [ -z "$(QUERY)" ] || [ -z "$(REPO_NAME)" ]; then \
-		echo 'usage: make query-lexical QUERY="..." REPO_NAME=name [TOP_K=...]'; exit 2; \
+		echo 'usage: make query-lexical QUERY="..." REPO_NAME=name [BRANCH=name] [TOP_K=...]'; exit 2; \
 	fi
-	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.query --repo-name $(REPO_NAME) --lexical "$(QUERY)" --top-k $(TOP_K)
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.query --repo-name $(REPO_NAME) $(BRANCH_FLAG) --lexical "$(QUERY)" --top-k $(TOP_K)
 
-query-hybrid: ## Hybrid query. QUERY="..." REPO_NAME=name [TOP_K=10] [MMR_REPO_LAMBDA=0.3] [MMR_FILE_LAMBDA=0.15]
+query-hybrid: ## Hybrid query. QUERY="..." REPO_NAME=name [BRANCH=name] [TOP_K=10] [MMR_REPO_LAMBDA=0.3] [MMR_FILE_LAMBDA=0.15]
 	@if [ -z "$(QUERY)" ] || [ -z "$(REPO_NAME)" ]; then \
-		echo 'usage: make query-hybrid QUERY="..." REPO_NAME=name [TOP_K=...] [MMR_*=...]'; exit 2; \
+		echo 'usage: make query-hybrid QUERY="..." REPO_NAME=name [BRANCH=name] [TOP_K=...] [MMR_*=...]'; exit 2; \
 	fi
-	$(call inject_and_run,$(PYTHON) -m cli.query --repo-name $(REPO_NAME) --hybrid "$(QUERY)" \
+	$(call inject_and_run,$(PYTHON) -m cli.query --repo-name $(REPO_NAME) $(BRANCH_FLAG) --hybrid "$(QUERY)" \
 		--top-k $(TOP_K) $(MMR_REPO_LAMBDA_FLAG) $(MMR_FILE_LAMBDA_FLAG))
 
-query-fake-hybrid: ## Hybrid query with the deterministic fake embedder (no API key). QUERY="..." REPO_NAME=name [TOP_K=...]
+query-fake-hybrid: ## Hybrid query with the deterministic fake embedder (no API key). QUERY="..." REPO_NAME=name [BRANCH=name] [TOP_K=...]
 	@if [ -z "$(QUERY)" ] || [ -z "$(REPO_NAME)" ]; then \
-		echo 'usage: make query-fake-hybrid QUERY="..." REPO_NAME=name [TOP_K=...]'; exit 2; \
+		echo 'usage: make query-fake-hybrid QUERY="..." REPO_NAME=name [BRANCH=name] [TOP_K=...]'; exit 2; \
 	fi
-	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.query --repo-name $(REPO_NAME) --hybrid "$(QUERY)" --fake \
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.query --repo-name $(REPO_NAME) $(BRANCH_FLAG) --hybrid "$(QUERY)" --fake \
 		--top-k $(TOP_K) $(MMR_REPO_LAMBDA_FLAG) $(MMR_FILE_LAMBDA_FLAG)
 
-query-multi-repo-semantic: ## Cross-repo semantic query. QUERY="..." REPOS=a,b[,c] [TOP_K=...]
+query-multi-repo-semantic: ## Cross-repo semantic query. QUERY="..." REPOS=a[:branch],b[:branch][,c] [TOP_K=...]
 	@if [ -z "$(QUERY)" ] || [ -z "$(REPOS)" ]; then \
-		echo 'usage: make query-multi-repo-semantic QUERY="..." REPOS=a,b[,c] [TOP_K=...]'; exit 2; \
+		echo 'usage: make query-multi-repo-semantic QUERY="..." REPOS=a[:branch],b[:branch][,c] [TOP_K=...]'; exit 2; \
 	fi
 	$(call inject_and_run,$(PYTHON) -m cli.query --repos $(REPOS) --semantic "$(QUERY)" --top-k $(TOP_K))
 
-query-multi-repo-hybrid: ## Cross-repo hybrid query (MMR diversifies across repos). QUERY="..." REPOS=a,b[,c] [TOP_K=...] [MMR_*=...]
+query-multi-repo-hybrid: ## Cross-repo hybrid query (MMR diversifies across repos). QUERY="..." REPOS=a[:branch],b[:branch][,c] [TOP_K=...] [MMR_*=...]
 	@if [ -z "$(QUERY)" ] || [ -z "$(REPOS)" ]; then \
-		echo 'usage: make query-multi-repo-hybrid QUERY="..." REPOS=a,b[,c] [TOP_K=...] [MMR_*=...]'; exit 2; \
+		echo 'usage: make query-multi-repo-hybrid QUERY="..." REPOS=a[:branch],b[:branch][,c] [TOP_K=...] [MMR_*=...]'; exit 2; \
 	fi
 	$(call inject_and_run,$(PYTHON) -m cli.query --repos $(REPOS) --hybrid "$(QUERY)" \
 		--top-k $(TOP_K) $(MMR_REPO_LAMBDA_FLAG) $(MMR_FILE_LAMBDA_FLAG))
 
-diagnose: ## Print resolution stats for any repo in $(DB). REPO_NAME=name [DB=...]
-	@if [ -z "$(REPO_NAME)" ]; then echo 'usage: make diagnose REPO_NAME=name [DB=...]'; exit 2; fi
-	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.diagnose --repo-name $(REPO_NAME) --unresolved
+diagnose: ## Print resolution stats for any repo branch in $(DB). REPO_NAME=name [BRANCH=name] [DB=...]
+	@if [ -z "$(REPO_NAME)" ]; then echo 'usage: make diagnose REPO_NAME=name [BRANCH=name] [DB=...]'; exit 2; fi
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.diagnose --repo-name $(REPO_NAME) $(BRANCH_FLAG) --unresolved
+
+# ------------------------------------------------------------------------------
+# Branch management
+# ------------------------------------------------------------------------------
+branches: ## List branches per repo with file counts. [DB=...]
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.branches list
+
+branch-set-default: ## Re-flag a repo's default branch. REPO_NAME=name BRANCH=name
+	@if [ -z "$(REPO_NAME)" ] || [ -z "$(BRANCH)" ]; then \
+		echo 'usage: make branch-set-default REPO_NAME=name BRANCH=name'; exit 2; \
+	fi
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.branches set-default --repo-name $(REPO_NAME) --branch $(BRANCH)
+
+branch-drop: ## Delete a non-default branch (cascade). REPO_NAME=name BRANCH=name
+	@if [ -z "$(REPO_NAME)" ] || [ -z "$(BRANCH)" ]; then \
+		echo 'usage: make branch-drop REPO_NAME=name BRANCH=name'; exit 2; \
+	fi
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.branches drop --repo-name $(REPO_NAME) --branch $(BRANCH)
+
+gc: ## Reclaim orphan file_versions and chunk_embeddings. [DB=...]
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.branches gc
 
 # ------------------------------------------------------------------------------
 # Mode B — one DB per repo (CI-friendly, per-repo isolation).
@@ -218,32 +245,32 @@ db-ensure-isolated: ## Create (idempotent) and migrate trident_$(REPO_NAME).
 	@createdb trident_$(REPO_NAME) 2>/dev/null || true
 	@$(MAKE) --no-print-directory db-migrate PG_DB=trident_$(REPO_NAME)
 
-index-isolated: ## Index any repo into its own DB trident_$(REPO_NAME). REPO_PATH=/path REPO_NAME=name [EXCLUDE=...]
+index-isolated: ## Index any repo into its own DB trident_$(REPO_NAME). REPO_PATH=/path REPO_NAME=name [BRANCH=name] [EXCLUDE=...]
 	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
-		echo 'usage: make index-isolated REPO_PATH=/path REPO_NAME=name [EXCLUDE=...]'; exit 2; \
+		echo 'usage: make index-isolated REPO_PATH=/path REPO_NAME=name [BRANCH=name] [EXCLUDE=...]'; exit 2; \
 	fi
 	@$(MAKE) --no-print-directory db-ensure-isolated REPO_NAME=$(REPO_NAME)
-	@$(MAKE) --no-print-directory index REPO_PATH=$(REPO_PATH) REPO_NAME=$(REPO_NAME) DB=trident_$(REPO_NAME) EXCLUDE='$(EXCLUDE)'
+	@$(MAKE) --no-print-directory index REPO_PATH=$(REPO_PATH) REPO_NAME=$(REPO_NAME) BRANCH=$(BRANCH) DB=trident_$(REPO_NAME) EXCLUDE='$(EXCLUDE)'
 
-embed-isolated: ## Index + embed any repo into its own DB. REPO_PATH=/path REPO_NAME=name [EXCLUDE=...]
+embed-isolated: ## Index + embed any repo into its own DB. REPO_PATH=/path REPO_NAME=name [BRANCH=name] [EXCLUDE=...]
 	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
-		echo 'usage: make embed-isolated REPO_PATH=/path REPO_NAME=name [EXCLUDE=...]'; exit 2; \
+		echo 'usage: make embed-isolated REPO_PATH=/path REPO_NAME=name [BRANCH=name] [EXCLUDE=...]'; exit 2; \
 	fi
 	@$(MAKE) --no-print-directory db-ensure-isolated REPO_NAME=$(REPO_NAME)
-	@$(MAKE) --no-print-directory embed REPO_PATH=$(REPO_PATH) REPO_NAME=$(REPO_NAME) DB=trident_$(REPO_NAME) EXCLUDE='$(EXCLUDE)'
+	@$(MAKE) --no-print-directory embed REPO_PATH=$(REPO_PATH) REPO_NAME=$(REPO_NAME) BRANCH=$(BRANCH) DB=trident_$(REPO_NAME) EXCLUDE='$(EXCLUDE)'
 
-query-isolated-semantic: ## Semantic query against per-repo DB. QUERY="..." REPO_NAME=name
-	@$(MAKE) --no-print-directory query-semantic QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) DB=trident_$(REPO_NAME)
+query-isolated-semantic: ## Semantic query against per-repo DB. QUERY="..." REPO_NAME=name [BRANCH=name]
+	@$(MAKE) --no-print-directory query-semantic QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) BRANCH=$(BRANCH) DB=trident_$(REPO_NAME)
 
-query-isolated-lexical: ## Lexical query against per-repo DB. QUERY="..." REPO_NAME=name
-	@$(MAKE) --no-print-directory query-lexical QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) DB=trident_$(REPO_NAME)
+query-isolated-lexical: ## Lexical query against per-repo DB. QUERY="..." REPO_NAME=name [BRANCH=name]
+	@$(MAKE) --no-print-directory query-lexical QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) BRANCH=$(BRANCH) DB=trident_$(REPO_NAME)
 
-query-isolated-hybrid: ## Hybrid query against per-repo DB. QUERY="..." REPO_NAME=name
-	@$(MAKE) --no-print-directory query-hybrid QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) DB=trident_$(REPO_NAME)
+query-isolated-hybrid: ## Hybrid query against per-repo DB. QUERY="..." REPO_NAME=name [BRANCH=name]
+	@$(MAKE) --no-print-directory query-hybrid QUERY="$(QUERY)" REPO_NAME=$(REPO_NAME) BRANCH=$(BRANCH) DB=trident_$(REPO_NAME)
 
-graph-isolated: ## Graph exploration against per-repo DB. REPO_NAME=name CMD="callers-of foo"
-	@$(MAKE) --no-print-directory graph REPO_NAME=$(REPO_NAME) CMD="$(CMD)" DB=trident_$(REPO_NAME)
+graph-isolated: ## Graph exploration against per-repo DB. REPO_NAME=name CMD="callers-of foo" [BRANCH=name]
+	@$(MAKE) --no-print-directory graph REPO_NAME=$(REPO_NAME) BRANCH=$(BRANCH) CMD="$(CMD)" DB=trident_$(REPO_NAME)
 
-diagnose-isolated: ## Print resolution stats from per-repo DB trident_$(REPO_NAME). REPO_NAME=name
-	@if [ -z "$(REPO_NAME)" ]; then echo 'usage: make diagnose-isolated REPO_NAME=name'; exit 2; fi
-	@$(MAKE) --no-print-directory diagnose REPO_NAME=$(REPO_NAME) DB=trident_$(REPO_NAME)
+diagnose-isolated: ## Print resolution stats from per-repo DB trident_$(REPO_NAME). REPO_NAME=name [BRANCH=name]
+	@if [ -z "$(REPO_NAME)" ]; then echo 'usage: make diagnose-isolated REPO_NAME=name [BRANCH=name]'; exit 2; fi
+	@$(MAKE) --no-print-directory diagnose REPO_NAME=$(REPO_NAME) BRANCH=$(BRANCH) DB=trident_$(REPO_NAME)
