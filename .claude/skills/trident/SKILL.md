@@ -33,26 +33,14 @@ Before any queries can run, a repo must be indexed. Indexing runs the full pipel
 
 ### Make targets
 
-There are two indexing modes:
-
-**Shared DB** (`trident`) — all repos in one database, required for cross-repo queries:
+Every target requires `DB=<name>`. Pick whatever Postgres DB name you want — use a per-repo DB (e.g. `trident_<name>`) for clean isolation, or share one DB across multiple repos to enable cross-repo queries. Set up the DB once with `make db-setup DB=<name>`.
 
 ```bash
 # Index only (no embeddings)
-make index REPO_PATH=/absolute/path/to/repo REPO_NAME=<name> [EXCLUDE='<pattern>']
+make index DB=<dbname> REPO_PATH=/absolute/path/to/repo REPO_NAME=<name> [EXCLUDE='<pattern>']
 
 # Index + embed (real embedder, secrets via pass-cli)
-make embed REPO_PATH=/absolute/path/to/repo REPO_NAME=<name> [EXCLUDE='<pattern>']
-```
-
-**Isolated DB** (`trident_<name>`) — one DB per repo, creates and migrates the DB automatically:
-
-```bash
-# Index only
-make index-isolated REPO_PATH=/absolute/path/to/repo REPO_NAME=<name> [EXCLUDE='<pattern>']
-
-# Index + embed
-make embed-isolated REPO_PATH=/absolute/path/to/repo REPO_NAME=<name> [EXCLUDE='<pattern>']
+make embed DB=<dbname> REPO_PATH=/absolute/path/to/repo REPO_NAME=<name> [EXCLUDE='<pattern>']
 ```
 
 `REPO_PATH` must be an **absolute path** on the host.
@@ -110,14 +98,14 @@ make index REPO_PATH=/path REPO_NAME=myrepo EXCLUDE='*.t.sol,test'
 
 ---
 
-## Shared vs. isolated DB
+## Picking a DB
 
-| Mode | Default DB | When used | Indexing targets | Query target prefix |
-|------|-----------|-----------|-----------------|-------------------|
-| **Shared** | `trident` | Multiple repos together; cross-repo queries | `index`, `embed` | `query-*`, `query-multi-repo-*` |
-| **Isolated** | `trident_<name>` | Single repo, one DB per repo | `index-isolated`, `embed-isolated` | `query-isolated-*` |
+`DB=<name>` selects which Postgres database to operate on. There is no default — pass it on every target. Two common shapes:
 
-Use the matching query target for how the repo was indexed.
+- **Per-repo isolation** — `DB=trident_<name>`, one repo per DB. Clean uninstall via `dropdb`.
+- **Shared DB** — one `DB=<name>` indexed with several `REPO_NAME=`s. Required for cross-repo queries.
+
+Run `make db-setup DB=<name>` once per DB to create it and apply migrations.
 
 ---
 
@@ -125,27 +113,16 @@ Use the matching query target for how the repo was indexed.
 
 Use when you need relevant code content returned as scored chunks.
 
-### Shared DB (single repo)
+All query targets take `REPO_LIST=a[:branch][,b[:branch]...]`. A single entry queries one repo; comma-separated entries fan out to a cross-repo query (only works when those repos share a DB).
 
 ```bash
-make query-semantic  REPO_NAME=<name> QUERY="<natural language>" [TOP_K=10]
-make query-lexical   REPO_NAME=<name> QUERY="<terms>"            [TOP_K=10]
-make query-hybrid    REPO_NAME=<name> QUERY="<natural language>" [TOP_K=10] [MMR_REPO_LAMBDA=0.3] [MMR_FILE_LAMBDA=0.15]
-```
+make query-semantic DB=<dbname> REPO_LIST=<name>[:branch] QUERY="<natural language>" [TOP_K=10]
+make query-lexical  DB=<dbname> REPO_LIST=<name>[:branch] QUERY="<terms>"            [TOP_K=10]
+make query-hybrid   DB=<dbname> REPO_LIST=<name>[:branch] QUERY="<natural language>" [TOP_K=10] [MMR_REPO_LAMBDA=0.3] [MMR_FILE_LAMBDA=0.15]
 
-### Isolated DB (single repo)
-
-```bash
-make query-isolated-semantic REPO_NAME=<name> QUERY="..." [TOP_K=10]
-make query-isolated-lexical  REPO_NAME=<name> QUERY="..." [TOP_K=10]
-make query-isolated-hybrid   REPO_NAME=<name> QUERY="..." [TOP_K=10]
-```
-
-### Shared DB — cross-repo queries
-
-```bash
-make query-multi-repo-semantic REPOS=repoA,repoB QUERY="..." [TOP_K=10]
-make query-multi-repo-hybrid   REPOS=repoA,repoB QUERY="..." [TOP_K=10] [MMR_REPO_LAMBDA=0.3] [MMR_FILE_LAMBDA=0.15]
+# Cross-repo (repos must share a DB)
+make query-hybrid DB=<dbname> REPO_LIST=repoA,repoB QUERY="..." [TOP_K=10]
+make query-hybrid DB=<dbname> REPO_LIST=repoA:main,repoB:feature/x QUERY="..."
 ```
 
 ### Query modes
@@ -163,22 +140,22 @@ make query-multi-repo-hybrid   REPOS=repoA,repoB QUERY="..." [TOP_K=10] [MMR_REP
 | Conceptual question, default choice | `query-hybrid` |
 | Known exact identifier or string | `query-lexical` |
 | Semantic search, need diverse results by concept | `query-semantic` |
-| Query spans multiple repos | `query-multi-repo-hybrid` or `query-multi-repo-semantic` |
+| Query spans multiple repos (same DB) | `query-hybrid` / `query-semantic` with comma-separated `REPO_LIST` |
 
 ### Examples
 
 ```bash
-# Hybrid query on a repo in the shared DB
-make query-hybrid REPO_NAME=myrepo QUERY="how is a job retried after failure"
+# Hybrid query on a single repo
+make query-hybrid DB=trident_repo REPO_LIST=repo QUERY="how is a job retried after failure"
 
 # Lexical lookup of an exact identifier
-make query-lexical REPO_NAME=myrepo QUERY="PaymentError"
+make query-lexical DB=trident_repo REPO_LIST=repo QUERY="PaymentError"
 
-# Cross-repo hybrid query
-make query-multi-repo-hybrid REPOS=api,worker QUERY="user data flow" TOP_K=20
+# Cross-repo hybrid query (api + worker were both indexed into trident_shared)
+make query-hybrid DB=trident_shared REPO_LIST=api,worker QUERY="user data flow" TOP_K=20
 
-# Hybrid query on an isolated per-repo DB
-make query-isolated-hybrid REPO_NAME=myrepo QUERY="connection pooling"
+# Query a non-default branch
+make query-hybrid DB=trident_repo REPO_LIST=repo:feature/x QUERY="connection pooling"
 ```
 
 ---
@@ -190,11 +167,7 @@ Use when you need to understand *relationships* between definitions: who calls w
 The full graph subcommand and its arguments are passed as a single `CMD` string.
 
 ```bash
-# Shared DB (default)
-make graph REPO_NAME=<name> CMD="<subcommand> [args] [--json]"
-
-# Isolated DB
-make graph-isolated REPO_NAME=<name> CMD="<subcommand> [args] [--json]"
+make graph DB=<dbname> REPO_NAME=<name> CMD="<subcommand> [args] [--json]" [BRANCH=<name>]
 ```
 
 Pass `--json` inside `CMD` for structured output suitable for further processing.
@@ -222,25 +195,22 @@ Common flags inside CMD: `--confidence certain|inferred|uncertain`, `--timeout <
 
 ```bash
 # Who can trigger withdraw? (full upstream slice)
-make graph REPO_NAME=myrepo CMD="ancestors withdraw --json"
+make graph DB=trident_repo REPO_NAME=repo CMD="ancestors withdraw --json"
 
 # What would break if I change parseConfig? (blast radius)
-make graph REPO_NAME=myrepo CMD="reachable parseConfig"
+make graph DB=trident_repo REPO_NAME=repo CMD="reachable parseConfig"
 
 # Is there a call path from handleRequest to sendEmail?
-make graph REPO_NAME=myrepo CMD="paths handleRequest sendEmail"
+make graph DB=trident_repo REPO_NAME=repo CMD="paths handleRequest sendEmail"
 
 # Get source of a specific function
-make graph REPO_NAME=myrepo CMD="source withdraw --json"
+make graph DB=trident_repo REPO_NAME=repo CMD="source withdraw --json"
 
 # What does services/user.py import?
-make graph REPO_NAME=myrepo CMD="imports --file services/user.py"
+make graph DB=trident_repo REPO_NAME=repo CMD="imports --file services/user.py"
 
 # Public API surface
-make graph REPO_NAME=myrepo CMD="entrypoints --kind function"
-
-# Graph query on an isolated per-repo DB
-make graph-isolated REPO_NAME=myrepo CMD="callers-of processPayment --json"
+make graph DB=trident_repo REPO_NAME=repo CMD="entrypoints --kind function"
 ```
 
 ---
@@ -249,13 +219,13 @@ make graph-isolated REPO_NAME=myrepo CMD="callers-of processPayment --json"
 
 | Instead of | Use |
 |------------|-----|
-| `grep -r "functionName"` | `make graph REPO_NAME=... CMD="resolve <name>"` or `make query-lexical` |
-| Reading a file to find a function | `make graph REPO_NAME=... CMD="source <name>"` |
-| Reading a file to understand imports | `make graph REPO_NAME=... CMD="imports --file <path>"` |
-| Manually tracing callers | `make graph REPO_NAME=... CMD="callers-of <name>"` or `CMD="ancestors <name>"` |
-| Reading multiple files for context | `make query-hybrid REPO_NAME=... QUERY="<question>"` |
-| Searching for all uses of a class | `make query-lexical REPO_NAME=... QUERY="<ClassName>"` |
+| `grep -r "functionName"` | `make graph DB=... REPO_NAME=... CMD="resolve <name>"` or `make query-lexical` |
+| Reading a file to find a function | `make graph DB=... REPO_NAME=... CMD="source <name>"` |
+| Reading a file to understand imports | `make graph DB=... REPO_NAME=... CMD="imports --file <path>"` |
+| Manually tracing callers | `make graph DB=... REPO_NAME=... CMD="callers-of <name>"` or `CMD="ancestors <name>"` |
+| Reading multiple files for context | `make query-hybrid DB=... REPO_LIST=... QUERY="<question>"` |
+| Searching for all uses of a class | `make query-lexical DB=... REPO_LIST=... QUERY="<ClassName>"` |
 | Understanding data flow | `make query-hybrid` + `make graph CMD="paths <src> <dst>"` |
-| Finding a change's blast radius | `make graph REPO_NAME=... CMD="reachable <changed-function>"` |
+| Finding a change's blast radius | `make graph DB=... REPO_NAME=... CMD="reachable <changed-function>"` |
 
 trident queries are pre-indexed and return only relevant code, avoiding token waste from reading entire files.

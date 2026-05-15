@@ -21,27 +21,21 @@ brew install postgresql@18 pgvector uv
 ## Setup
 
 ```sh
-make install     # .venv + project deps via uv
-make db-setup    # start postgres, create trident DB, apply migrations
+make install                       # .venv + project deps via uv
+make db-setup DB=trident_myrepo    # start postgres, create the DB, apply migrations
 ```
 
-DSN defaults to `postgresql://$USER@localhost:5432/trident`. Override with
-`DATABASE_URL`.
-
-## Shared vs per-repo DB
-
-Repos are addressed by name (`--repo-name foo`). Two workflows:
-
-- **Shared** — one `trident` DB holding many repos. Use the plain
-  `make index` / `make embed` / `make query-*` targets.
-- **Isolated** — one DB per repo (`trident_<name>`). Use the
-  `*-isolated` variants; they create and migrate the per-repo DB on
-  first use. Clean uninstall via `DROP DATABASE`.
+There is no default DB — every runtime + admin make target requires
+`DB=<name>`. Pick whatever name you want: a per-repo DB
+(`trident_<repo>`) for clean uninstall via `DROP DATABASE`, or a shared
+DB across many repos to enable cross-repo queries. The make targets
+build `DATABASE_URL` from `DB=`; for raw `python -m cli.*` invocations,
+export `DATABASE_URL` yourself.
 
 ## Indexing
 
 ```sh
-make index REPO_PATH=/path/to/repo REPO_NAME=myrepo
+make index DB=trident_repo REPO_PATH=/path/to/repo REPO_NAME=repo
 ```
 
 Re-running after no source changes prints `Skipped N unchanged files`
@@ -68,7 +62,7 @@ The `make embed` and `make query-*` targets stream the API key from
 pass-cli into the process env — nothing extra is written to disk.
 
 ```sh
-make embed REPO_PATH=/path/to/repo REPO_NAME=myrepo
+make embed DB=trident_repo REPO_PATH=/path/to/repo REPO_NAME=repo
 ```
 
 If you'd rather export `EMBEDDING_*` vars manually, the raw CLI reads
@@ -76,18 +70,24 @@ the same vars.
 
 ## Query
 
+The query targets take a `REPO_LIST=a[:branch][,b[:branch]...]`. A single entry queries one repo (branch optional after `:`); comma-separated entries fan out to a cross-repo query — which only works when those repos share a DB.
+
 ```sh
 # semantic: cosine NN over chunk embeddings
-make query-semantic QUERY="how does the call graph link cross-module" REPO_NAME=myrepo
+make query-semantic DB=trident_repo REPO_LIST=repo QUERY="how does the call graph link cross-module"
 
 # hybrid: semantic seeds + 1-hop call-graph expansion (best default)
-make query-hybrid QUERY="reentrancy guard usage" REPO_NAME=myrepo
+make query-hybrid DB=trident_repo REPO_LIST=repo QUERY="reentrancy guard usage"
 
 # lexical: postgres FTS, no embedder needed
-make query-lexical QUERY="deposit withdraw" REPO_NAME=myrepo
+make query-lexical DB=trident_repo REPO_LIST=repo QUERY="deposit withdraw"
+
+# cross-repo hybrid query (both repos must be indexed in the same DB)
+make query-hybrid DB=trident_shared REPO_LIST=api,worker QUERY="user data flow"
 
 # structural: graph walk from a known definition name
-.venv/bin/python -m cli.query --repo-name myrepo --structural deposit --depth 2
+DATABASE_URL=postgresql://$USER@localhost:5432/trident_repo \
+  .venv/bin/python -m cli.query --repo-name myrepo --structural deposit --depth 2
 ```
 
 Add `--show-content` to print chunk bodies, `--top-k N` to change the

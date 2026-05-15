@@ -16,12 +16,15 @@ MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 def default_dsn() -> str:
     """Default DSN for local Homebrew Postgres.
 
-    Homebrew Postgres allows the running OS user to connect over the local
-    socket / TCP without a password. The database name defaults to `trident`.
-    Override with the DATABASE_URL env var.
+    Homebrew Postgres allows the running OS user to connect over the local socket / TCP
     """
     user = os.environ.get("PGUSER") or getpass.getuser()
-    db = os.environ.get("PGDATABASE", "trident")
+    db = os.environ.get("PGDATABASE")
+    if not db:
+        raise RuntimeError(
+            "DATABASE_URL or PGDATABASE must be set, there is no default DB. "
+            "Pass DB=<name> to the Makefile, or export DATABASE_URL."
+        )
     host = os.environ.get("PGHOST", "localhost")
     port = os.environ.get("PGPORT", "5432")
     return f"postgresql://{user}@{host}:{port}/{db}"
