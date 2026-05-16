@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -103,59 +104,17 @@ async def index_file(
     repo_id: int,
     branch_id: int,
     discovered: DiscoveredFile,
+    raw: bytes,
+    content_hash: str,
     *,
     from_dependency: bool = False,
 ) -> IndexFileResult:
-    """Parse one file (if needed) and write file_versions + nodes + branch_files rows.
+    """Cold-path: parse one file and write file_versions + nodes + branch_files.
 
-    The hot path: when the file content hash matches an existing file_versions
-    row for this repo, we skip parsing entirely and only upsert the
-    branch_files mapping. This is what makes branch-indexing cheap when
-    most content is shared with another branch.
+    Caller (index_repo) has already hashed the bytes and confirmed no
+    matching file_versions row exists for this content. Hash-hit and
+    mapping-only-update cases are handled by index_repo's bulk UNNEST.
     """
-    raw = discovered.path.read_bytes()
-    content_hash = _hash_bytes(raw)
-
-    # Step 1: does this content already have a file_versions row in this repo?
-    fv = await conn.fetchrow(
-        "SELECT id FROM file_versions WHERE repo_id=$1 AND content_hash=$2",
-        repo_id,
-        content_hash,
-    )
-
-    if fv is not None:
-        file_version_id = fv["id"]
-        # Step 2: upsert the branch_files mapping. The conflict target is
-        # (branch_id, path) — if the path already maps to a different
-        # file_version (e.g. previous indexing of this branch had stale
-        # content), repoint it. Setting from_dependency=$4 lets the prune
-        # at the end of index_repo classify rows correctly.
-        existing_mapping = await conn.fetchval(
-            """
-            SELECT file_version_id FROM branch_files
-            WHERE branch_id=$1 AND path=$2
-            """,
-            branch_id, discovered.rel_path,
-        )
-        await conn.execute(
-            """
-            INSERT INTO branch_files (branch_id, path, file_version_id, from_dependency)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (branch_id, path) DO UPDATE
-              SET file_version_id = EXCLUDED.file_version_id,
-                  from_dependency = EXCLUDED.from_dependency
-            """,
-            branch_id, discovered.rel_path, file_version_id, from_dependency,
-        )
-        return IndexFileResult(
-            file_version_id=file_version_id,
-            rel_path=discovered.rel_path,
-            language=discovered.language,
-            node_count=0,
-            skipped=existing_mapping == file_version_id,
-        )
-
-    # Step 3: new content — parse it, insert file_versions + nodes, then map.
     text = raw.decode("utf-8", errors="replace")
 
     file_version_id = await conn.fetchval(
@@ -260,12 +219,13 @@ async def index_repo(
 
     # Walk + hash everything once, off the DB. Reading file bytes is local
     # I/O; sha256 is CPU. Doing this up front lets us issue the two prefetch
-    # queries below before any per-file DB work begins.
-    walk_entries: list[tuple[DiscoveredFile, str]] = []
+    # queries below before any per-file DB work begins. We retain `raw` so
+    # the cold-path tasks don't re-read each file from disk.
+    walk_entries: list[tuple[DiscoveredFile, bytes, str]] = []
     for discovered in walk_repo(cfg):
         walked_paths.append(discovered.rel_path)
         raw = discovered.path.read_bytes()
-        walk_entries.append((discovered, _hash_bytes(raw)))
+        walk_entries.append((discovered, raw, _hash_bytes(raw)))
 
     async with pool.acquire() as conn:
         # Record the on-disk root so Phase 3 resolvers (e.g. Go's go.mod parse)
@@ -277,7 +237,7 @@ async def index_repo(
         )
 
         # Batch 1: every file_versions row that matches any walked hash.
-        unique_hashes = list({h for _, h in walk_entries})
+        unique_hashes = list({h for _, _, h in walk_entries})
         fv_by_hash: dict[str, int] = {}
         if unique_hashes:
             fv_rows = await conn.fetch(
@@ -288,30 +248,30 @@ async def index_repo(
             fv_by_hash = {r["content_hash"]: r["id"] for r in fv_rows}
 
         # Batch 2: the current branch_files mappings for this branch. Snapshot
-        # at the start of this run; cold-path inserts inside the loop only
-        # touch new paths, so the snapshot stays consistent for the hot path.
+        # at the start of this run; cold-path inserts run on separate
+        # connections below but only add new (branch_id, path) pairs not in
+        # this snapshot, so it stays consistent for partitioning.
         bf_rows = await conn.fetch(
             "SELECT path, file_version_id FROM branch_files WHERE branch_id=$1",
             branch_id,
         )
         mapping_by_path: dict[str, int] = {r["path"]: r["file_version_id"] for r in bf_rows}
 
-        # Partition: unchanged (no writes), rebind (bulk upsert later), new (cold path).
+        # Partition: unchanged, rebind (bulk upsert), new (cold path).
+        # Cold path is deduped by content_hash so identical-content paths
+        # don't race to INSERT the same file_versions row.
+        cold_by_hash: dict[str, tuple[DiscoveredFile, bytes]] = {}
+        cold_extra: dict[str, list[DiscoveredFile]] = {}
         rebinds: list[tuple[str, int, str]] = []  # (rel_path, fv_id, language)
-        for discovered, content_hash in walk_entries:
+        for discovered, raw, content_hash in walk_entries:
             fv_id = fv_by_hash.get(content_hash)
             if fv_id is None:
-                # Cold path: parse the file, write file_versions + nodes,
-                # upsert branch_files. One transaction per file.
-                async with conn.transaction():
-                    result = await index_file(conn, repo_id, branch_id, discovered)
-                if result.skipped:
-                    skipped.append(result)
+                if content_hash in cold_by_hash:
+                    cold_extra.setdefault(content_hash, []).append(discovered)
                 else:
-                    indexed.append(result)
+                    cold_by_hash[content_hash] = (discovered, raw)
                 continue
             if mapping_by_path.get(discovered.rel_path) == fv_id:
-                # Hash hit and the mapping is already correct — no DB writes.
                 skipped.append(IndexFileResult(
                     file_version_id=fv_id,
                     rel_path=discovered.rel_path,
@@ -323,20 +283,19 @@ async def index_repo(
                 rebinds.append((discovered.rel_path, fv_id, discovered.language))
 
         if rebinds:
-            async with conn.transaction():
-                await conn.execute(
-                    """
-                    INSERT INTO branch_files (branch_id, path, file_version_id, from_dependency)
-                    SELECT $1, * FROM UNNEST($2::text[], $3::bigint[], $4::boolean[])
-                    ON CONFLICT (branch_id, path) DO UPDATE
-                      SET file_version_id = EXCLUDED.file_version_id,
-                          from_dependency = EXCLUDED.from_dependency
-                    """,
-                    branch_id,
-                    [r[0] for r in rebinds],
-                    [r[1] for r in rebinds],
-                    [False] * len(rebinds),
-                )
+            await conn.execute(
+                """
+                INSERT INTO branch_files (branch_id, path, file_version_id, from_dependency)
+                SELECT $1, * FROM UNNEST($2::text[], $3::bigint[], $4::boolean[])
+                ON CONFLICT (branch_id, path) DO UPDATE
+                  SET file_version_id = EXCLUDED.file_version_id,
+                      from_dependency = EXCLUDED.from_dependency
+                """,
+                branch_id,
+                [r[0] for r in rebinds],
+                [r[1] for r in rebinds],
+                [False] * len(rebinds),
+            )
             for rel_path, fv_id, lang in rebinds:
                 indexed.append(IndexFileResult(
                     file_version_id=fv_id,
@@ -363,6 +322,50 @@ async def index_repo(
             walked_paths,
         )
         deleted = [r["path"] for r in deleted_rows]
+
+    # Cold path: parse + insert each new file on its own connection so
+    # tree-sitter work and DB I/O overlap across files.
+    if cold_by_hash:
+        sem = asyncio.Semaphore(int(os.environ.get("INDEX_CONCURRENCY", "4")))
+
+        async def _cold(discovered: DiscoveredFile, raw: bytes, content_hash: str) -> IndexFileResult:
+            async with sem, pool.acquire() as c, c.transaction():
+                return await index_file(c, repo_id, branch_id, discovered, raw, content_hash)
+
+        cold_items = list(cold_by_hash.items())  # [(hash, (discovered, raw)), ...]
+        cold_results = await asyncio.gather(
+            *[_cold(d, r, h) for h, (d, r) in cold_items]
+        )
+        indexed.extend(cold_results)
+
+        # Map extra paths (same hash as a cold task) onto the minted fv_id.
+        if cold_extra:
+            hash_to_fv = {h: res.file_version_id for (h, _), res in zip(cold_items, cold_results)}
+            extra_paths: list[str] = []
+            extra_fvs: list[int] = []
+            for h, dups in cold_extra.items():
+                fv_id = hash_to_fv[h]
+                for d in dups:
+                    extra_paths.append(d.rel_path)
+                    extra_fvs.append(fv_id)
+                    indexed.append(IndexFileResult(
+                        file_version_id=fv_id,
+                        rel_path=d.rel_path,
+                        language=d.language,
+                        node_count=0,
+                    ))
+            async with pool.acquire() as c:
+                await c.execute(
+                    """
+                    INSERT INTO branch_files (branch_id, path, file_version_id, from_dependency)
+                    SELECT $1, * FROM UNNEST($2::text[], $3::bigint[], $4::boolean[])
+                    ON CONFLICT (branch_id, path) DO UPDATE
+                      SET file_version_id = EXCLUDED.file_version_id,
+                          from_dependency = EXCLUDED.from_dependency
+                    """,
+                    branch_id, extra_paths, extra_fvs, [False] * len(extra_paths),
+                )
+
     return IndexRepoResult(indexed=indexed, skipped=skipped, deleted=deleted)
 
 
