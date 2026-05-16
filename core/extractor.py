@@ -240,16 +240,33 @@ async def index_repo(
 ) -> IndexRepoResult:
     """Walk a repo and index every supported file under (repo_id, branch_id).
 
-    One connection / one transaction per file. The branch_files prune at the
-    end removes mappings for user files no longer reached by the walker
-    (deletes, moves, newly excluded) without touching file_versions —
-    file_versions are reclaimed only by `make gc` when no branch references
-    them.
+    Hashes every discovered file on disk first, then prefetches all existing
+    `file_versions` rows for those hashes and the current `branch_files`
+    mappings in two batched queries. The per-file loop then only writes for
+    truly new content (cold path: parse + COPY nodes) and for hash-hit files
+    whose `branch_files` mapping is missing or stale (bulk UNNEST upsert at
+    the end). Files whose hash and mapping are already correct cost zero DB
+    round-trips.
+
+    The branch_files prune at the end removes mappings for user files no
+    longer reached by the walker (deletes, moves, newly excluded) without
+    touching file_versions — file_versions are reclaimed only by `make gc`
+    when no branch references them.
     """
     cfg = walk_config or WalkConfig.with_defaults(repo_root)
     indexed: list[IndexFileResult] = []
     skipped: list[IndexFileResult] = []
     walked_paths: list[str] = []
+
+    # Walk + hash everything once, off the DB. Reading file bytes is local
+    # I/O; sha256 is CPU. Doing this up front lets us issue the two prefetch
+    # queries below before any per-file DB work begins.
+    walk_entries: list[tuple[DiscoveredFile, str]] = []
+    for discovered in walk_repo(cfg):
+        walked_paths.append(discovered.rel_path)
+        raw = discovered.path.read_bytes()
+        walk_entries.append((discovered, _hash_bytes(raw)))
+
     async with pool.acquire() as conn:
         # Record the on-disk root so Phase 3 resolvers (e.g. Go's go.mod parse)
         # can find files outside the DB. Idempotent; overwrites if changed.
@@ -258,14 +275,76 @@ async def index_repo(
             repo_id,
             str(Path(repo_root).resolve()),
         )
-        for discovered in walk_repo(cfg):
-            walked_paths.append(discovered.rel_path)
-            async with conn.transaction():
-                result = await index_file(conn, repo_id, branch_id, discovered)
-            if result.skipped:
-                skipped.append(result)
+
+        # Batch 1: every file_versions row that matches any walked hash.
+        unique_hashes = list({h for _, h in walk_entries})
+        fv_by_hash: dict[str, int] = {}
+        if unique_hashes:
+            fv_rows = await conn.fetch(
+                "SELECT id, content_hash FROM file_versions "
+                "WHERE repo_id=$1 AND content_hash = ANY($2::text[])",
+                repo_id, unique_hashes,
+            )
+            fv_by_hash = {r["content_hash"]: r["id"] for r in fv_rows}
+
+        # Batch 2: the current branch_files mappings for this branch. Snapshot
+        # at the start of this run; cold-path inserts inside the loop only
+        # touch new paths, so the snapshot stays consistent for the hot path.
+        bf_rows = await conn.fetch(
+            "SELECT path, file_version_id FROM branch_files WHERE branch_id=$1",
+            branch_id,
+        )
+        mapping_by_path: dict[str, int] = {r["path"]: r["file_version_id"] for r in bf_rows}
+
+        # Partition: unchanged (no writes), rebind (bulk upsert later), new (cold path).
+        rebinds: list[tuple[str, int, str]] = []  # (rel_path, fv_id, language)
+        for discovered, content_hash in walk_entries:
+            fv_id = fv_by_hash.get(content_hash)
+            if fv_id is None:
+                # Cold path: parse the file, write file_versions + nodes,
+                # upsert branch_files. One transaction per file.
+                async with conn.transaction():
+                    result = await index_file(conn, repo_id, branch_id, discovered)
+                if result.skipped:
+                    skipped.append(result)
+                else:
+                    indexed.append(result)
+                continue
+            if mapping_by_path.get(discovered.rel_path) == fv_id:
+                # Hash hit and the mapping is already correct — no DB writes.
+                skipped.append(IndexFileResult(
+                    file_version_id=fv_id,
+                    rel_path=discovered.rel_path,
+                    language=discovered.language,
+                    node_count=0,
+                    skipped=True,
+                ))
             else:
-                indexed.append(result)
+                rebinds.append((discovered.rel_path, fv_id, discovered.language))
+
+        if rebinds:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO branch_files (branch_id, path, file_version_id, from_dependency)
+                    SELECT $1, * FROM UNNEST($2::text[], $3::bigint[], $4::boolean[])
+                    ON CONFLICT (branch_id, path) DO UPDATE
+                      SET file_version_id = EXCLUDED.file_version_id,
+                          from_dependency = EXCLUDED.from_dependency
+                    """,
+                    branch_id,
+                    [r[0] for r in rebinds],
+                    [r[1] for r in rebinds],
+                    [False] * len(rebinds),
+                )
+            for rel_path, fv_id, lang in rebinds:
+                indexed.append(IndexFileResult(
+                    file_version_id=fv_id,
+                    rel_path=rel_path,
+                    language=lang,
+                    node_count=0,
+                    skipped=False,
+                ))
 
         # Prune branch_files mappings for user files no longer reached by the
         # walker (deletes, moves, newly excluded). Dependency mappings are
