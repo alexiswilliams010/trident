@@ -44,6 +44,7 @@ async def _run(
     exclude_patterns: tuple[str, ...],
     use_tridentignore: bool,
     force_resolve: bool = False,
+    force_rehash: bool = False,
 ) -> int:
     async with pool_ctx(dsn) as pool:
         if init_schema:
@@ -71,7 +72,10 @@ async def _run(
             walk_cfg.exclude_patterns = tuple(all_excludes)
             print(f"[walk] excluding: {', '.join(all_excludes)}")
 
-        extract_result = await index_repo(pool, repo_id, branch_id, repo_path, walk_config=walk_cfg)
+        extract_result = await index_repo(
+            pool, repo_id, branch_id, repo_path,
+            walk_config=walk_cfg, force_rehash=force_rehash,
+        )
         print(
             f"[Tier 1] Indexed {len(extract_result.indexed)} files "
             f"({extract_result.total_nodes} nodes); "
@@ -160,6 +164,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="Don't auto-load .tridentignore from the repo root.")
     parser.add_argument("--force-resolve", action="store_true",
                         help="Re-run semantic resolution on all files, not just changed ones.")
+    parser.add_argument("--rehash", action="store_true",
+                        help="Ignore the (size, content_hash) cache and re-read every file. "
+                             "Use when a content edit preserved file size.")
     args = parser.parse_args(argv)
 
     if not args.repo_path.is_dir():
@@ -180,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
             tuple(p for group in args.exclude for p in group),
             not args.no_tridentignore,
             force_resolve=args.force_resolve,
+            force_rehash=args.rehash,
         )
     )
 

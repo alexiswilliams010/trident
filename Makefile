@@ -150,10 +150,11 @@ EXCLUDE_FLAG := $(if $(EXCLUDE),--exclude '$(EXCLUDE)',)
 # designated default branch (auto-created as `main` on first index).
 BRANCH_FLAG := $(if $(BRANCH),--branch $(BRANCH),)
 
-# Force semantic re-resolution even when Tier-1 says nothing changed. Use
-# this after editing core/semantic_resolver.py / configs/*.yaml etc., where
-# the source files are unchanged but the analysis logic is.
-FORCE_RESOLVE_FLAG := $(if $(FORCE_RESOLVE),--force-resolve,)
+# FORCE=1 bypasses every "looks unchanged" shortcut: ignore the size cache
+# (re-read + re-hash every file) and re-run semantic resolution on the full
+# repo. Use after editing core/semantic_resolver.py / configs/*.yaml, or
+# when a content edit preserved file size and slipped past the size cache.
+FORCE_FLAGS := $(if $(FORCE),--rehash --force-resolve,)
 
 # Optional flag expansions — empty when the variable is unset, so the CLI
 # falls back to its built-in defaults.
@@ -164,13 +165,13 @@ index: _require-db ## Index a repo into $(DB). REPO_PATH=/path REPO_NAME=name [B
 	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
 		echo 'usage: make index DB=name REPO_PATH=/path REPO_NAME=name [BRANCH=name] [EXCLUDE=...]'; exit 2; \
 	fi
-	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) $(BRANCH_FLAG) $(EXCLUDE_FLAG) $(FORCE_RESOLVE_FLAG)
+	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) $(BRANCH_FLAG) $(EXCLUDE_FLAG) $(FORCE_FLAGS)
 
-embed: _require-db ## Index + embed a repo into $(DB) (real embedder, secrets via pass-cli). REPO_PATH=/path REPO_NAME=name [BRANCH=name] [EXCLUDE='pat1,pat2'] [FORCE_RESOLVE=1]
+embed: _require-db ## Index + embed a repo into $(DB) (real embedder, secrets via pass-cli). REPO_PATH=/path REPO_NAME=name [BRANCH=name] [EXCLUDE='pat1,pat2'] [FORCE=1]
 	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
-		echo 'usage: make embed DB=name REPO_PATH=/path REPO_NAME=name [BRANCH=name] [EXCLUDE=...] [FORCE_RESOLVE=1]'; exit 2; \
+		echo 'usage: make embed DB=name REPO_PATH=/path REPO_NAME=name [BRANCH=name] [EXCLUDE=...] [FORCE=1]'; exit 2; \
 	fi
-	$(call inject_and_run,$(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) --embed real $(BRANCH_FLAG) $(EXCLUDE_FLAG) $(FORCE_RESOLVE_FLAG))
+	$(call inject_and_run,$(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) --embed real $(BRANCH_FLAG) $(EXCLUDE_FLAG) $(FORCE_FLAGS))
 
 # Function-call tracer over the index run. Emits a JSON trace at
 # profile/index-<timestamp>.json. Open it with `make profile-view
@@ -199,7 +200,7 @@ profile-index: _require-db ## Trace an index run. REPO_PATH=/path REPO_NAME=name
 		env DATABASE_URL=$(DB_DSN) $(VIZTRACER) --output_file $$OUT \
 			--min_duration $(PROFILE_MIN_US)us --ignore_c_function --log_async \
 			--tracer_entries $(PROFILE_ENTRIES) \
-			-m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) $(BRANCH_FLAG) $(EXCLUDE_FLAG) $(FORCE_RESOLVE_FLAG) && \
+			-m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) $(BRANCH_FLAG) $(EXCLUDE_FLAG) $(FORCE_FLAGS) && \
 		echo "wrote $$OUT — view with: make profile-view TRACE=$$OUT"
 
 profile-view: ## Open a viztracer JSON trace in the interactive viewer. TRACE=profile/index-<ts>.json

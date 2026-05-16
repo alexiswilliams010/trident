@@ -21,6 +21,15 @@ Branch-aware indexing model:
        that diverges from main by only a few files.
     3. Otherwise parse, INSERT file_versions, COPY nodes tied to the new
        file_version_id, then upsert branch_files.
+
+Size-cache shortcut: branch_files.size stores each file's byte length, and
+`branch_dirs` stores a per-directory SHA-256 over its sorted manifest
+(forming a Merkle tree rooted at the branch). On re-index the walker
+compares `os.stat().st_size` against the cached size; on a match we trust
+the cached content_hash and skip read+SHA-256 entirely. Size is chosen
+over mtime because it's the only filesystem-metadata signal that's reliable
+across platforms. Same-size content edits slip past — pass `--rehash` to
+bypass the cache when that matters.
 """
 
 from __future__ import annotations
@@ -34,7 +43,7 @@ from pathlib import Path
 import asyncpg
 
 from db.connection import reserve_node_ids
-from .file_walker import DiscoveredFile, WalkConfig, walk_repo
+from .file_walker import DiscoveredFile, WalkConfig, walk_repo_tree
 from .grammar_meta import LANGUAGES
 
 NODE_COLUMNS = (
@@ -172,13 +181,14 @@ async def index_file(
 
     await conn.execute(
         """
-        INSERT INTO branch_files (branch_id, path, file_version_id, from_dependency)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO branch_files (branch_id, path, file_version_id, from_dependency, size)
+        VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (branch_id, path) DO UPDATE
           SET file_version_id = EXCLUDED.file_version_id,
-              from_dependency = EXCLUDED.from_dependency
+              from_dependency = EXCLUDED.from_dependency,
+              size = EXCLUDED.size
         """,
-        branch_id, discovered.rel_path, file_version_id, from_dependency,
+        branch_id, discovered.rel_path, file_version_id, from_dependency, discovered.size,
     )
 
     return IndexFileResult(
@@ -196,16 +206,19 @@ async def index_repo(
     repo_root: str | Path,
     *,
     walk_config: WalkConfig | None = None,
+    force_rehash: bool = False,
 ) -> IndexRepoResult:
     """Walk a repo and index every supported file under (repo_id, branch_id).
 
-    Hashes every discovered file on disk first, then prefetches all existing
-    `file_versions` rows for those hashes and the current `branch_files`
-    mappings in two batched queries. The per-file loop then only writes for
-    truly new content (cold path: parse + COPY nodes) and for hash-hit files
-    whose `branch_files` mapping is missing or stale (bulk UNNEST upsert at
-    the end). Files whose hash and mapping are already correct cost zero DB
-    round-trips.
+    Re-uses cached `(size, content_hash)` from `branch_files` so files whose
+    byte size hasn't changed skip read+SHA-256 entirely. The walker also
+    builds per-directory Merkle hashes which are persisted to `branch_dirs`.
+
+    The per-file loop only writes for truly new content (cold path: parse +
+    COPY nodes) and for hash-hit files whose `branch_files` mapping or
+    cached size is missing or stale (bulk UNNEST upsert). Files whose hash
+    and mapping are already correct cost zero DB round-trips beyond the
+    initial prefetch.
 
     The branch_files prune at the end removes mappings for user files no
     longer reached by the walker (deletes, moves, newly excluded) without
@@ -215,88 +228,127 @@ async def index_repo(
     cfg = walk_config or WalkConfig.with_defaults(repo_root)
     indexed: list[IndexFileResult] = []
     skipped: list[IndexFileResult] = []
-    walked_paths: list[str] = []
 
-    # Walk + hash everything once, off the DB. Reading file bytes is local
-    # I/O; sha256 is CPU. Doing this up front lets us issue the two prefetch
-    # queries below before any per-file DB work begins. We retain `raw` so
-    # the cold-path tasks don't re-read each file from disk.
-    walk_entries: list[tuple[DiscoveredFile, bytes, str]] = []
-    for discovered in walk_repo(cfg):
-        walked_paths.append(discovered.rel_path)
-        raw = discovered.path.read_bytes()
-        walk_entries.append((discovered, raw, _hash_bytes(raw)))
-
+    # Prefetch the branch's current (path, fv_id, size, content_hash) so the
+    # walker's leaf-hash provider can skip read+SHA-256 when size matches.
+    # JOIN file_versions to pull content_hash in the same round-trip — FK
+    # guarantees every branch_files row has a matching file_versions row.
     async with pool.acquire() as conn:
-        # Record the on-disk root so Phase 3 resolvers (e.g. Go's go.mod parse)
-        # can find files outside the DB. Idempotent; overwrites if changed.
         await conn.execute(
             "UPDATE repos SET root_path=$2 WHERE id=$1",
             repo_id,
             str(Path(repo_root).resolve()),
         )
+        bf_rows = await conn.fetch(
+            """
+            SELECT bf.path, bf.file_version_id, bf.size, fv.content_hash
+            FROM branch_files bf
+            JOIN file_versions fv ON fv.id = bf.file_version_id
+            WHERE bf.branch_id = $1
+            """,
+            branch_id,
+        )
 
-        # Batch 1: every file_versions row that matches any walked hash.
-        unique_hashes = list({h for _, _, h in walk_entries})
+    cached_fv_by_path: dict[str, int] = {}
+    cached_size_by_path: dict[str, int] = {}
+    cached_hash_by_path: dict[str, str] = {}
+    for r in bf_rows:
+        cached_fv_by_path[r["path"]] = r["file_version_id"]
+        if r["size"] is not None:
+            cached_size_by_path[r["path"]] = r["size"]
+            cached_hash_by_path[r["path"]] = r["content_hash"]
+
+    # Provider closure: returns the file's content hash, reading from disk
+    # only on cache miss. Cache-hit files contribute to the walk for tree
+    # purposes but never get read or retained in memory.
+    raw_by_path: dict[str, bytes] = {}
+    hash_by_path: dict[str, str] = {}
+
+    def leaf_hash_provider(rel_path: str, size: int, abs_path: Path) -> str:
+        if not force_rehash:
+            cached_h = cached_hash_by_path.get(rel_path)
+            if cached_h is not None and cached_size_by_path.get(rel_path) == size:
+                hash_by_path[rel_path] = cached_h
+                return cached_h
+        raw = abs_path.read_bytes()
+        h = _hash_bytes(raw)
+        raw_by_path[rel_path] = raw
+        hash_by_path[rel_path] = h
+        return h
+
+    files, dir_hashes = walk_repo_tree(cfg, leaf_hash_provider)
+    walked_paths = [f.rel_path for f in files]
+
+    async with pool.acquire() as conn:
+        # For fresh hashes (cache miss) we may need to learn the file_version_id.
+        # Cache-hit hashes already know theirs from the prefetch — no lookup.
+        fresh_hashes = list({hash_by_path[p] for p in raw_by_path.keys()})
         fv_by_hash: dict[str, int] = {}
-        if unique_hashes:
+        if fresh_hashes:
             fv_rows = await conn.fetch(
                 "SELECT id, content_hash FROM file_versions "
                 "WHERE repo_id=$1 AND content_hash = ANY($2::text[])",
-                repo_id, unique_hashes,
+                repo_id, fresh_hashes,
             )
             fv_by_hash = {r["content_hash"]: r["id"] for r in fv_rows}
-
-        # Batch 2: the current branch_files mappings for this branch. Snapshot
-        # at the start of this run; cold-path inserts run on separate
-        # connections below but only add new (branch_id, path) pairs not in
-        # this snapshot, so it stays consistent for partitioning.
-        bf_rows = await conn.fetch(
-            "SELECT path, file_version_id FROM branch_files WHERE branch_id=$1",
-            branch_id,
-        )
-        mapping_by_path: dict[str, int] = {r["path"]: r["file_version_id"] for r in bf_rows}
 
         # Partition: unchanged, rebind (bulk upsert), new (cold path).
         # Cold path is deduped by content_hash so identical-content paths
         # don't race to INSERT the same file_versions row.
         cold_by_hash: dict[str, tuple[DiscoveredFile, bytes]] = {}
         cold_extra: dict[str, list[DiscoveredFile]] = {}
-        rebinds: list[tuple[str, int, str]] = []  # (rel_path, fv_id, language)
-        for discovered, raw, content_hash in walk_entries:
-            fv_id = fv_by_hash.get(content_hash)
-            if fv_id is None:
-                if content_hash in cold_by_hash:
-                    cold_extra.setdefault(content_hash, []).append(discovered)
+        rebinds: list[tuple[str, int, str, int]] = []  # (rel_path, fv_id, language, size)
+        for f in files:
+            h = hash_by_path[f.rel_path]
+            if f.rel_path in raw_by_path:
+                # Cache miss: we read the file. fv may or may not exist.
+                fv_id = fv_by_hash.get(h)
+                if fv_id is None:
+                    if h in cold_by_hash:
+                        cold_extra.setdefault(h, []).append(f)
+                    else:
+                        cold_by_hash[h] = (f, raw_by_path[f.rel_path])
+                    continue
+                if (cached_fv_by_path.get(f.rel_path) == fv_id
+                        and cached_size_by_path.get(f.rel_path) == f.size):
+                    skipped.append(IndexFileResult(
+                        file_version_id=fv_id,
+                        rel_path=f.rel_path,
+                        language=f.language,
+                        node_count=0,
+                        skipped=True,
+                    ))
                 else:
-                    cold_by_hash[content_hash] = (discovered, raw)
-                continue
-            if mapping_by_path.get(discovered.rel_path) == fv_id:
+                    # Mapping changed, size needs backfill, or both.
+                    rebinds.append((f.rel_path, fv_id, f.language, f.size))
+            else:
+                # Cache hit: trust prefetched fv_id; truly skipped.
+                fv_id = cached_fv_by_path[f.rel_path]
                 skipped.append(IndexFileResult(
                     file_version_id=fv_id,
-                    rel_path=discovered.rel_path,
-                    language=discovered.language,
+                    rel_path=f.rel_path,
+                    language=f.language,
                     node_count=0,
                     skipped=True,
                 ))
-            else:
-                rebinds.append((discovered.rel_path, fv_id, discovered.language))
 
         if rebinds:
             await conn.execute(
                 """
-                INSERT INTO branch_files (branch_id, path, file_version_id, from_dependency)
-                SELECT $1, * FROM UNNEST($2::text[], $3::bigint[], $4::boolean[])
+                INSERT INTO branch_files (branch_id, path, file_version_id, from_dependency, size)
+                SELECT $1, * FROM UNNEST($2::text[], $3::bigint[], $4::boolean[], $5::bigint[])
                 ON CONFLICT (branch_id, path) DO UPDATE
                   SET file_version_id = EXCLUDED.file_version_id,
-                      from_dependency = EXCLUDED.from_dependency
+                      from_dependency = EXCLUDED.from_dependency,
+                      size = EXCLUDED.size
                 """,
                 branch_id,
                 [r[0] for r in rebinds],
                 [r[1] for r in rebinds],
                 [False] * len(rebinds),
+                [r[3] for r in rebinds],
             )
-            for rel_path, fv_id, lang in rebinds:
+            for rel_path, fv_id, lang, _size in rebinds:
                 indexed.append(IndexFileResult(
                     file_version_id=fv_id,
                     rel_path=rel_path,
@@ -323,6 +375,25 @@ async def index_repo(
         )
         deleted = [r["path"] for r in deleted_rows]
 
+        # Persist directory Merkle hashes. Bulk upsert all current dirs,
+        # then prune rows for directories no longer in the walk (deleted
+        # subtrees, newly excluded paths).
+        dir_paths = list(dir_hashes.keys())
+        dir_tree_hashes = [dir_hashes[p] for p in dir_paths]
+        await conn.execute(
+            """
+            INSERT INTO branch_dirs (branch_id, path, tree_hash)
+            SELECT $1, * FROM UNNEST($2::text[], $3::text[])
+            ON CONFLICT (branch_id, path) DO UPDATE
+              SET tree_hash = EXCLUDED.tree_hash
+            """,
+            branch_id, dir_paths, dir_tree_hashes,
+        )
+        await conn.execute(
+            "DELETE FROM branch_dirs WHERE branch_id=$1 AND path <> ALL($2::text[])",
+            branch_id, dir_paths,
+        )
+
     # Cold path: parse + insert each new file on its own connection so
     # tree-sitter work and DB I/O overlap across files.
     if cold_by_hash:
@@ -343,11 +414,13 @@ async def index_repo(
             hash_to_fv = {h: res.file_version_id for (h, _), res in zip(cold_items, cold_results)}
             extra_paths: list[str] = []
             extra_fvs: list[int] = []
+            extra_sizes: list[int] = []
             for h, dups in cold_extra.items():
                 fv_id = hash_to_fv[h]
                 for d in dups:
                     extra_paths.append(d.rel_path)
                     extra_fvs.append(fv_id)
+                    extra_sizes.append(d.size)
                     indexed.append(IndexFileResult(
                         file_version_id=fv_id,
                         rel_path=d.rel_path,
@@ -357,13 +430,14 @@ async def index_repo(
             async with pool.acquire() as c:
                 await c.execute(
                     """
-                    INSERT INTO branch_files (branch_id, path, file_version_id, from_dependency)
-                    SELECT $1, * FROM UNNEST($2::text[], $3::bigint[], $4::boolean[])
+                    INSERT INTO branch_files (branch_id, path, file_version_id, from_dependency, size)
+                    SELECT $1, * FROM UNNEST($2::text[], $3::bigint[], $4::boolean[], $5::bigint[])
                     ON CONFLICT (branch_id, path) DO UPDATE
                       SET file_version_id = EXCLUDED.file_version_id,
-                          from_dependency = EXCLUDED.from_dependency
+                          from_dependency = EXCLUDED.from_dependency,
+                          size = EXCLUDED.size
                     """,
-                    branch_id, extra_paths, extra_fvs, [False] * len(extra_paths),
+                    branch_id, extra_paths, extra_fvs, [False] * len(extra_paths), extra_sizes,
                 )
 
     return IndexRepoResult(indexed=indexed, skipped=skipped, deleted=deleted)

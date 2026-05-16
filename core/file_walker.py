@@ -20,15 +20,23 @@ dependency pass to read explicitly-named files inside dep dirs (e.g. an
 import resolver tells us "we need lib/forge-std/src/Test.sol" — that file
 gets yielded even though `lib/` is otherwise pruned). Exclusion patterns
 do not apply to that pass.
+
+`walk_repo_tree` is the Merkle-tree-aware variant used by the extractor: it
+yields the same `DiscoveredFile` set and additionally returns a per-directory
+SHA-256 over the sorted manifest of children. The leaf hashes feeding into
+each directory hash come from a caller-supplied `leaf_hash_provider`, which
+lets the extractor reuse cached content hashes when a file's size hasn't
+changed.
 """
 
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
 from .grammar_meta import LANGUAGES, language_for_path
 from .languages import HANDLERS
@@ -54,6 +62,14 @@ DEFAULT_DEP_PATHS: dict[str, tuple[str, ...]] = {
 }
 
 TRIDENT_IGNORE_FILE = ".tridentignore"
+
+ROOT_DIR_PATH = ""  # branch_dirs stores the repo root with empty-string path.
+
+# Leaf provider contract: given (rel_path, size, abs_path), return the
+# file's SHA-256 hex digest. The extractor implements this with a size-cache
+# shortcut; tests and the basic `walk_repo` path bypass tree-building and
+# don't call any provider.
+LeafHashProvider = Callable[[str, int, Path], str]
 
 
 @dataclass
@@ -126,45 +142,138 @@ class DiscoveredFile:
     path: Path           # absolute path
     rel_path: str        # path relative to repo_root, forward-slash separated
     language: str
+    size: int            # bytes (from os.stat); cached on branch_files for the size-cache shortcut
+
+
+def _scan_one_dir(
+    config: WalkConfig,
+    abs_dir: Path,
+    rel_dir: str,
+) -> tuple[list[DiscoveredFile], list[tuple[Path, str, str]]]:
+    """List the immediate children of `abs_dir` that survive the filters.
+
+    Returns (files, subdirs). `subdirs` items are (abs_path, rel_path, name).
+    Filenames in `files` are sorted by basename; subdirs are sorted by name.
+    Sorting matters for the Merkle tree's canonical dir manifest.
+    """
+    skip_dirs = ALWAYS_IGNORED | config.all_dep_dirs()
+    excludes = config.exclude_patterns
+
+    files: list[DiscoveredFile] = []
+    subdirs: list[tuple[Path, str, str]] = []
+
+    with os.scandir(abs_dir) as it:
+        entries = list(it)
+    entries.sort(key=lambda e: e.name)
+
+    for entry in entries:
+        name = entry.name
+        rel = f"{rel_dir}/{name}" if rel_dir else name
+        if entry.is_dir(follow_symlinks=False):
+            if name in skip_dirs:
+                continue
+            if config.skip_hidden and name.startswith("."):
+                continue
+            if _matches_excludes(rel, excludes):
+                continue
+            subdirs.append((Path(entry.path), rel, name))
+        elif entry.is_file(follow_symlinks=False):
+            lang = language_for_path(Path(entry.path))
+            if lang is None:
+                continue
+            if _matches_excludes(rel, excludes):
+                continue
+            try:
+                size = entry.stat(follow_symlinks=False).st_size
+            except FileNotFoundError:
+                continue
+            files.append(DiscoveredFile(
+                path=Path(entry.path), rel_path=rel, language=lang, size=size,
+            ))
+
+    return files, subdirs
 
 
 def walk_repo(config: WalkConfig) -> Iterator[DiscoveredFile]:
     """Yield source files in `config.repo_root`, pruning dep + ignored dirs
-    and applying any user `exclude_patterns`."""
+    and applying any user `exclude_patterns`. Does not compute tree hashes."""
     root = config.repo_root
     if not root.is_dir():
         raise ValueError(f"repo_root not a directory: {root}")
 
-    skip_dirs = ALWAYS_IGNORED | config.all_dep_dirs()
-    excludes = config.exclude_patterns
+    stack: list[tuple[Path, str]] = [(root, "")]
+    while stack:
+        abs_dir, rel_dir = stack.pop()
+        files, subdirs = _scan_one_dir(config, abs_dir, rel_dir)
+        for f in files:
+            yield f
+        # Push in reverse so leftmost dir is processed next.
+        for abs_sub, rel_sub, _name in reversed(subdirs):
+            stack.append((abs_sub, rel_sub))
 
-    for dirpath, dirnames, filenames in os.walk(root):
-        rel_dir = Path(dirpath).relative_to(root).as_posix()
-        if rel_dir == ".":
-            rel_dir = ""
 
-        # Prune in-place so os.walk does not descend.
-        pruned: list[str] = []
-        for d in list(dirnames):
-            if d in skip_dirs:
-                continue
-            if config.skip_hidden and d.startswith("."):
-                continue
-            sub_rel = f"{rel_dir}/{d}" if rel_dir else d
-            if _matches_excludes(sub_rel, excludes):
-                continue
-            pruned.append(d)
-        dirnames[:] = pruned
+def _dir_manifest_hash(entries: list[tuple[str, str, str]]) -> str:
+    """SHA-256 over the canonical manifest of one directory.
 
-        for fname in filenames:
-            full = Path(dirpath) / fname
-            lang = language_for_path(full)
-            if lang is None:
-                continue
-            rel = full.relative_to(root).as_posix()
-            if _matches_excludes(rel, excludes):
-                continue
-            yield DiscoveredFile(path=full, rel_path=rel, language=lang)
+    `entries` is a list of (kind, name, hash) where kind is 'f' or 'd'.
+    Caller passes them already sorted by name. Lines are joined with `\n`,
+    fields with `|`. Names are NUL-rejected to keep the format unambiguous;
+    POSIX filenames cannot contain NUL anyway.
+    """
+    h = hashlib.sha256()
+    for kind, name, child_hash in entries:
+        if "\x00" in name:
+            raise ValueError(f"filename contains NUL: {name!r}")
+        h.update(f"{kind}|{name}|{child_hash}\n".encode())
+    return h.hexdigest()
+
+
+def walk_repo_tree(
+    config: WalkConfig,
+    leaf_hash_provider: LeafHashProvider,
+) -> tuple[list[DiscoveredFile], dict[str, str]]:
+    """Walk the repo and build the per-directory Merkle hashes.
+
+    Returns (files, dir_hashes). `files` is the same set `walk_repo` would
+    yield, in deterministic (depth-first, name-sorted) order. `dir_hashes`
+    maps every visited directory's repo-relative path (with the root as
+    `ROOT_DIR_PATH`/empty string) to its SHA-256 manifest hash.
+
+    `leaf_hash_provider(rel_path, size, abs_path)` is called for every file
+    and must return the file's content hash (hex SHA-256). The extractor
+    uses this hook to reuse cached hashes when a file's size hasn't changed.
+    """
+    root = config.repo_root
+    if not root.is_dir():
+        raise ValueError(f"repo_root not a directory: {root}")
+
+    files: list[DiscoveredFile] = []
+    dir_hashes: dict[str, str] = {}
+
+    def recurse(abs_dir: Path, rel_dir: str) -> str:
+        local_files, subdirs = _scan_one_dir(config, abs_dir, rel_dir)
+        # Entries fed into this dir's hash, sorted by name. Files and subdirs
+        # were each independently sorted in _scan_one_dir; merge by name.
+        manifest: list[tuple[str, str, str]] = []
+        # Build child hashes first so they're available for the manifest.
+        sub_hashes: dict[str, str] = {}
+        for abs_sub, rel_sub, name in subdirs:
+            sub_hashes[name] = recurse(abs_sub, rel_sub)
+        file_hashes: dict[str, str] = {}
+        for f in local_files:
+            file_hashes[f.path.name] = leaf_hash_provider(f.rel_path, f.size, f.path)
+            files.append(f)
+        for name in sorted(set(sub_hashes) | set(file_hashes)):
+            if name in file_hashes:
+                manifest.append(("f", name, file_hashes[name]))
+            else:
+                manifest.append(("d", name, sub_hashes[name]))
+        h = _dir_manifest_hash(manifest)
+        dir_hashes[rel_dir] = h
+        return h
+
+    recurse(root, ROOT_DIR_PATH)
+    return files, dir_hashes
 
 
 def walk_dependency_files(
@@ -195,10 +304,15 @@ def walk_dependency_files(
         lang = language_for_path(full)
         if lang is None:
             continue
+        try:
+            size = full.stat().st_size
+        except FileNotFoundError:
+            continue
         yield DiscoveredFile(
             path=full,
             rel_path=full.relative_to(root).as_posix(),
             language=lang,
+            size=size,
         )
 
 
@@ -206,10 +320,13 @@ __all__ = [
     "ALWAYS_IGNORED",
     "DEFAULT_DEP_PATHS",
     "DiscoveredFile",
+    "LeafHashProvider",
+    "ROOT_DIR_PATH",
     "TRIDENT_IGNORE_FILE",
     "WalkConfig",
     "read_tridentignore",
     "walk_dependency_files",
     "walk_repo",
+    "walk_repo_tree",
     "LANGUAGES",
 ]
