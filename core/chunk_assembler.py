@@ -372,34 +372,42 @@ async def _load_defs(conn: asyncpg.Connection, branch_id: int) -> list[_DefRow]:
 
 
 async def _load_call_edges(conn: asyncpg.Connection, branch_id: int) -> list[asyncpg.Record]:
+    # ORDER BY is load-bearing: callees_by_caller list order feeds chunk
+    # content; without it heap-scan order can shift between runs and produce
+    # spurious content_hash churn / re-embedding.
     return await conn.fetch(
         """
         SELECT ce.caller_def_id, ce.callee_def_id, ce.callee_name, ce.confidence
         FROM call_edges ce
         WHERE ce.branch_id = $1
+        ORDER BY ce.caller_def_id, ce.callee_def_id NULLS LAST, ce.callee_name
         """,
         branch_id,
     )
 
 
 async def _load_data_access(conn: asyncpg.Connection, branch_id: int) -> list[asyncpg.Record]:
+    # ORDER BY for chunk-hash stability (see _load_call_edges).
     return await conn.fetch(
         """
         SELECT da.accessor_def_id, da.target_def_id, da.access_type
         FROM data_access da
         WHERE da.branch_id = $1
+        ORDER BY da.accessor_def_id, da.target_def_id, da.access_type
         """,
         branch_id,
     )
 
 
 async def _load_imports(conn: asyncpg.Connection, branch_id: int) -> dict[int, list[asyncpg.Record]]:
+    # ORDER BY for chunk-hash stability (see _load_call_edges).
     rows = await conn.fetch(
         """
         SELECT i.file_version_id, i.import_path, i.dep_class, e.package_name
         FROM imports i
         LEFT JOIN external_dependencies e ON e.id = i.external_dep_id
         WHERE i.branch_id = $1
+        ORDER BY i.file_version_id, i.import_path, i.dep_class
         """,
         branch_id,
     )
@@ -430,6 +438,7 @@ async def _load_overrides_edges(conn: asyncpg.Connection, branch_id: int) -> lis
         SELECT oe.child_def_id, oe.base_def_id
         FROM overrides_edges oe
         WHERE oe.branch_id = $1
+        ORDER BY oe.child_def_id, oe.base_def_id
         """,
         branch_id,
     )
