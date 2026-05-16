@@ -25,9 +25,9 @@ from typing import Awaitable, Callable
 import asyncpg
 
 try:
-    from openai import OpenAI
+    from openai import AsyncOpenAI
 except ImportError:  # pragma: no cover - dev deps installed by uv
-    OpenAI = None  # type: ignore
+    AsyncOpenAI = None  # type: ignore
 
 try:
     from pgvector.asyncpg import register_vector
@@ -65,10 +65,10 @@ class OpenAICompatibleEmbedder:
     """Calls `client.embeddings.create(model=..., input=batch)` per the OpenAI HTTP shape."""
 
     def __init__(self, config: EmbedderConfig):
-        if OpenAI is None:
+        if AsyncOpenAI is None:
             raise RuntimeError("openai SDK not installed")
         self.config = config
-        self._client = OpenAI(base_url=config.base_url, api_key=config.api_key)
+        self._client = AsyncOpenAI(base_url=config.base_url, api_key=config.api_key)
 
     @property
     def model_name(self) -> str:
@@ -81,9 +81,7 @@ class OpenAICompatibleEmbedder:
         # OpenAI v3 supports `dimensions`; gateways that ignore it just return native dim.
         if "openai.com" in self.config.base_url or self.config.model.startswith("text-embedding-3"):
             kwargs["dimensions"] = self.config.dim
-        # The OpenAI client is sync; offload to a thread.
-        loop = asyncio.get_running_loop()
-        resp = await loop.run_in_executor(None, lambda: self._client.embeddings.create(**kwargs))
+        resp = await self._client.embeddings.create(**kwargs)
         # SDK returns Pydantic models with .data[i].embedding (list[float]).
         return [list(item.embedding) for item in resp.data]
 
@@ -107,6 +105,11 @@ class EmbedStats:
 
 # Outer ceiling that filters chunks before sending to the embedder gateway.
 DEFAULT_MAX_INPUT_TOKENS = int(os.environ.get("EMBEDDING_MAX_INPUT_TOKENS", "16000"))
+
+# How many embedding API calls to keep in flight concurrently. API latency
+# (200–500 ms per batch) dominates throughput, so 2–4 concurrent calls
+# typically give a near-linear speedup without tripping rate limits.
+DEFAULT_EMBEDDING_CONCURRENCY = int(os.environ.get("EMBEDDING_CONCURRENCY", "3"))
 
 
 def _vector_literal(values: list[float]) -> str:
@@ -177,30 +180,57 @@ async def embed_branch_chunks(
                 f"(largest: {max(t for _, t in stats.skipped_oversize)})"
             )
 
-        for i in range(0, len(eligible), batch_size):
-            batch = eligible[i : i + batch_size]
-            texts = [r["content"] for r in batch]
-            vectors = await embed_fn(texts)
+        sem = asyncio.Semaphore(DEFAULT_EMBEDDING_CONCURRENCY)
+
+        async def _embed_one(batch: list) -> tuple[list, list[list[float]]]:
+            async with sem:
+                texts = [r["content"] for r in batch]
+                vectors = await embed_fn(texts)
             if len(vectors) != len(batch):
                 raise RuntimeError(
                     f"embed_fn returned {len(vectors)} vectors for batch of {len(batch)}"
                 )
-            insert_rows = []
             for r, vec in zip(batch, vectors):
                 if len(vec) != dim:
                     raise RuntimeError(
                         f"embedding dim mismatch: got {len(vec)}, expected {dim} (chunk {r['id']})"
                     )
-                insert_rows.append((r["content_hash"], _vector_literal(vec), model_name))
-            await conn.executemany(
+            return batch, vectors
+
+        tasks = [
+            asyncio.create_task(_embed_one(eligible[i : i + batch_size]))
+            for i in range(0, len(eligible), batch_size)
+        ]
+
+        all_hashes: list[str] = []
+        all_vectors: list[str] = []
+        try:
+            for coro in asyncio.as_completed(tasks):
+                batch, vectors = await coro
+                for r, vec in zip(batch, vectors):
+                    all_hashes.append(r["content_hash"])
+                    all_vectors.append(_vector_literal(vec))
+                stats.embedded += len(batch)
+        except BaseException:
+            # On any failure, cancel the remaining in-flight API calls so we
+            # don't keep burning the gateway after a fatal validation error.
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            raise
+
+        if all_hashes:
+            await conn.execute(
                 """
                 INSERT INTO chunk_embeddings (content_hash, embedding, model_name)
-                VALUES ($1, $2::vector, $3)
+                SELECT content_hash, embedding::vector, $3
+                FROM UNNEST($1::text[], $2::text[]) AS t(content_hash, embedding)
                 ON CONFLICT (content_hash) DO NOTHING
                 """,
-                insert_rows,
+                all_hashes,
+                all_vectors,
+                model_name,
             )
-            stats.embedded += len(batch)
     return stats
 
 
