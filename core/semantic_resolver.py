@@ -42,6 +42,7 @@ from db.connection import reserve_definition_ids
 
 from .config_loader import LanguageConfig, load_language_config
 from .grammar_meta import LANGUAGES
+from .languages import SemanticContext, get_handler
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -264,179 +265,6 @@ def _terminal_identifier(ts_node) -> str | None:
     return None
 
 
-_RUST_TEST_PATH_SEGMENTS = frozenset({"tests", "benches", "examples", "test_utils"})
-
-
-def _is_rust_test_path(rel_path: str) -> bool:
-    """True if a Rust source file lives in a directory we treat as test-only
-    or test-scaffolding code:
-      • cargo's separate-compilation-unit dirs: `tests/`, `benches/`,
-        `examples/` — these never link into the production crate.
-      • `test_utils/` — Solana/Anchor convention for cross-crate test
-        fixtures. Not gated by `#[cfg(test)]` (so other crates' integration
-        tests can pull them in) but functionally test scaffolding —
-        retrieval-noise for production code questions.
-    Detected by path segment, catching both top-level and per-crate
-    workspace layouts (`programs/bridge/src/test_utils/mod.rs`)."""
-    return any(p in _RUST_TEST_PATH_SEGMENTS for p in rel_path.split("/"))
-
-
-def _rust_attribute_path_name(attr_ts) -> str | None:
-    """Return the dotted-path head of an `attribute` node (the bit before
-    the optional `(...)` arguments). For `#[cfg(test)]` returns `"cfg"`;
-    for `#[serde(rename_all = "snake_case")]` returns `"serde"`; for
-    `#[tokio::test]` returns `"test"` (the trailing identifier)."""
-    for c in attr_ts.children:
-        if c.type == "identifier":
-            return _text(c)
-        if c.type == "scoped_identifier":
-            return _terminal_identifier(c)
-    return None
-
-
-def _token_tree_contains_test(args_ts) -> bool:
-    """True if the `cfg(...)` token-tree mentions a literal `test` token
-    anywhere in its named subtree. We don't try to interpret arbitrary cfg
-    predicates — `cfg(any(test, feature = "x"))` and `cfg(all(test, …))`
-    both correctly trip this. False positives are rare; the cost of
-    occasionally over-skipping borderline test-utility code is far less
-    than the cost of letting unit-test bodies dominate retrieval."""
-    stack = [args_ts]
-    while stack:
-        n = stack.pop()
-        if n.type == "identifier" and _text(n) == "test":
-            return True
-        for c in n.children:
-            stack.append(c)
-    return False
-
-
-def _has_test_attribute(item_ts) -> bool:
-    """Walk previous-sibling attribute_items looking for a test marker:
-      • `#[test]` / `#[tokio::test]` / `#[<runner>::test]`
-      • `#[cfg(test)]` / `#[cfg(any(test, …))]` / `#[cfg(all(test, …))]`
-    Returns True on the first match."""
-    cursor = item_ts.prev_named_sibling
-    while cursor is not None and cursor.type == "attribute_item":
-        attr = next((c for c in cursor.children if c.type == "attribute"), None)
-        if attr is not None:
-            path_name = _rust_attribute_path_name(attr)
-            if path_name == "test":
-                return True
-            if path_name == "cfg":
-                args = attr.child_by_field_name("arguments")
-                if args is not None and _token_tree_contains_test(args):
-                    return True
-        cursor = cursor.prev_named_sibling
-    return False
-
-
-_RUST_SKIP_ITEM_TYPES = frozenset({
-    "mod_item", "function_item", "impl_item",
-    "struct_item", "enum_item", "union_item",
-    "trait_item", "type_item", "const_item", "static_item",
-    "macro_definition",
-})
-
-# Module names that, by convention, hold test scaffolding even when not
-# `#[cfg(test)]`-gated. `tests` is the unit-test convention (almost always
-# paired with cfg(test) but not strictly required). `test_utils` is the
-# Solana/Anchor / cross-crate helper convention — fixtures live here so
-# integration tests in other crates can pull them in, which means they
-# can't be cfg(test)-gated. Both are noise for code retrieval.
-_RUST_TEST_MOD_NAMES = frozenset({"tests", "test_utils"})
-
-
-def _collect_rust_test_skip_ids(ts_walk) -> frozenset[int]:
-    """Return the ts_node ids whose subtrees should be skipped during
-    semantic emission because they are test code. A node is a skip-root
-    when one of:
-      • it carries a test attribute (#[test], #[cfg(test)], etc.)
-      • it's a `mod_item` literally named `tests` (idiomatic test-mod
-        convention; almost always paired with `#[cfg(test)]` but not
-        strictly required by the language)
-
-    The skip set includes all descendants of every skip-root, so any def
-    rule matching anything inside `mod tests { … }` is filtered out before
-    a definition row is reserved."""
-    skip_roots: list = []
-    for ts in ts_walk:
-        if ts.type not in _RUST_SKIP_ITEM_TYPES:
-            continue
-        is_test = _has_test_attribute(ts)
-        if not is_test and ts.type == "mod_item":
-            name_node = ts.child_by_field_name("name")
-            if name_node is not None and _text(name_node) in _RUST_TEST_MOD_NAMES:
-                is_test = True
-        if is_test:
-            skip_roots.append(ts)
-    if not skip_roots:
-        return frozenset()
-    out: set[int] = set()
-    for root in skip_roots:
-        stack = [root]
-        while stack:
-            n = stack.pop()
-            out.add(n.id)
-            for c in n.children:
-                stack.append(c)
-    return frozenset(out)
-
-
-def _collect_rust_derives(item_ts) -> list[str]:
-    """Walk an item's previous siblings to collect names from `#[derive(...)]`
-    attributes. tree-sitter-rust represents attributes as siblings, not
-    children, of the item they decorate.
-
-    Stops at the first non-attribute_item sibling so a comment-or-blank-line
-    gap between an attribute and the item still works (whitespace isn't a
-    named child). `#[derive(Foo, Bar)]` and chained `#[derive(Foo)]
-    #[derive(Bar)]` both yield `[Foo, Bar]`. Any non-derive attribute
-    (`#[serde(rename = "...")]`, `#[cfg(test)]`, …) is skipped — only the
-    derive list contributes graph edges.
-    """
-    out: list[str] = []
-    cursor = item_ts.prev_named_sibling
-    while cursor is not None and cursor.type == "attribute_item":
-        attr = None
-        for c in cursor.children:
-            if c.type == "attribute":
-                attr = c
-                break
-        if attr is None:
-            cursor = cursor.prev_named_sibling
-            continue
-        # First named child of `attribute` is the path (`derive`, `cfg`, …).
-        path_name: str | None = None
-        for c in attr.children:
-            if c.type == "identifier":
-                path_name = _text(c)
-                break
-            if c.type == "scoped_identifier":
-                path_name = _terminal_identifier(c)
-                break
-        if path_name == "derive":
-            args = attr.child_by_field_name("arguments")
-            if args is not None:
-                # token_tree carries the parenthesized list; we collect every
-                # identifier / scoped_identifier child as a derived trait. The
-                # commas and parens are anonymous tokens and are skipped by
-                # is_named. We prepend each attribute's derives so the result
-                # reads in source order despite the prev-sibling walk.
-                this_attr: list[str] = []
-                for c in args.children:
-                    if not c.is_named:
-                        continue
-                    if c.type in ("identifier", "type_identifier"):
-                        this_attr.append(_text(c))
-                    elif c.type == "scoped_identifier":
-                        n = _terminal_identifier(c)
-                        if n:
-                            this_attr.append(n)
-                out = this_attr + out
-        cursor = cursor.prev_named_sibling
-    return out
-
 
 def _extract_bases(ts_node, cfg) -> list[str]:
     """Return ordered list of base-class names declared on this node, per the
@@ -599,24 +427,21 @@ async def resolve_file(
 
     await _clear_branch_semantic_for_file_version(conn, branch_id, file_version_id)
 
-    # Rust-only: drop integration-test files (`tests/`, `benches/`,
-    # `examples/`) from semantic emission entirely — these are separate
-    # compilation units and their bodies are noise for retrieval. Inline
-    # `#[cfg(test)] mod tests { … }` blocks are filtered per-node below.
-    if config.language == "rust" and _is_rust_test_path(rel_path):
+    # Per-language hooks: whole-file skip (Rust uses this for `tests/`,
+    # `benches/`, `examples/` dirs), plus per-file precompute that stashes
+    # scratch state used by later emission loops (Rust's test-gated node IDs).
+    handler = get_handler(config.language)
+    if handler.should_skip_file(rel_path):
         return ResolveFileResult(
             file_version_id=file_version_id, language=config.language,
             n_definitions=0, n_references=0,
             n_call_edges=0, n_data_access=0,
         )
 
-    # Rust-only: pre-compute the set of ts_node ids inside test-gated items
-    # (cfg(test)/test attribute or `mod tests { … }`). Every emission loop
-    # below treats these as if they didn't exist.
-    test_skip_ts_ids: frozenset[int] = (
-        _collect_rust_test_skip_ids(ts_walk)
-        if config.language == "rust"
-        else frozenset()
+    sem_ctx = SemanticContext(config=config, file_path=rel_path)
+    handler.precompute_file_state(ts_walk, sem_ctx)
+    test_skip_ts_ids: frozenset[int] = sem_ctx.scratch.get(
+        "test_skip_ts_ids", frozenset(),
     )
 
     # Hydrate mode: when another branch already resolved this file_version,
@@ -771,23 +596,12 @@ async def resolve_file(
                         for i in range(n.child_count - 1, -1, -1):
                             stack.append(n.children[i])
 
-            # Rust-specific: a `function_item` whose AST grandparent is an
-            # `impl_item` is a method; prefix its qualified_name with the impl's
-            # target type (`Counter::new`). impl_item is intentionally not a
-            # definition of its own — see configs/rust.yaml — so the prefix has
-            # to come from the AST, not the scope chain.
-            if (
-                config.language == "rust"
-                and prefix_segment is None
-                and ts.type == "function_item"
-            ):
-                parent = ts.parent
-                if parent is not None and parent.type == "declaration_list":
-                    gp = parent.parent
-                    if gp is not None and gp.type == "impl_item":
-                        type_field = gp.child_by_field_name("type")
-                        if type_field is not None:
-                            prefix_segment = _terminal_identifier(type_field)
+            # Per-language hook: language-specific qualified-name prefix
+            # segment that the YAML config can't express. Rust uses this to
+            # prepend an impl block's target type to method names
+            # (`Counter::new` → qualified_name includes 'Counter').
+            if prefix_segment is None:
+                prefix_segment = handler.qualified_name_prefix(ts, sem_ctx)
 
             visibility: str | None = None
             if rule.visibility_field:
@@ -886,67 +700,22 @@ async def resolve_file(
                 base_def_id = defs_by_scope_and_name.get((module_def_id, base_name))
                 inh_records.append((child_def_id, base_name, ordinal, base_def_id, "certain"))
 
-    # ── P2.5b: Rust-specific inheritance (impl-trait + derive macros) ──
-    # Two synthetic shapes the YAML inheritance machinery can't express:
-    #   • `impl Trait for Type { … }` → edge Type → Trait. The child here is
-    #     the Type's existing struct/enum/union/type def, not the impl_item
-    #     (which is intentionally not a definition).
-    #   • `#[derive(Trait1, Trait2)]` on a struct/enum/union → one edge per
-    #     derived trait. Tree-sitter never expands the macro, so the actual
-    #     `impl Trait for Type { ... }` block rust-analyzer would see is
-    #     invisible to us; we synthesize the edges best-effort. Confidence
-    #     `inferred` reflects the heuristic nature of both shapes.
-    if config.language == "rust":
+    # ── P2.5b: handler-synthesized inheritance edges ──
+    # Per-language hook for shapes the YAML inheritance machinery can't
+    # express (Rust: `impl Trait for Type` and `#[derive(...)]` macro edges).
+    # Ordinals are per-target so multiple synthesized edges sharing a target
+    # def_id get stable, unique `ord` values.
+    sem_ctx.module_def_id = module_def_id
+    sem_ctx.defs_by_scope_and_name = defs_by_scope_and_name
+    synthesized = handler.synthesize_inheritance(ts_walk, sem_ctx)
+    if synthesized:
         ord_for: dict[int, int] = {}
-
-        def _next_ord(target: int) -> int:
-            n = ord_for.get(target, 0) + 1
-            ord_for[target] = n
-            return n
-
-        # impl Trait for Type → Type's def → Trait
-        for ts in ts_walk:
-            if ts.id in test_skip_ts_ids:
-                continue
-            if ts.type != "impl_item":
-                continue
-            type_field = ts.child_by_field_name("type")
-            trait_field = ts.child_by_field_name("trait")
-            if type_field is None or trait_field is None:
-                continue
-            target_name = _terminal_identifier(type_field)
-            trait_name = _terminal_identifier(trait_field)
-            if not target_name or not trait_name:
-                continue
-            target_def = defs_by_scope_and_name.get((module_def_id, target_name))
-            if target_def is None:
-                # Type defined in another file — Phase 3 will not currently
-                # link this since inherits cross-file resolution keys on
-                # child_def_id. Skip silently.
-                continue
-            base_def = defs_by_scope_and_name.get((module_def_id, trait_name))
+        for edge in synthesized:
+            n = ord_for.get(edge.child_def_id, 0) + 1
+            ord_for[edge.child_def_id] = n
             inh_records.append(
-                (target_def, trait_name, _next_ord(target_def), base_def, "inferred")
+                (edge.child_def_id, edge.base_name, n, edge.base_def_id, edge.confidence)
             )
-
-        # #[derive(Trait1, Trait2, …)] above struct/enum/union
-        for ts in ts_walk:
-            if ts.id in test_skip_ts_ids:
-                continue
-            if ts.type not in ("struct_item", "enum_item", "union_item"):
-                continue
-            name_node = ts.child_by_field_name("name")
-            if name_node is None:
-                continue
-            target_name = _text(name_node)
-            target_def = defs_by_scope_and_name.get((module_def_id, target_name))
-            if target_def is None:
-                continue
-            for trait_name in _collect_rust_derives(ts):
-                base_def = defs_by_scope_and_name.get((module_def_id, trait_name))
-                inh_records.append(
-                    (target_def, trait_name, _next_ord(target_def), base_def, "inferred")
-                )
 
     if inh_records:
         await conn.executemany(

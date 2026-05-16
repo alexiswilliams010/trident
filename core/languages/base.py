@@ -54,21 +54,30 @@ class SemanticContext:
 
     `scratch` is a free-form slot handlers can write into during
     `precompute_file_state` and read back from later hooks within the same
-    file (e.g. Rust stashes test-skip node IDs here).
+    file (e.g. Rust stashes test-skip node IDs at `scratch['test_skip_ts_ids']`).
+    `module_def_id` and `defs_by_scope_and_name` are populated by the resolver
+    before `synthesize_inheritance` fires so handlers can resolve intra-file
+    base-name lookups.
     """
 
     config: "LanguageConfig"
     file_path: str
     scratch: dict[str, Any] = field(default_factory=dict)
+    module_def_id: int | None = None
+    defs_by_scope_and_name: dict[tuple[int, str], int] = field(default_factory=dict)
 
 
 @dataclass
 class InheritanceEdge:
-    """Synthesized inheritance relation: subclass extends/implements `base_qualified_name`."""
+    """One inheritance edge a handler wants emitted into `inherits_edges`.
+    `base_def_id` is filled when intra-file resolution succeeds; otherwise
+    cross-file linking fills it in Phase 3. The caller assigns `ord` from a
+    per-target counter so emission order is stable."""
 
-    subclass_def_id: int
-    base_qualified_name: str
-    confidence: str = "certain"
+    child_def_id: int
+    base_name: str
+    base_def_id: int | None = None
+    confidence: str = "inferred"
 
 
 class LanguageHandler(ABC):
@@ -141,15 +150,27 @@ class LanguageHandler(ABC):
 
     # ── optional: semantic resolver hooks ────────────────────────────
     def should_skip_file(self, rel_path: str) -> bool:
+        """Whole-file skip — return True to drop the file from semantic emission
+        entirely. Rust uses this for `tests/` / `benches/` / `examples/` dirs."""
         return False
 
-    def precompute_file_state(self, tree_root, ctx: SemanticContext) -> None:
+    def precompute_file_state(self, ts_walk: list, ctx: SemanticContext) -> None:
+        """Stash per-file precomputed state into `ctx.scratch` before any other
+        hook runs. Rust uses this to collect the set of ts_node ids under test
+        gates (`#[cfg(test)]`, `#[test]`, `mod tests { … }`) — every emission
+        loop in the resolver consults this set."""
         return None
 
     def qualified_name_prefix(self, ts_node, ctx: SemanticContext) -> str | None:
+        """Return an extra qualified-name prefix segment for this node, or None.
+        Rust uses this to prepend an impl block's target type to method names
+        (`Counter::new` → qualified_name includes `Counter`)."""
         return None
 
     def synthesize_inheritance(
-        self, ts_node, ctx: SemanticContext,
+        self, ts_walk: list, ctx: SemanticContext,
     ) -> list[InheritanceEdge]:
+        """Return language-specific inheritance edges the YAML-driven loop
+        can't express. Rust uses this for `impl Trait for Type` and
+        `#[derive(...)]` macro edges."""
         return []

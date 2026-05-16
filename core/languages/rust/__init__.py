@@ -3,10 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..base import ImportEntry, LanguageHandler, ResolvedImport
+from ..base import ImportEntry, InheritanceEdge, LanguageHandler, ResolvedImport, SemanticContext
 from .crates import RustIndexState, finalize_rust_state
 from .imports import extract_rust_imports
 from .resolve import resolve_rust
+from .semantic import (
+    collect_rust_test_skip_ids,
+    is_rust_test_path,
+    rust_qualified_name_prefix,
+    synthesize_rust_inheritance,
+)
 
 if TYPE_CHECKING:
     from ...config_loader import LanguageConfig
@@ -40,6 +46,21 @@ class RustHandler(LanguageHandler):
         self, entry: ImportEntry, idx: "BranchIndex", cfg: "LanguageConfig",
     ) -> ResolvedImport:
         return resolve_rust(entry, idx)
+
+    # ── semantic hooks ───────────────────────────────────────────────
+    def should_skip_file(self, rel_path: str) -> bool:
+        return is_rust_test_path(rel_path)
+
+    def precompute_file_state(self, ts_walk: list, ctx: SemanticContext) -> None:
+        ctx.scratch["test_skip_ts_ids"] = collect_rust_test_skip_ids(ts_walk)
+
+    def qualified_name_prefix(self, ts_node, ctx: SemanticContext) -> str | None:
+        return rust_qualified_name_prefix(ts_node, ctx)
+
+    def synthesize_inheritance(
+        self, ts_walk: list, ctx: SemanticContext,
+    ) -> list[InheritanceEdge]:
+        return synthesize_rust_inheritance(ts_walk, ctx)
 
 
 __all__ = ["RustHandler"]
