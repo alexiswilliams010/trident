@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from ..base import ImportEntry, LanguageHandler
+from ..base import ImportEntry, LanguageHandler, ResolvedImport
 from .crates import RustIndexState, finalize_rust_state
 from .imports import extract_rust_imports
+from .resolve import resolve_rust
+
+if TYPE_CHECKING:
+    from ...config_loader import LanguageConfig
+    from ...heuristic_resolver import BranchIndex
 
 
 class RustHandler(LanguageHandler):
@@ -29,6 +35,11 @@ class RustHandler(LanguageHandler):
 
     def finalize_index(self, repo_root: Path | None, state: RustIndexState) -> None:
         finalize_rust_state(repo_root, state)
+
+    def resolve(
+        self, entry: ImportEntry, idx: "BranchIndex", cfg: "LanguageConfig",
+    ) -> ResolvedImport:
+        return resolve_rust(entry, idx)
 
 
 __all__ = ["RustHandler"]

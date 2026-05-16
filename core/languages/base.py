@@ -123,6 +123,22 @@ class LanguageHandler(ABC):
         """Called once after all files are indexed (e.g. read go.mod, walk Cargo.toml)."""
         return None
 
+    # ── optional: cross-file linker hooks ────────────────────────────
+    def seed_implicit_imports(self, idx: "BranchIndex") -> dict[int, set[int]]:
+        """Return extra (importer_fvid → imported_fvids) edges intrinsic to
+        this language's scoping rules — e.g. Go files in the same package
+        see each other without explicit imports. Default: nothing."""
+        return {}
+
+    def expand_import_target(
+        self, target_fvid: int, idx: "BranchIndex",
+    ) -> set[int]:
+        """Expand a single resolved import target into the set of files it
+        effectively reaches. Used by the cross-file linker when one import
+        targets a package containing multiple files (Go). Default: just the
+        target itself."""
+        return {target_fvid}
+
     # ── optional: semantic resolver hooks ────────────────────────────
     def should_skip_file(self, rel_path: str) -> bool:
         return False

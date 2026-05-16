@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .._shared.node_imports import extract_node_imports
 from .._shared.node_index import NodeIndexState, finalize_node_state
-from ..base import ImportEntry, LanguageHandler
+from .._shared.node_resolve import resolve_node
+from ..base import ImportEntry, LanguageHandler, ResolvedImport
+
+if TYPE_CHECKING:
+    from ...config_loader import LanguageConfig
+    from ...heuristic_resolver import BranchIndex
 
 
 class TypeScriptHandler(LanguageHandler):
@@ -27,6 +33,11 @@ class TypeScriptHandler(LanguageHandler):
 
     def finalize_index(self, repo_root: Path | None, state: NodeIndexState) -> None:
         finalize_node_state(repo_root, state)
+
+    def resolve(
+        self, entry: ImportEntry, idx: "BranchIndex", cfg: "LanguageConfig",
+    ) -> ResolvedImport:
+        return resolve_node(entry, idx)
 
 
 __all__ = ["TypeScriptHandler"]

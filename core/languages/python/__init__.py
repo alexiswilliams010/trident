@@ -1,8 +1,15 @@
 from __future__ import annotations
 
-from ..base import ImportEntry, LanguageHandler
+from typing import TYPE_CHECKING
+
+from ..base import ImportEntry, LanguageHandler, ResolvedImport
 from .imports import extract_python_imports
 from .index import PythonIndexState, python_dotted_for
+from .resolve import resolve_python
+
+if TYPE_CHECKING:
+    from ...config_loader import LanguageConfig
+    from ...heuristic_resolver import BranchIndex
 
 
 class PythonHandler(LanguageHandler):
@@ -25,6 +32,11 @@ class PythonHandler(LanguageHandler):
         dotted = python_dotted_for(rel_path)
         if dotted:
             state.pkg_index[dotted] = fvid
+
+    def resolve(
+        self, entry: ImportEntry, idx: "BranchIndex", cfg: "LanguageConfig",
+    ) -> ResolvedImport:
+        return resolve_python(entry, idx)
 
 
 __all__ = ["PythonHandler"]

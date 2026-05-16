@@ -29,11 +29,6 @@ import asyncpg
 from .config_loader import LanguageConfig, load_language_config
 from .grammar_meta import LANGUAGES
 from .languages import ImportEntry, ResolvedImport, get_handler
-from .languages._shared.node_resolution import (
-    package_name_for_specifier,
-    resolve_relative as _resolve_relative_node,
-    resolve_tsconfig_alias as _resolve_tsconfig_alias,
-)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -203,300 +198,6 @@ build_repo_index = build_branch_index
 
 
 # ────────────────────────────────────────────────────────────────────
-# Resolution (per language)
-# ────────────────────────────────────────────────────────────────────
-
-
-def _resolve_python(entry: ImportEntry, idx: BranchIndex) -> ResolvedImport:
-    if entry.is_relative:
-        # `from .foo import x` from a/b/main.py → a/b/foo
-        # `from ..foo import x` from a/b/main.py → a/foo
-        src_dir_parts = list(PurePosixPath(entry.source_rel_path).parts[:-1])
-        # Python: 1 dot = current package, 2 dots = parent, etc.
-        ascend = entry.dot_count - 1
-        if ascend > len(src_dir_parts):
-            return ResolvedImport(entry, dep_class="unresolved")
-        base_parts = src_dir_parts[: len(src_dir_parts) - ascend]
-        tail = entry.import_path.lstrip(".")
-        tail_parts = tail.split(".") if tail else []
-
-        # Try: as a module file `<base>/<tail>.py`
-        if tail_parts:
-            cand = "/".join(base_parts + tail_parts) + ".py"
-            if cand in idx.file_index:
-                return ResolvedImport(entry, "intra_repo", resolved_file_version_id=idx.file_index[cand])
-            # Try as package __init__.py
-            cand = "/".join(base_parts + tail_parts) + "/__init__.py"
-            if cand in idx.file_index:
-                return ResolvedImport(entry, "intra_repo", resolved_file_version_id=idx.file_index[cand])
-            # Try: each imported name is itself a sibling module (`from . import siblings`)
-            # falls through if tail was given but didn't resolve — leave unresolved.
-        else:
-            # `from . import name` — each imported name is a sibling module.
-            # Resolve the FIRST name to populate resolved_file_version_id (full multi-name handled below).
-            for name in entry.imported_names:
-                cand = "/".join(base_parts + [name]) + ".py"
-                if cand in idx.file_index:
-                    return ResolvedImport(entry, "intra_repo", resolved_file_version_id=idx.file_index[cand])
-                cand = "/".join(base_parts + [name]) + "/__init__.py"
-                if cand in idx.file_index:
-                    return ResolvedImport(entry, "intra_repo", resolved_file_version_id=idx.file_index[cand])
-        return ResolvedImport(entry, "unresolved")
-
-    # Absolute import: try the full dotted path + parent dotted prefixes.
-    py_state = idx.lang_state.get("python")
-    pkg_index = py_state.pkg_index if py_state is not None else {}
-    parts = entry.import_path.split(".")
-    while parts:
-        cand = ".".join(parts)
-        if cand in pkg_index:
-            return ResolvedImport(entry, "intra_repo", resolved_file_version_id=pkg_index[cand])
-        parts.pop()
-
-    # Top-level segment isn't local → external (e.g., `import requests`).
-    top = entry.import_path.split(".")[0]
-    return ResolvedImport(entry, "external", package_name=top)
-
-
-def _resolve_solidity(entry: ImportEntry, idx: BranchIndex, cfg: LanguageConfig) -> ResolvedImport:
-    raw = entry.import_path
-    external_prefixes = cfg.imports.external_prefixes if cfg.imports else ()
-    dep_dirs = set(cfg.dependency_paths or ())
-
-    # Scoped/prefixed packages (e.g. "@openzeppelin/...") are external.
-    for pref in external_prefixes:
-        if raw.startswith(pref):
-            parts = raw.lstrip("@").split("/")
-            pkg = "@" + "/".join(parts[:2]) if raw.startswith("@") and len(parts) >= 2 else parts[0]
-            return ResolvedImport(entry, "external", package_name=pkg)
-
-    if entry.is_relative:
-        src_dir = PurePosixPath(entry.source_rel_path).parent
-        target = _normalize_relative_posix((src_dir / raw).as_posix())
-        if target in idx.file_index:
-            return ResolvedImport(entry, "intra_repo", resolved_file_version_id=idx.file_index[target])
-        return ResolvedImport(entry, "unresolved")
-
-    # Bare repo-relative path that names a real file (rare but valid).
-    if raw in idx.file_index:
-        return ResolvedImport(entry, "intra_repo", resolved_file_version_id=idx.file_index[raw])
-
-    # Path begins with a configured dependency dir ("lib/forge-std/src/Test.sol")
-    # → external, with package = the segment immediately after the dep dir.
-    parts = raw.split("/")
-    if parts and parts[0] in dep_dirs:
-        pkg = parts[1] if len(parts) > 1 else parts[0]
-        return ResolvedImport(entry, "external", package_name=pkg)
-
-    # No remapping context: a multi-segment name is most likely a Foundry/Hardhat
-    # remapping target (e.g. "forge-std/Test.sol"). Best-effort: tag external with
-    # package = first segment. Phase 7 (Deno resolver) gets the precise answer.
-    if "/" in raw:
-        return ResolvedImport(entry, "external", package_name=parts[0])
-
-    return ResolvedImport(entry, "unresolved")
-
-
-def _normalize_relative_posix(path: str) -> str:
-    """`a/b/../c/./d` → `a/c/d`, without touching the filesystem."""
-    parts: list[str] = []
-    for seg in path.split("/"):
-        if seg == "" or seg == ".":
-            continue
-        if seg == "..":
-            if parts:
-                parts.pop()
-            continue
-        parts.append(seg)
-    return "/".join(parts)
-
-
-def _resolve_go(entry: ImportEntry, idx: BranchIndex) -> ResolvedImport:
-    """Classify a Go import path.
-
-    Three buckets, in priority order:
-      - intra_repo: matches the module path declared in go.mod, suffix maps
-        to a known package directory.
-      - external (stdlib): first segment has no dot ("fmt", "net/http", …).
-      - external (third-party): everything else, e.g. github.com/x/y. The
-        package_name keeps the org/repo prefix so the same dependency rolls
-        up across multiple subpackage imports.
-    """
-    raw = entry.import_path
-    go_state = idx.lang_state.get("go")
-    mod = go_state.module_path if go_state is not None else None
-    if mod and (raw == mod or raw.startswith(mod + "/")):
-        suffix = "" if raw == mod else raw[len(mod) + 1 :]
-        target = go_state.pkg_index.get(suffix) if go_state is not None else None
-        if target is not None:
-            return ResolvedImport(entry, "intra_repo", resolved_file_version_id=target)
-        return ResolvedImport(entry, "unresolved")
-
-    first = raw.split("/", 1)[0]
-    if "." not in first:
-        return ResolvedImport(entry, "external", package_name=raw)
-
-    parts = raw.split("/")
-    if first in {"github.com", "gitlab.com", "bitbucket.org"} and len(parts) >= 3:
-        pkg = "/".join(parts[:3])
-    else:
-        pkg = parts[0]
-    return ResolvedImport(entry, "external", package_name=pkg)
-
-
-def _try_rust_module_path(
-    entry: ImportEntry,
-    crate_index: dict[str, int],
-    parts: list[str],
-) -> ResolvedImport:
-    """Try `parts` as a module path inside `crate_index` (one crate's module
-    map); drop trailing segments on miss. Mirrors the Python resolver's
-    parent-prefix fallback — handles the ambiguity between
-    `use crate::utils::helper` (helper is an item in utils.rs) and
-    `use crate::utils::helpers` (helpers might be a submodule file). Empty
-    parts maps to the crate root entry, if present."""
-    while parts:
-        cand = "::".join(parts)
-        target = crate_index.get(cand)
-        if target is not None:
-            return ResolvedImport(entry, "intra_repo", resolved_file_version_id=target)
-        parts = parts[:-1]
-    crate_root = crate_index.get("")
-    if crate_root is not None:
-        return ResolvedImport(entry, "intra_repo", resolved_file_version_id=crate_root)
-    return ResolvedImport(entry, "unresolved")
-
-
-def _resolve_rust(entry: ImportEntry, idx: BranchIndex) -> ResolvedImport:
-    """Classify a Rust use-path.
-
-    Buckets, in priority order:
-      • relative (`self::…` / `super::…`) — anchored at the importer's
-        module path within its own crate; ascend per leading `super`, then
-        descend per the remaining tail.
-      • `crate::…` — strip prefix, look up in the source file's owning
-        crate's index.
-      • Absolute path whose head matches a known workspace member crate
-        (cargo-normalised, dashes → underscores) — strip the head, look up
-        in that crate's index. Covers both same-crate references that name
-        the crate explicitly (`use my_crate::utils`) and cross-crate
-        references inside a workspace (`use other_member::foo`).
-      • Anything else — external. Package = first path segment.
-
-    Edge case: if the source file has no owning crate (e.g. it lives outside
-    every discovered crate's src tree), `crate::` and relative paths can't
-    be resolved and we return unresolved rather than guessing.
-    """
-    raw = entry.import_path
-    if not raw:
-        return ResolvedImport(entry, "unresolved")
-    parts = raw.split("::")
-
-    rust_state = idx.lang_state.get("rust")
-    if rust_state is None:
-        return ResolvedImport(entry, "external", package_name=parts[0])
-    src_owner = rust_state.module_for_file.get(entry.file_version_id)
-
-    if entry.is_relative:
-        if src_owner is None:
-            return ResolvedImport(entry, "unresolved")
-        src_crate, src_module = src_owner
-        crate_index = rust_state.package_index.get(src_crate, {})
-        src_parts = src_module.split("::") if src_module else []
-        ascend = 0
-        i = 0
-        while i < len(parts):
-            if parts[i] == "self":
-                i += 1
-                continue
-            if parts[i] == "super":
-                ascend += 1
-                i += 1
-                continue
-            break
-        if ascend > len(src_parts):
-            return ResolvedImport(entry, "unresolved")
-        base = src_parts[: len(src_parts) - ascend]
-        tail = parts[i:]
-        return _try_rust_module_path(entry, crate_index, base + tail)
-
-    head = parts[0]
-    if head == "crate":
-        if src_owner is None:
-            return ResolvedImport(entry, "unresolved")
-        crate_index = rust_state.package_index.get(src_owner[0], {})
-        return _try_rust_module_path(entry, crate_index, parts[1:])
-
-    # Cargo normalises `-` to `_` in crate names *as referenced from code*,
-    # so `use anchor_lang::…` matches a Cargo.toml declaring `anchor-lang`.
-    head_norm = head.replace("-", "_")
-    if head_norm in rust_state.crate_names:
-        crate_index = rust_state.package_index.get(head_norm, {})
-        return _try_rust_module_path(entry, crate_index, parts[1:])
-
-    # Fallback: bare path whose head names a top-level module of the source
-    # file's own crate — `use common::foo;` from a lib.rs that declared
-    # `mod common;`. Strict edition-2018 style would write `use crate::…`
-    # but plenty of real code (anchor programs, libs vendored from Rust
-    # 2015) uses the bare form. We require an exact module match (not just
-    # any path prefix) to keep false positives low.
-    if src_owner is not None:
-        src_crate_index = rust_state.package_index.get(src_owner[0], {})
-        if head in src_crate_index or any(k.startswith(head + "::") for k in src_crate_index):
-            return _try_rust_module_path(entry, src_crate_index, parts)
-
-    return ResolvedImport(entry, "external", package_name=head)
-
-
-def _resolve_node_import(entry: ImportEntry, idx: BranchIndex) -> ResolvedImport:
-    """Classify a JS/TS import.
-
-    Order:
-      1. tsconfig `paths` alias — `@app/*` style; intra_repo when the rewritten
-         path lands on a known file.
-      2. Relative path — Node-style extension probe (.ts → .tsx → .js → .jsx
-         → .mjs → .cjs, then `index.<ext>`); intra_repo on hit.
-      3. Bare specifier — external. The package name is rolled up so
-         `react/jsx-runtime`, `react/server`, and `react` all share one
-         external_dependencies row.
-
-    Note: `node_modules/` contents are not indexed in v1, so vendored
-    packages still classify as external (matches existing Solidity behavior).
-    """
-    raw = entry.import_path
-
-    node_state = idx.lang_state.get(entry.language)
-    tsconfig = node_state.tsconfig if node_state is not None else None
-    if tsconfig is not None:
-        target = _resolve_tsconfig_alias(raw, tsconfig, idx.file_index)
-        if target is not None:
-            return ResolvedImport(entry, "intra_repo", resolved_file_version_id=target)
-
-    if entry.is_relative:
-        target = _resolve_relative_node(entry.source_rel_path, raw, idx.file_index)
-        if target is not None:
-            return ResolvedImport(entry, "intra_repo", resolved_file_version_id=target)
-        return ResolvedImport(entry, "unresolved")
-
-    pkg = package_name_for_specifier(raw)
-    return ResolvedImport(entry, "external", package_name=pkg)
-
-
-def _resolve_one(entry: ImportEntry, idx: BranchIndex, cfg: LanguageConfig) -> ResolvedImport:
-    if entry.language == "python":
-        return _resolve_python(entry, idx)
-    if entry.language == "solidity":
-        return _resolve_solidity(entry, idx, cfg)
-    if entry.language == "go":
-        return _resolve_go(entry, idx)
-    if entry.language in ("javascript", "typescript"):
-        return _resolve_node_import(entry, idx)
-    if entry.language == "rust":
-        return _resolve_rust(entry, idx)
-    return ResolvedImport(entry, "unresolved")
-
-
-# ────────────────────────────────────────────────────────────────────
 # Persistence
 # ────────────────────────────────────────────────────────────────────
 
@@ -606,30 +307,27 @@ async def _link_cross_file(
     # importer_file_version_id → set(imported_file_version_ids)
     imported_files_by: dict[int, set[int]] = {}
 
-    # Go: files in the same package share scope without an explicit import. Seed
-    # every Go file with its package peers so cross-file ref/call/inheritance
-    # linking can find symbols declared by a sibling file.
-    go_state = idx.lang_state.get("go")
-    go_pkg_files = go_state.pkg_files if go_state is not None else {}
-    for pkg_dir, peers in go_pkg_files.items():
-        peer_set = set(peers)
-        for fvid in peers:
-            imported_files_by.setdefault(fvid, set()).update(peer_set - {fvid})
+    # Implicit-import seeding (e.g. Go: every file in a package implicitly
+    # imports its peers). Each handler that needs this overrides
+    # `seed_implicit_imports`; the default is a no-op.
+    for lang_name in idx.lang_state:
+        seeded = get_handler(lang_name).seed_implicit_imports(idx)
+        for importer, targets in seeded.items():
+            imported_files_by.setdefault(importer, set()).update(targets)
 
     # importer_file_version_id → name → target_def_id (Tier A direct hits)
     direct_by: dict[int, dict[str, int]] = {}
     for row in intra_imports:
         importer = row["file_version_id"]
         target_file = row["resolved_file_version_id"]
-        # Go: an `import "x/y/z"` references a package, not a single file.
-        # Expand to every sibling .go file so Tier-B fuzzy matching can find
-        # symbols defined in any peer file of the imported package.
-        target_files: set[int] = {target_file}
-        if idx.file_languages.get(target_file) == "go":
-            target_path = idx.files_by_id.get(target_file, "")
-            pkg_dir = "/".join(target_path.split("/")[:-1])
-            peers = go_pkg_files.get(pkg_dir, [])
-            target_files.update(peers)
+        # Expand the import's effective target set. Most languages: just the
+        # target file. Go: every sibling .go file in the imported package, so
+        # Tier-B fuzzy matching can match symbols defined in any peer.
+        target_lang = idx.file_languages.get(target_file)
+        if target_lang is not None:
+            target_files = get_handler(target_lang).expand_import_target(target_file, idx)
+        else:
+            target_files = {target_file}
         imported_files_by.setdefault(importer, set()).update(target_files)
         for name in (row["imported_names"] or []):
             target_def_id = idx.qualified_to_def.get((target_file, name))
@@ -957,7 +655,7 @@ async def resolve_branch_imports(
         for entry in all_entries:
             cfg = configs.get(entry.language)
             assert cfg is not None
-            resolved.append(_resolve_one(entry, idx, cfg))
+            resolved.append(get_handler(entry.language).resolve(entry, idx, cfg))
             stats.by_class[resolved[-1].dep_class] = stats.by_class.get(resolved[-1].dep_class, 0) + 1
             if resolved[-1].dep_class == "unresolved":
                 stats.unresolved_paths.append(f"{entry.source_rel_path}: {entry.import_path}")
