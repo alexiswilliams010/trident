@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from .grammar_meta import LANGUAGES, language_for_path
+from .languages import HANDLERS
 
 # Directories pruned everywhere, regardless of language.
 ALWAYS_IGNORED: frozenset[str] = frozenset({
@@ -43,14 +44,13 @@ ALWAYS_IGNORED: frozenset[str] = frozenset({
     ".ruff_cache",
 })
 
-# Default dependency dirs per language. Overridable by passing dep_paths
-# explicitly (Phase 3 will load these from YAML configs).
+# Default dependency dirs per language. Sourced from each LanguageHandler's
+# `dependency_dirs` class attribute, so adding a language = one place to edit
+# (the handler module under core/languages/<lang>/).
 DEFAULT_DEP_PATHS: dict[str, tuple[str, ...]] = {
-    "python": ("venv", ".venv", "site-packages", "env", ".env"),
-    "solidity": ("lib", "node_modules", "out", "cache", "artifacts"),
-    "go": ("vendor",),
-    "javascript": ("node_modules", "dist", "build", "out", "coverage", ".next", ".nuxt"),
-    "typescript": ("node_modules", "dist", "build", "out", "coverage", ".next", ".nuxt"),
+    name: handler.dependency_dirs
+    for name, handler in HANDLERS.items()
+    if handler.dependency_dirs
 }
 
 TRIDENT_IGNORE_FILE = ".tridentignore"
