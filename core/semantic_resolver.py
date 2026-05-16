@@ -348,46 +348,45 @@ def _extract_bases(ts_node, cfg) -> list[str]:
 # ────────────────────────────────────────────────────────────────────
 
 
-async def _clear_branch_semantic_for_file_version(
+async def _bulk_clear_branch_semantic_for_file_versions(
     conn: asyncpg.Connection,
     branch_id: int,
-    file_version_id: int,
+    file_version_ids: list[int],
 ) -> None:
-    """Idempotency: drop any prior branch-scoped Tier 2 rows tied to this
-    (branch, file_version). Critically, this NEVER deletes definitions,
-    nodes, chunks, or any content-derived table — those are shared across
-    branches and only `make gc` reclaims them when truly unreferenced.
-
-    Six separate parameterized statements. Caller wraps this in a
-    transaction (resolve_repo does), so all six commit atomically.
+    """Idempotency: drop any prior branch-scoped Tier 2 rows tied to these
+    (branch, file_version) pairs. Six DELETEs total — one per edge table —
+    regardless of how many file_versions are passed. Never touches
+    definitions, nodes, or chunks (content-shared across branches).
     """
+    if not file_version_ids:
+        return
     await conn.execute(
         "DELETE FROM call_edges WHERE branch_id=$1 "
-        "AND callsite_node_id IN (SELECT id FROM nodes WHERE file_version_id=$2)",
-        branch_id, file_version_id,
+        "AND callsite_node_id IN (SELECT id FROM nodes WHERE file_version_id = ANY($2::bigint[]))",
+        branch_id, file_version_ids,
     )
     await conn.execute(
         "DELETE FROM data_access WHERE branch_id=$1 "
-        "AND accessor_def_id IN (SELECT id FROM definitions WHERE file_version_id=$2)",
-        branch_id, file_version_id,
+        "AND accessor_def_id IN (SELECT id FROM definitions WHERE file_version_id = ANY($2::bigint[]))",
+        branch_id, file_version_ids,
     )
     await conn.execute(
-        'DELETE FROM "references" WHERE branch_id=$1 AND file_version_id=$2',
-        branch_id, file_version_id,
+        'DELETE FROM "references" WHERE branch_id=$1 AND file_version_id = ANY($2::bigint[])',
+        branch_id, file_version_ids,
     )
     await conn.execute(
         "DELETE FROM overrides_edges WHERE branch_id=$1 "
-        "AND child_def_id IN (SELECT id FROM definitions WHERE file_version_id=$2)",
-        branch_id, file_version_id,
+        "AND child_def_id IN (SELECT id FROM definitions WHERE file_version_id = ANY($2::bigint[]))",
+        branch_id, file_version_ids,
     )
     await conn.execute(
         "DELETE FROM inherits_edges WHERE branch_id=$1 "
-        "AND child_def_id IN (SELECT id FROM definitions WHERE file_version_id=$2)",
-        branch_id, file_version_id,
+        "AND child_def_id IN (SELECT id FROM definitions WHERE file_version_id = ANY($2::bigint[]))",
+        branch_id, file_version_ids,
     )
     await conn.execute(
-        "DELETE FROM imports WHERE branch_id=$1 AND file_version_id=$2",
-        branch_id, file_version_id,
+        "DELETE FROM imports WHERE branch_id=$1 AND file_version_id = ANY($2::bigint[])",
+        branch_id, file_version_ids,
     )
 
 
@@ -399,6 +398,9 @@ async def resolve_file(
     config: LanguageConfig,
     *,
     node_ids: list[int] | None = None,
+    pre_cleared: bool = False,
+    hydrate_mode: bool | None = None,
+    def_id_start: int | None = None,
 ) -> ResolveFileResult:
     """Run Tier-2 resolution for one (branch, file_version) pair.
 
@@ -409,6 +411,10 @@ async def resolve_file(
     one. Tier-2 outputs (refs, calls, data_access, intra-file inheritance)
     are always emitted, tagged with branch_id, after the per-(branch,
     file_version) clear has removed any stale rows.
+
+    `pre_cleared`, `hydrate_mode`, and `def_id_start` let `resolve_repo` batch
+    the per-file clears, hydrate checks, and sequence reservations across all
+    files; when None/False the function falls back to its own per-file calls.
     """
     row = await conn.fetchrow(
         "SELECT language, raw_content FROM file_versions WHERE id=$1",
@@ -441,7 +447,10 @@ async def resolve_file(
         )
     db_id_for: dict[int, int] = {ts.id: node_ids[i] for i, ts in enumerate(ts_walk)}
 
-    await _clear_branch_semantic_for_file_version(conn, branch_id, file_version_id)
+    if not pre_cleared:
+        await _bulk_clear_branch_semantic_for_file_versions(
+            conn, branch_id, [file_version_id],
+        )
 
     # Per-language hooks: whole-file skip (Rust uses this for `tests/`,
     # `benches/`, `examples/` dirs), plus per-file precompute that stashes
@@ -463,11 +472,11 @@ async def resolve_file(
     # Hydrate mode: when another branch already resolved this file_version,
     # definitions and nodes are already in the DB. We rebuild the in-memory
     # scope tables from the existing rows instead of inserting new ones.
-    hydrate_mode = await conn.fetchval(
-        "SELECT 1 FROM definitions WHERE file_version_id=$1 LIMIT 1",
-        file_version_id,
-    )
-    hydrate_mode = bool(hydrate_mode)
+    if hydrate_mode is None:
+        hydrate_mode = bool(await conn.fetchval(
+            "SELECT 1 FROM definitions WHERE file_version_id=$1 LIMIT 1",
+            file_version_id,
+        ))
 
     # ── P1: definitions (synthetic module + matched rules) ──
     def_rules = {r.node_type: r for r in config.definitions}
@@ -528,7 +537,10 @@ async def resolve_file(
         # at the end. A safe upper bound on the count is `len(ts_walk) + 1`
         # (one def per ts_node plus the synthetic module). Wasted ids inside the
         # reserved block become harmless sequence gaps.
-        reserved_first = await reserve_definition_ids(conn, len(ts_walk) + 1)
+        if def_id_start is not None:
+            reserved_first = def_id_start
+        else:
+            reserved_first = await reserve_definition_ids(conn, len(ts_walk) + 1)
         next_def_id = reserved_first
 
         # Module / source_file root definition.
@@ -1008,13 +1020,15 @@ async def resolve_repo(
                 only_file_version_ids,
             )
 
-    # Prefetch all node ids for the file_versions about to be resolved.
-    # Collapses N per-file SELECTs into 1 round-trip; the row set is the
-    # same size either way. resolve_file falls back to its own query if
-    # we don't pass node_ids in.
+    # Up-front batches: node id prefetch, repo-wide clear, hydrate-mode set,
+    # and one definition-id reservation for all cold files. Each collapses N
+    # per-file round-trips into 1 and (for the reservation) eliminates
+    # advisory-lock contention between concurrent _resolve_one tasks.
+    all_fv_ids = [row["file_version_id"] for row in rows]
+    nodes_by_fv: dict[int, list[int]] = {}
+    hydrate_set: set[int] = set()
+    def_id_start_by_fv: dict[int, int] = {}
     async with pool.acquire() as conn:
-        all_fv_ids = [row["file_version_id"] for row in rows]
-        nodes_by_fv: dict[int, list[int]] = {}
         if all_fv_ids:
             node_rows = await conn.fetch(
                 "SELECT file_version_id, id FROM nodes "
@@ -1024,6 +1038,26 @@ async def resolve_repo(
             )
             for r in node_rows:
                 nodes_by_fv.setdefault(r["file_version_id"], []).append(r["id"])
+
+            await _bulk_clear_branch_semantic_for_file_versions(
+                conn, branch_id, all_fv_ids,
+            )
+
+            hydrate_rows = await conn.fetch(
+                "SELECT DISTINCT file_version_id FROM definitions "
+                "WHERE file_version_id = ANY($1::bigint[])",
+                all_fv_ids,
+            )
+            hydrate_set = {r["file_version_id"] for r in hydrate_rows}
+
+            cold_fvs = [fv for fv in all_fv_ids if fv not in hydrate_set]
+            if cold_fvs:
+                bounds = [len(nodes_by_fv.get(fv, [])) + 1 for fv in cold_fvs]
+                first = await reserve_definition_ids(conn, sum(bounds))
+                cursor = first
+                for fv, b in zip(cold_fvs, bounds):
+                    def_id_start_by_fv[fv] = cursor
+                    cursor += b
 
     # Load every needed language config up front so the per-file tasks can
     # read from `configs` without racing on lazy population.
@@ -1040,10 +1074,14 @@ async def resolve_repo(
         cfg = configs.get(row["language"])
         if cfg is None:
             return None
+        fv_id = row["file_version_id"]
         async with sem, pool.acquire() as conn, conn.transaction():
             return await resolve_file(
-                conn, branch_id, row["file_version_id"], row["path"], cfg,
-                node_ids=nodes_by_fv.get(row["file_version_id"], []),
+                conn, branch_id, fv_id, row["path"], cfg,
+                node_ids=nodes_by_fv.get(fv_id, []),
+                pre_cleared=True,
+                hydrate_mode=fv_id in hydrate_set,
+                def_id_start=def_id_start_by_fv.get(fv_id),
             )
 
     gathered = await asyncio.gather(*[_resolve_one(row) for row in rows])
