@@ -31,7 +31,7 @@ def default_dsn() -> str:
 
 
 def get_dsn() -> str:
-    return os.environ.get("DATABASE_URL", default_dsn())
+    return os.environ.get("DATABASE_URL") or default_dsn()
 
 
 async def create_pool(dsn: str | None = None, **kwargs) -> asyncpg.Pool:
