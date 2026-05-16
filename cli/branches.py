@@ -117,24 +117,57 @@ async def _cmd_drop(pool, args: argparse.Namespace) -> int:
 
 
 async def _cmd_gc(pool, args: argparse.Namespace) -> int:
+    # Batched delete with progress reporting. Each batch is one statement so
+    # the cascade fan-out stays bounded — a single DELETE on all orphan
+    # file_versions can cascade through hundreds of thousands of rows in
+    # nodes/references/definitions and feel hung. Anti-joins (NOT EXISTS)
+    # are used instead of NOT IN for friendlier planning.
+    #
+    # No outer transaction: GC may take a while on large DBs and we don't
+    # want a single long-running transaction holding locks on shared tables.
+    # Batch size for file_versions is intentionally small because each row's
+    # cascade can hit thousands of nodes/refs; chunk_embeddings has no
+    # cascade so a larger batch is fine.
+    FV_BATCH = 10
+    CE_BATCH = 1000
+
     async with pool.acquire() as conn:
-        # Two passes — first orphan file_versions, then orphan chunk_embeddings.
-        # No transaction wrapper: GC may take a while on large DBs and we don't
-        # want a single long-running transaction holding locks on shared tables.
-        fv_status = await conn.execute(
+        fv_orphans = await conn.fetch(
             """
-            DELETE FROM file_versions
-            WHERE id NOT IN (SELECT DISTINCT file_version_id FROM branch_files)
+            SELECT id FROM file_versions fv
+            WHERE NOT EXISTS (
+                SELECT 1 FROM branch_files bf WHERE bf.file_version_id = fv.id
+            )
             """,
         )
-        ce_status = await conn.execute(
+        fv_ids = [r["id"] for r in fv_orphans]
+        print(f"file_versions: {len(fv_ids)} orphan(s) to delete (batches of {FV_BATCH})")
+        for i in range(0, len(fv_ids), FV_BATCH):
+            batch = fv_ids[i:i + FV_BATCH]
+            await conn.execute(
+                "DELETE FROM file_versions WHERE id = ANY($1::bigint[])", batch,
+            )
+            done = min(i + FV_BATCH, len(fv_ids))
+            print(f"  file_versions: {done}/{len(fv_ids)}")
+
+        ce_orphans = await conn.fetch(
             """
-            DELETE FROM chunk_embeddings
-            WHERE content_hash NOT IN (SELECT DISTINCT content_hash FROM chunks)
+            SELECT content_hash FROM chunk_embeddings ce
+            WHERE NOT EXISTS (
+                SELECT 1 FROM chunks c WHERE c.content_hash = ce.content_hash
+            )
             """,
         )
-    print(f"file_versions: {fv_status}")
-    print(f"chunk_embeddings: {ce_status}")
+        ce_hashes = [r["content_hash"] for r in ce_orphans]
+        print(f"chunk_embeddings: {len(ce_hashes)} orphan(s) to delete (batches of {CE_BATCH})")
+        for i in range(0, len(ce_hashes), CE_BATCH):
+            batch = ce_hashes[i:i + CE_BATCH]
+            await conn.execute(
+                "DELETE FROM chunk_embeddings WHERE content_hash = ANY($1::text[])", batch,
+            )
+            done = min(i + CE_BATCH, len(ce_hashes))
+            print(f"  chunk_embeddings: {done}/{len(ce_hashes)}")
+
     return 0
 
 
