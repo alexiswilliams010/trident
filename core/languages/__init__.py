@@ -9,7 +9,13 @@ registry.
 from __future__ import annotations
 
 from ..grammar_meta import LANGUAGES
-from .base import InheritanceEdge, LanguageHandler, SemanticContext
+from .base import (
+    ImportEntry,
+    InheritanceEdge,
+    LanguageHandler,
+    ResolvedImport,
+    SemanticContext,
+)
 from .go import GoHandler
 from .javascript import JavaScriptHandler
 from .python import PythonHandler
@@ -47,8 +53,10 @@ if _handler_keys != _grammar_keys:
 
 __all__ = [
     "HANDLERS",
+    "ImportEntry",
     "InheritanceEdge",
     "LanguageHandler",
+    "ResolvedImport",
     "SemanticContext",
     "get_handler",
 ]

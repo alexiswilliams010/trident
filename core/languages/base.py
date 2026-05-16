@@ -17,12 +17,35 @@ from __future__ import annotations
 from abc import ABC
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ..config_loader import LanguageConfig
     from ..grammar_meta import LanguageSpec
-    from ..heuristic_resolver import BranchIndex, ImportEntry, ResolvedImport
+    from ..heuristic_resolver import BranchIndex
+
+
+@dataclass
+class ImportEntry:
+    """One import statement worth of info, before resolution."""
+
+    file_version_id: int        # importer file_version
+    node_id: int                # DB id of the import node
+    language: str
+    source_rel_path: str        # importer's repo-relative path (within the branch)
+    import_path: str            # raw text path: "mypackage.utils", "./Token.sol", "..", "@oz/..."
+    imported_names: list[str]   # specific symbols imported (e.g. ["helper", "double"])
+    is_relative: bool           # Python: starts with "." ; Solidity: starts with "./" or "../"
+    dot_count: int = 0          # Python: leading dots in `from . import …`
+
+
+@dataclass
+class ResolvedImport:
+    entry: ImportEntry
+    dep_class: str              # 'intra_repo' | 'external' | 'unresolved'
+    resolved_file_version_id: int | None = None
+    package_name: str | None = None
+    external_dep_id: int | None = None
 
 
 @dataclass
@@ -73,13 +96,17 @@ class LanguageHandler(ABC):
 
     # ── required hooks ───────────────────────────────────────────────
     def extract_imports(
-        self, tree_root, file_version_id: int, rel_path: str,
-    ) -> Iterable["ImportEntry"]:
+        self,
+        file_version_id: int,
+        source_rel_path: str,
+        ts_root,
+        db_id_for: dict[int, int],
+    ) -> list[ImportEntry]:
         raise NotImplementedError(f"{type(self).__name__}.extract_imports")
 
     def resolve(
-        self, entry: "ImportEntry", idx: "BranchIndex", cfg: "LanguageConfig",
-    ) -> "ResolvedImport":
+        self, entry: ImportEntry, idx: "BranchIndex", cfg: "LanguageConfig",
+    ) -> ResolvedImport:
         raise NotImplementedError(f"{type(self).__name__}.resolve")
 
     # ── optional: branch-index contribution ──────────────────────────
