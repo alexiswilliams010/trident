@@ -322,12 +322,17 @@ def _hash_content(metadata: dict, content: str) -> str:
 async def _load_defs(conn: asyncpg.Connection, branch_id: int) -> list[_DefRow]:
     """Load all defs whose file_version is mapped by this branch, hydrating
     raw_content + path from file_versions + branch_files."""
+    # DISTINCT ON (fv.id): a file_version can be reached by multiple branch_files
+    # paths (identical content). Pick one deterministic path per fv so the join
+    # below doesn't multiply each definition by the number of sharing paths.
     file_rows = await conn.fetch(
         """
-        SELECT fv.id, fv.raw_content, bf.path, fv.language
+        SELECT DISTINCT ON (fv.id)
+            fv.id, fv.raw_content, bf.path, fv.language
         FROM branch_files bf
         JOIN file_versions fv ON fv.id = bf.file_version_id
         WHERE bf.branch_id = $1
+        ORDER BY fv.id, bf.path
         """,
         branch_id,
     )
@@ -342,8 +347,9 @@ async def _load_defs(conn: asyncpg.Connection, branch_id: int) -> list[_DefRow]:
                n.start_byte, n.end_byte
         FROM definitions d
         JOIN nodes n ON n.id = d.node_id
-        JOIN branch_files bf ON bf.file_version_id = d.file_version_id
-        WHERE bf.branch_id = $1
+        WHERE d.file_version_id IN (
+            SELECT file_version_id FROM branch_files WHERE branch_id = $1
+        )
         ORDER BY d.id
         """,
         branch_id,
@@ -947,15 +953,6 @@ async def _bulk_persist_chunks(
     """
     if not chunks:
         return
-
-    # Dedupe by (anchor_def_id, granularity), last write wins. The old
-    # per-row upsert absorbed in-list duplicates implicitly; the bulk
-    # path's snapshot can't, so fold them here to avoid colliding on the
-    # unique constraint.
-    deduped_by_key: dict[tuple[int, str], _ChunkRow] = {}
-    for c in chunks:
-        deduped_by_key[(c.anchor_def_id, c.granularity)] = c
-    chunks = list(deduped_by_key.values())
 
     existing = await conn.fetch(
         """

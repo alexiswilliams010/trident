@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import getpass
 import os
+import zlib
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -111,7 +112,17 @@ async def _reserve_sequence_ids(
 ) -> int:
     if count <= 0:
         raise ValueError("count must be positive")
-    first = await conn.fetchval(f"SELECT nextval('{sequence}')")
-    if count > 1:
-        await conn.fetchval(f"SELECT setval('{sequence}', $1)", first + count - 1)
-    return first
+    # nextval+setval is racy under concurrent reservers: two backends can
+    # each call nextval (getting non-contiguous values) then setval over
+    # each other's range, handing out overlapping IDs. A DB-wide advisory
+    # lock serializes only the reservation of this specific sequence.
+    # crc32 over the sequence name gives a stable lock key across processes.
+    lock_key = zlib.crc32(sequence.encode())
+    await conn.fetchval("SELECT pg_advisory_lock($1)", lock_key)
+    try:
+        first = await conn.fetchval(f"SELECT nextval('{sequence}')")
+        if count > 1:
+            await conn.fetchval(f"SELECT setval('{sequence}', $1)", first + count - 1)
+        return first
+    finally:
+        await conn.fetchval("SELECT pg_advisory_unlock($1)", lock_key)

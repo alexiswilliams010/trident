@@ -32,6 +32,7 @@ walking in the same DFS preorder used by the Tier 1 extractor.
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Iterator
@@ -886,15 +887,19 @@ async def resolve_file(
         )
 
     if call_records:
-        await conn.executemany(
+        await conn.execute(
             """
             INSERT INTO call_edges (branch_id, callsite_node_id, caller_def_id, callee_def_id, callee_name, confidence)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            SELECT $1, * FROM UNNEST(
+                $2::bigint[], $3::bigint[], $4::bigint[], $5::text[], $6::text[]
+            )
             """,
-            [
-                (branch_id, r.callsite_db_node_id, r.caller_def_id, r.callee_def_id, r.callee_name, r.confidence)
-                for r in call_records
-            ],
+            branch_id,
+            [r.callsite_db_node_id for r in call_records],
+            [r.caller_def_id for r in call_records],
+            [r.callee_def_id for r in call_records],
+            [r.callee_name for r in call_records],
+            [r.confidence for r in call_records],
         )
 
     # ── P6: data access ──
@@ -926,12 +931,18 @@ async def resolve_file(
             )
 
     if da_records:
-        await conn.executemany(
+        await conn.execute(
             """
             INSERT INTO data_access (branch_id, accessor_def_id, target_def_id, access_type, node_id)
-            VALUES ($1, $2, $3, $4, $5)
+            SELECT $1, * FROM UNNEST(
+                $2::bigint[], $3::bigint[], $4::text[], $5::bigint[]
+            )
             """,
-            [(branch_id, r.accessor_def_id, r.target_def_id, r.access_type, r.db_node_id) for r in da_records],
+            branch_id,
+            [r.accessor_def_id for r in da_records],
+            [r.target_def_id for r in da_records],
+            [r.access_type for r in da_records],
+            [r.db_node_id for r in da_records],
         )
 
     return ResolveFileResult(
@@ -968,37 +979,40 @@ async def resolve_repo(
     files whose CST didn't change).
     """
     async with pool.acquire() as conn:
+        # DISTINCT ON (fv.id): two branch_files paths can share one file_version
+        # (identical content). Resolution is per file_version, so collapse here
+        # or concurrent _resolve_one tasks race and collide on definitions.node_id.
         if only_file_version_ids is None:
             rows = await conn.fetch(
                 """
-                SELECT bf.path, fv.id AS file_version_id, fv.language
+                SELECT DISTINCT ON (fv.id)
+                    bf.path, fv.id AS file_version_id, fv.language
                 FROM branch_files bf
                 JOIN file_versions fv ON fv.id = bf.file_version_id
                 WHERE bf.branch_id = $1
-                ORDER BY fv.id
+                ORDER BY fv.id, bf.path
                 """,
                 branch_id,
             )
         else:
             rows = await conn.fetch(
                 """
-                SELECT bf.path, fv.id AS file_version_id, fv.language
+                SELECT DISTINCT ON (fv.id)
+                    bf.path, fv.id AS file_version_id, fv.language
                 FROM branch_files bf
                 JOIN file_versions fv ON fv.id = bf.file_version_id
                 WHERE bf.branch_id = $1 AND fv.id = ANY($2::bigint[])
-                ORDER BY fv.id
+                ORDER BY fv.id, bf.path
                 """,
                 branch_id,
                 only_file_version_ids,
             )
 
-    configs: dict[str, LanguageConfig] = {}
-    results: list[ResolveFileResult] = []
+    # Prefetch all node ids for the file_versions about to be resolved.
+    # Collapses N per-file SELECTs into 1 round-trip; the row set is the
+    # same size either way. resolve_file falls back to its own query if
+    # we don't pass node_ids in.
     async with pool.acquire() as conn:
-        # Prefetch all node ids for the file_versions about to be resolved.
-        # Collapses N per-file SELECTs into 1 round-trip; the row set is the
-        # same size either way. resolve_file falls back to its own query if
-        # we don't pass node_ids in.
         all_fv_ids = [row["file_version_id"] for row in rows]
         nodes_by_fv: dict[int, list[int]] = {}
         if all_fv_ids:
@@ -1011,22 +1025,29 @@ async def resolve_repo(
             for r in node_rows:
                 nodes_by_fv.setdefault(r["file_version_id"], []).append(r["id"])
 
-        for row in rows:
-            lang = row["language"]
-            if lang not in configs:
-                try:
-                    configs[lang] = load_language_config(lang)
-                except FileNotFoundError:
-                    continue
-            cfg = configs[lang]
-            async with conn.transaction():
-                results.append(
-                    await resolve_file(
-                        conn, branch_id, row["file_version_id"], row["path"], cfg,
-                        node_ids=nodes_by_fv.get(row["file_version_id"], []),
-                    )
-                )
-    return results
+    # Load every needed language config up front so the per-file tasks can
+    # read from `configs` without racing on lazy population.
+    configs: dict[str, LanguageConfig] = {}
+    for lang in {row["language"] for row in rows}:
+        try:
+            configs[lang] = load_language_config(lang)
+        except FileNotFoundError:
+            pass
+
+    sem = asyncio.Semaphore(int(os.environ.get("RESOLVE_CONCURRENCY", "4")))
+
+    async def _resolve_one(row) -> ResolveFileResult | None:
+        cfg = configs.get(row["language"])
+        if cfg is None:
+            return None
+        async with sem, pool.acquire() as conn, conn.transaction():
+            return await resolve_file(
+                conn, branch_id, row["file_version_id"], row["path"], cfg,
+                node_ids=nodes_by_fv.get(row["file_version_id"], []),
+            )
+
+    gathered = await asyncio.gather(*[_resolve_one(row) for row in rows])
+    return [r for r in gathered if r is not None]
 
 
 def resolve_repo_sync(
