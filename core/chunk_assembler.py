@@ -932,51 +932,94 @@ def _fts_text(qualified_name: str | None, content: str) -> str:
     return f"{qn} {_split_camel(qn)} {_expand_idents(content)}"
 
 
-async def _upsert_chunk(conn: asyncpg.Connection, chunk: _ChunkRow) -> str:
-    """Upsert a per-branch chunk row.
+async def _bulk_persist_chunks(
+    conn: asyncpg.Connection, branch_id: int, chunks: list[_ChunkRow], stats: ChunkStats,
+) -> None:
+    """Partition `chunks` into insert / update / unchanged against the existing
+    rows for this branch, then issue at most one INSERT and one UPDATE for
+    the whole set.
 
     chunk_embeddings are content-keyed and shared across chunks (and
     branches): we never delete embedding rows here. If a chunk's content
     changed, the new content_hash either already has an embedding (reused)
     or will be embedded by the next embedder pass. Stale embeddings are
     reclaimed by `make gc`.
-
-    Returns 'inserted' | 'updated' | 'unchanged'.
     """
-    existing = await conn.fetchrow(
+    if not chunks:
+        return
+
+    existing = await conn.fetch(
         """
-        SELECT id, content_hash FROM chunks
-        WHERE branch_id=$1 AND anchor_def_id=$2 AND granularity=$3
+        SELECT id, anchor_def_id, granularity, content_hash
+        FROM chunks WHERE branch_id=$1
         """,
-        chunk.branch_id, chunk.anchor_def_id, chunk.granularity,
+        branch_id,
     )
-    if existing is not None and existing["content_hash"] == chunk.content_hash:
-        return "unchanged"
-    fts_text = _fts_text(chunk.metadata.get("anchor"), chunk.content)
-    if existing is not None:
+    existing_by_key: dict[tuple[int, str], tuple[int, str]] = {
+        (r["anchor_def_id"], r["granularity"]): (r["id"], r["content_hash"]) for r in existing
+    }
+
+    to_insert: list[_ChunkRow] = []
+    to_update: list[tuple[int, _ChunkRow]] = []  # (existing chunk id, new row)
+    for c in chunks:
+        ex = existing_by_key.get((c.anchor_def_id, c.granularity))
+        if ex is None:
+            to_insert.append(c)
+        elif ex[1] != c.content_hash:
+            to_update.append((ex[0], c))
+        else:
+            stats.n_unchanged += 1
+
+    if to_insert:
         await conn.execute(
             """
-            UPDATE chunks
-            SET file_version_id=$1, content=$2, token_count=$3, metadata=$4, content_hash=$5,
-                fts_doc=to_tsvector('english', $6)
-            WHERE id=$7
+            INSERT INTO chunks
+                (branch_id, file_version_id, anchor_def_id, granularity, content,
+                 token_count, metadata, content_hash, fts_doc)
+            SELECT $1, fv_id, anchor, gran, content, tc, meta, ch,
+                   to_tsvector('english', fts_text)
+            FROM UNNEST(
+                $2::bigint[], $3::bigint[], $4::text[], $5::text[],
+                $6::int[],    $7::jsonb[],  $8::text[], $9::text[]
+            ) AS t(fv_id, anchor, gran, content, tc, meta, ch, fts_text)
             """,
-            chunk.file_version_id, chunk.content, chunk.token_count,
-            json.dumps(chunk.metadata), chunk.content_hash, fts_text, existing["id"],
+            branch_id,
+            [c.file_version_id for c in to_insert],
+            [c.anchor_def_id for c in to_insert],
+            [c.granularity for c in to_insert],
+            [c.content for c in to_insert],
+            [c.token_count for c in to_insert],
+            [json.dumps(c.metadata) for c in to_insert],
+            [c.content_hash for c in to_insert],
+            [_fts_text(c.metadata.get("anchor"), c.content) for c in to_insert],
         )
-        return "updated"
-    await conn.execute(
-        """
-        INSERT INTO chunks
-            (branch_id, file_version_id, anchor_def_id, granularity, content, token_count, metadata,
-             content_hash, fts_doc)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, to_tsvector('english', $9))
-        """,
-        chunk.branch_id, chunk.file_version_id, chunk.anchor_def_id, chunk.granularity,
-        chunk.content, chunk.token_count, json.dumps(chunk.metadata),
-        chunk.content_hash, fts_text,
-    )
-    return "inserted"
+        stats.n_inserted += len(to_insert)
+
+    if to_update:
+        await conn.execute(
+            """
+            UPDATE chunks SET
+                file_version_id = u.fv_id,
+                content         = u.content,
+                token_count     = u.tc,
+                metadata        = u.meta,
+                content_hash    = u.ch,
+                fts_doc         = to_tsvector('english', u.fts_text)
+            FROM UNNEST(
+                $1::bigint[], $2::bigint[], $3::text[], $4::int[],
+                $5::jsonb[],  $6::text[],   $7::text[]
+            ) AS u(id, fv_id, content, tc, meta, ch, fts_text)
+            WHERE chunks.id = u.id
+            """,
+            [eid for eid, _ in to_update],
+            [c.file_version_id for _, c in to_update],
+            [c.content for _, c in to_update],
+            [c.token_count for _, c in to_update],
+            [json.dumps(c.metadata) for _, c in to_update],
+            [c.content_hash for _, c in to_update],
+            [_fts_text(c.metadata.get("anchor"), c.content) for _, c in to_update],
+        )
+        stats.n_updated += len(to_update)
 
 
 async def assemble_chunks(pool: asyncpg.Pool, repo_id: int, branch_id: int) -> ChunkStats:
@@ -1014,14 +1057,7 @@ async def assemble_chunks(pool: asyncpg.Pool, repo_id: int, branch_id: int) -> C
                 stats.n_module += 1
 
         async with conn.transaction():
-            for c in chunks:
-                outcome = await _upsert_chunk(conn, c)
-                if outcome == "inserted":
-                    stats.n_inserted += 1
-                elif outcome == "updated":
-                    stats.n_updated += 1
-                else:
-                    stats.n_unchanged += 1
+            await _bulk_persist_chunks(conn, branch_id, chunks, stats)
 
     return stats
 

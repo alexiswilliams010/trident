@@ -357,27 +357,37 @@ async def _clear_branch_semantic_for_file_version(
     nodes, chunks, or any content-derived table — those are shared across
     branches and only `make gc` reclaims them when truly unreferenced.
 
-    Uses the simple-query protocol (no parameters) so all six statements
-    run in order. branch_id and file_version_id are interpolated as ints.
+    Six separate parameterized statements. Caller wraps this in a
+    transaction (resolve_repo does), so all six commit atomically.
     """
-    bid = int(branch_id)
-    fvid = int(file_version_id)
-    await conn.execute(f"""
-        DELETE FROM call_edges
-          WHERE branch_id={bid}
-            AND callsite_node_id IN (SELECT id FROM nodes WHERE file_version_id={fvid});
-        DELETE FROM data_access
-          WHERE branch_id={bid}
-            AND accessor_def_id IN (SELECT id FROM definitions WHERE file_version_id={fvid});
-        DELETE FROM "references" WHERE branch_id={bid} AND file_version_id={fvid};
-        DELETE FROM overrides_edges
-          WHERE branch_id={bid}
-            AND child_def_id IN (SELECT id FROM definitions WHERE file_version_id={fvid});
-        DELETE FROM inherits_edges
-          WHERE branch_id={bid}
-            AND child_def_id IN (SELECT id FROM definitions WHERE file_version_id={fvid});
-        DELETE FROM imports WHERE branch_id={bid} AND file_version_id={fvid};
-    """)
+    await conn.execute(
+        "DELETE FROM call_edges WHERE branch_id=$1 "
+        "AND callsite_node_id IN (SELECT id FROM nodes WHERE file_version_id=$2)",
+        branch_id, file_version_id,
+    )
+    await conn.execute(
+        "DELETE FROM data_access WHERE branch_id=$1 "
+        "AND accessor_def_id IN (SELECT id FROM definitions WHERE file_version_id=$2)",
+        branch_id, file_version_id,
+    )
+    await conn.execute(
+        'DELETE FROM "references" WHERE branch_id=$1 AND file_version_id=$2',
+        branch_id, file_version_id,
+    )
+    await conn.execute(
+        "DELETE FROM overrides_edges WHERE branch_id=$1 "
+        "AND child_def_id IN (SELECT id FROM definitions WHERE file_version_id=$2)",
+        branch_id, file_version_id,
+    )
+    await conn.execute(
+        "DELETE FROM inherits_edges WHERE branch_id=$1 "
+        "AND child_def_id IN (SELECT id FROM definitions WHERE file_version_id=$2)",
+        branch_id, file_version_id,
+    )
+    await conn.execute(
+        "DELETE FROM imports WHERE branch_id=$1 AND file_version_id=$2",
+        branch_id, file_version_id,
+    )
 
 
 async def resolve_file(
@@ -386,6 +396,8 @@ async def resolve_file(
     file_version_id: int,
     rel_path: str,
     config: LanguageConfig,
+    *,
+    node_ids: list[int] | None = None,
 ) -> ResolveFileResult:
     """Run Tier-2 resolution for one (branch, file_version) pair.
 
@@ -412,18 +424,21 @@ async def resolve_file(
     parser = LANGUAGES[config.language].parser(PurePosixPath(rel_path).suffix.lower())
     tree = parser.parse(source)
 
-    # Pair ts_nodes to DB ids (same DFS preorder as Tier 1).
+    # Pair ts_nodes to DB ids (same DFS preorder as Tier 1). `node_ids` may be
+    # supplied by resolve_repo's bulk prefetch to skip the per-file SELECT.
     ts_walk: list = list(_dfs(tree.root_node))
-    db_ids = await conn.fetch(
-        "SELECT id FROM nodes WHERE file_version_id=$1 ORDER BY id",
-        file_version_id,
-    )
-    if len(ts_walk) != len(db_ids):
+    if node_ids is None:
+        db_id_rows = await conn.fetch(
+            "SELECT id FROM nodes WHERE file_version_id=$1 ORDER BY id",
+            file_version_id,
+        )
+        node_ids = [r["id"] for r in db_id_rows]
+    if len(ts_walk) != len(node_ids):
         raise RuntimeError(
             f"CST size mismatch for file_version_id={file_version_id}: "
-            f"reparse produced {len(ts_walk)} nodes, DB has {len(db_ids)}"
+            f"reparse produced {len(ts_walk)} nodes, DB has {len(node_ids)}"
         )
-    db_id_for: dict[int, int] = {ts.id: db_ids[i]["id"] for i, ts in enumerate(ts_walk)}
+    db_id_for: dict[int, int] = {ts.id: node_ids[i] for i, ts in enumerate(ts_walk)}
 
     await _clear_branch_semantic_for_file_version(conn, branch_id, file_version_id)
 
@@ -980,6 +995,22 @@ async def resolve_repo(
     configs: dict[str, LanguageConfig] = {}
     results: list[ResolveFileResult] = []
     async with pool.acquire() as conn:
+        # Prefetch all node ids for the file_versions about to be resolved.
+        # Collapses N per-file SELECTs into 1 round-trip; the row set is the
+        # same size either way. resolve_file falls back to its own query if
+        # we don't pass node_ids in.
+        all_fv_ids = [row["file_version_id"] for row in rows]
+        nodes_by_fv: dict[int, list[int]] = {}
+        if all_fv_ids:
+            node_rows = await conn.fetch(
+                "SELECT file_version_id, id FROM nodes "
+                "WHERE file_version_id = ANY($1::bigint[]) "
+                "ORDER BY file_version_id, id",
+                all_fv_ids,
+            )
+            for r in node_rows:
+                nodes_by_fv.setdefault(r["file_version_id"], []).append(r["id"])
+
         for row in rows:
             lang = row["language"]
             if lang not in configs:
@@ -990,7 +1021,10 @@ async def resolve_repo(
             cfg = configs[lang]
             async with conn.transaction():
                 results.append(
-                    await resolve_file(conn, branch_id, row["file_version_id"], row["path"], cfg)
+                    await resolve_file(
+                        conn, branch_id, row["file_version_id"], row["path"], cfg,
+                        node_ids=nodes_by_fv.get(row["file_version_id"], []),
+                    )
                 )
     return results
 
