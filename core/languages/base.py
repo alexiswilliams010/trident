@@ -68,6 +68,18 @@ class SemanticContext:
 
 
 @dataclass
+class ResolvedReference:
+    """Return value of `LanguageHandler.resolve_reference`.
+
+    Carries an explicit confidence so a handler that resolves via AST
+    context can upgrade the resulting row above the rule's declared
+    confidence when its answer is type-aware rather than name-only.
+    """
+    target_def_id: int
+    confidence: str = "certain"
+
+
+@dataclass
 class InheritanceEdge:
     """One inheritance edge a handler wants emitted into `inherits_edges`.
     `base_def_id` is filled when intra-file resolution succeeds; otherwise
@@ -159,6 +171,16 @@ class LanguageHandler(ABC):
         hook runs. Rust uses this to collect the set of ts_node ids under test
         gates (`#[cfg(test)]`, `#[test]`, `mod tests { … }`) — every emission
         loop in the resolver consults this set."""
+        return None
+
+    def resolve_reference(
+        self, ts_node, rule, ctx: SemanticContext,
+    ) -> "ResolvedReference | None":
+        """Per-reference resolution override. Called before the YAML-driven
+        inferred/certain path; return a `ResolvedReference` when AST
+        context yields a more confident answer than name-only lookup, or
+        None to fall through to the rule's declared strategy.
+        """
         return None
 
     def qualified_name_prefix(self, ts_node, ctx: SemanticContext) -> str | None:

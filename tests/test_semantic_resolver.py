@@ -417,6 +417,167 @@ async def test_resolve_rust_within_file_calls(clean_repo, rust_fixture_root: Pat
         assert row["confidence"] == "certain"
 
 
+async def test_resolve_rust_struct_field_data_access(clean_repo, rust_fixture_root: Path):
+    """`Counter.value` should appear as a `field` def, and `Counter::increment`
+    should have a write + read on it (from `self.value = helper(self.value + by)`).
+    Field-reference resolution uses the inferred-confidence file_name_index
+    path: since `value` is unique in utils.rs, refs resolve to the field def.
+    """
+    pool, repo_id, branch_id = clean_repo
+    await index_repo(pool, repo_id, branch_id, rust_fixture_root)
+    await resolve_repo(pool, repo_id, branch_id)
+
+    async with pool.acquire() as conn:
+        field_kind = await conn.fetchval(
+            f"""
+            SELECT d.kind FROM definitions d
+            {_BRANCH_FILE_JOIN}='src/utils.rs' AND d.qualified_name='utils.Counter.value'
+            """,
+            branch_id,
+        )
+        assert field_kind == "field"
+
+        rows = await conn.fetch(
+            """
+            SELECT da.access_type
+            FROM data_access da
+            JOIN definitions accessor ON accessor.id=da.accessor_def_id
+            JOIN definitions target   ON target.id=da.target_def_id
+            WHERE da.branch_id=$1
+              AND accessor.qualified_name='utils.Counter.increment'
+              AND target.qualified_name='utils.Counter.value'
+            """,
+            branch_id,
+        )
+        access_types = {r["access_type"] for r in rows}
+        assert "write" in access_types
+        assert "read" in access_types
+
+
+async def test_resolve_rust_field_data_access_skips_ambiguous_names(
+    clean_repo, tmp_path: Path
+):
+    """When two structs in the same file share a field name AND the
+    accessor is a plain function (no `impl` context), neither resolution
+    path can pick the right field — the inferred lookup refuses on
+    ambiguity and the impl-aware hook abstains because there's no `self`.
+    No data_access rows should appear: the no-false-positive guarantee.
+    """
+    pool, repo_id, branch_id = clean_repo
+    (tmp_path / "Cargo.toml").write_text(
+        '[package]\nname="ambig"\nversion="0.0.0"\nedition="2021"\n'
+    )
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "lib.rs").write_text(
+        "pub struct A { pub count: u32 }\n"
+        "pub struct B { pub count: u32 }\n"
+        "pub fn bump(a: &mut A) { a.count = a.count + 1; }\n"
+    )
+    await index_repo(pool, repo_id, branch_id, tmp_path)
+    await resolve_repo(pool, repo_id, branch_id)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT da.access_type
+            FROM data_access da
+            JOIN definitions accessor ON accessor.id=da.accessor_def_id
+            JOIN definitions target   ON target.id=da.target_def_id
+            WHERE da.branch_id=$1 AND target.name='count'
+            """,
+            branch_id,
+        )
+        assert rows == []
+
+
+async def test_resolve_rust_impl_aware_field_resolution(
+    clean_repo, tmp_path: Path
+):
+    """Multi-struct file where the field name is ambiguous, but the
+    accessor is `self.count` inside `impl A`. The type-aware handler hook
+    must pick `A.count` (not `B.count`) and tag the ref as `certain`
+    rather than the rule's blanket `inferred`.
+    """
+    pool, repo_id, branch_id = clean_repo
+    (tmp_path / "Cargo.toml").write_text(
+        '[package]\nname="impl_aware"\nversion="0.0.0"\nedition="2021"\n'
+    )
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "lib.rs").write_text(
+        "pub struct A { pub count: u32 }\n"
+        "pub struct B { pub count: u32 }\n"
+        "impl A {\n"
+        "    pub fn bump(&mut self) { self.count = self.count + 1; }\n"
+        "}\n"
+        "impl B {\n"
+        "    pub fn read(&self) -> u32 { self.count }\n"
+        "}\n"
+    )
+    await index_repo(pool, repo_id, branch_id, tmp_path)
+    await resolve_repo(pool, repo_id, branch_id)
+
+    async with pool.acquire() as conn:
+        a_rows = await conn.fetch(
+            """
+            SELECT da.access_type
+            FROM data_access da
+            JOIN definitions accessor ON accessor.id=da.accessor_def_id
+            JOIN definitions target   ON target.id=da.target_def_id
+            WHERE da.branch_id=$1
+              AND accessor.qualified_name='lib.A.bump'
+              AND target.qualified_name='lib.A.count'
+            """,
+            branch_id,
+        )
+        a_types = {r["access_type"] for r in a_rows}
+        assert "write" in a_types
+        assert "read" in a_types
+
+        b_rows = await conn.fetch(
+            """
+            SELECT da.access_type
+            FROM data_access da
+            JOIN definitions accessor ON accessor.id=da.accessor_def_id
+            JOIN definitions target   ON target.id=da.target_def_id
+            WHERE da.branch_id=$1
+              AND accessor.qualified_name='lib.B.read'
+              AND target.qualified_name='lib.B.count'
+            """,
+            branch_id,
+        )
+        assert {r["access_type"] for r in b_rows} == {"read"}
+
+        # Cross-check: B.read must NOT have touched A.count, and A.bump
+        # must NOT have touched B.count.
+        cross = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM data_access da
+            JOIN definitions accessor ON accessor.id=da.accessor_def_id
+            JOIN definitions target   ON target.id=da.target_def_id
+            WHERE da.branch_id=$1 AND (
+              (accessor.qualified_name='lib.A.bump' AND target.qualified_name='lib.B.count') OR
+              (accessor.qualified_name='lib.B.read' AND target.qualified_name='lib.A.count')
+            )
+            """,
+            branch_id,
+        )
+        assert cross == 0
+
+        # Confidence got upgraded from the rule's blanket `inferred` to
+        # `certain` because the impl-aware hook returned a typed answer.
+        ref_conf = await conn.fetchval(
+            """
+            SELECT MAX(r.resolution_confidence) FROM "references" r
+            JOIN definitions target ON target.id=r.target_def_id
+            WHERE r.branch_id=$1 AND target.qualified_name='lib.A.count'
+            """,
+            branch_id,
+        )
+        assert ref_conf == 1.0
+
+
 async def test_resolve_node_intra_file_inheritance(clean_repo, node_fixture_root: Path):
     pool, repo_id, branch_id = clean_repo
     await index_repo(pool, repo_id, branch_id, node_fixture_root)

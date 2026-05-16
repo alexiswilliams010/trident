@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .._shared.ts_helpers import terminal_identifier, text
-from ..base import InheritanceEdge
+from ..base import InheritanceEdge, ResolvedReference
 
 if TYPE_CHECKING:
     from ..base import SemanticContext
@@ -190,6 +190,80 @@ def _collect_rust_derives(item_ts) -> list[str]:
                 out = this_attr + out
         cursor = cursor.prev_named_sibling
     return out
+
+
+def collect_rust_impl_method_targets(ts_walk: list) -> dict[int, str]:
+    """Map each `function_item` ts_id sitting inside an `impl Foo { … }` block
+    to the impl's target type name (`Foo`). Used by `resolve_rust_reference`
+    to type-resolve `self.x` field accesses to the right struct's field
+    when name-only lookup would be ambiguous."""
+    out: dict[int, str] = {}
+    for ts in ts_walk:
+        if ts.type != "impl_item":
+            continue
+        type_field = ts.child_by_field_name("type")
+        if type_field is None:
+            continue
+        target_name = terminal_identifier(type_field)
+        if not target_name:
+            continue
+        body = ts.child_by_field_name("body")
+        if body is None:
+            continue
+        for child in body.children:
+            if child.type == "function_item":
+                out[child.id] = target_name
+    return out
+
+
+def resolve_rust_reference(ts_node, rule, ctx: "SemanticContext") -> ResolvedReference | None:
+    """Type-aware override for `self.x` field accesses inside `impl` methods.
+
+    Catches the one pattern where AST context unambiguously identifies the
+    target struct: `field_expression` whose `value` is the literal `self`
+    keyword, inside a `function_item` that lives in some `impl Foo { … }`.
+    The struct's `Foo.x` field is looked up via the per-scope name index.
+
+    Other shapes (`obj.x`, `Self::x`, chained `self.inner().x`) need real
+    type inference and are left to the default file_name_index path —
+    which only resolves when the field name is unique in the file, so the
+    no-false-positive guarantee is preserved.
+    """
+    if ts_node.type != "field_identifier":
+        return None
+    parent = ts_node.parent
+    if parent is None or parent.type != "field_expression":
+        return None
+    field_child = parent.child_by_field_name("field")
+    # tree-sitter Python returns fresh wrapper objects from child_by_field_name
+    # each call, so `is`/`==` won't work — compare the underlying node id.
+    if field_child is None or field_child.id != ts_node.id:
+        return None
+    value = parent.child_by_field_name("value")
+    if value is None or value.type != "self":
+        return None
+
+    impl_method_target = ctx.scratch.get("impl_method_target", {})
+    if not impl_method_target or ctx.module_def_id is None:
+        return None
+
+    cur = parent.parent
+    while cur is not None:
+        if cur.type == "function_item":
+            target_name = impl_method_target.get(cur.id)
+            if target_name is None:
+                return None
+            struct_did = ctx.defs_by_scope_and_name.get(
+                (ctx.module_def_id, target_name)
+            )
+            if struct_did is None:
+                return None
+            field_did = ctx.defs_by_scope_and_name.get((struct_did, text(ts_node)))
+            if field_did is None:
+                return None
+            return ResolvedReference(target_def_id=field_did, confidence="certain")
+        cur = cur.parent
+    return None
 
 
 def rust_qualified_name_prefix(ts_node, ctx: "SemanticContext") -> str | None:

@@ -70,6 +70,16 @@ definitions:
     kind: macro
     name_field: name
 
+  # Named struct/union fields. (Tuple struct positional fields have no name
+  # and are intentionally not modeled as definitions.) Field references are
+  # resolved at `inferred` confidence via the file_name_index uniqueness
+  # check — files with two structs sharing a field name will yield no
+  # data_access rows for that name, which is the conservative choice given
+  # we don't do type inference.
+  - node_type: field_declaration
+    kind: field
+    name_field: name
+
 references:
   - node_type: identifier
     exclude_parent_field:
@@ -121,6 +131,33 @@ calls:
   # token_trees and any items they generate are invisible to tree-sitter.
   - node_type: macro_invocation
     function_field: macro
+
+# Only top-level `const` and `static` items become data_access targets.
+# Struct fields aren't tracked as definitions in Rust (see references rule for
+# `field_identifier` — confidence: inferred, no target_def_id), so field reads
+# and writes are intentionally outside the data_access graph. Function-local
+# `let` bindings are likewise excluded by virtue of not being definitions.
+#
+# Write detection uses tree-sitter-rust's two assignment shapes:
+#   `x = 5`  → assignment_expression.left
+#   `x += 1` → compound_assignment_expr.left
+# `&mut X` borrows and `*p = v` deref-writes are deliberately not classified
+# as writes here — the borrow may never lead to a mutation, and deref-write
+# targets the pointee rather than the named binding.
+data_access:
+  # `field` covers named struct/union fields: `self.x = 5` (write) and
+  # `self.x` in any expression (read). The ancestor-field walker climbs
+  # through `field_expression.field` to find the surrounding
+  # `assignment_expression.left`, so the write keys below catch field
+  # writes the same way they catch plain identifier writes. Field
+  # construction (`Counter { value: 0 }`) is intentionally classified as a
+  # read — it's storing into a fresh struct rather than mutating shared
+  # state, and treating it as a write would distort the "who modifies X"
+  # view for LLM data-flow analysis.
+  target_kinds: [const, static, field]
+  write_when_parent_field:
+    - assignment_expression.left
+    - compound_assignment_expr.left
 
 imports:
   node_types: [use_declaration]

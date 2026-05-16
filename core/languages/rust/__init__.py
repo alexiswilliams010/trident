@@ -3,13 +3,22 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..base import ImportEntry, InheritanceEdge, LanguageHandler, ResolvedImport, SemanticContext
+from ..base import (
+    ImportEntry,
+    InheritanceEdge,
+    LanguageHandler,
+    ResolvedImport,
+    ResolvedReference,
+    SemanticContext,
+)
 from .crates import RustIndexState, finalize_rust_state
 from .imports import extract_rust_imports
 from .resolve import resolve_rust
 from .semantic import (
+    collect_rust_impl_method_targets,
     collect_rust_test_skip_ids,
     is_rust_test_path,
+    resolve_rust_reference,
     rust_qualified_name_prefix,
     synthesize_rust_inheritance,
 )
@@ -53,6 +62,12 @@ class RustHandler(LanguageHandler):
 
     def precompute_file_state(self, ts_walk: list, ctx: SemanticContext) -> None:
         ctx.scratch["test_skip_ts_ids"] = collect_rust_test_skip_ids(ts_walk)
+        ctx.scratch["impl_method_target"] = collect_rust_impl_method_targets(ts_walk)
+
+    def resolve_reference(
+        self, ts_node, rule, ctx: SemanticContext,
+    ) -> ResolvedReference | None:
+        return resolve_rust_reference(ts_node, rule, ctx)
 
     def qualified_name_prefix(self, ts_node, ctx: SemanticContext) -> str | None:
         return rust_qualified_name_prefix(ts_node, ctx)

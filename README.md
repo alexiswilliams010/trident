@@ -5,7 +5,7 @@ repository into a relational graph (syntactic CST → semantic edges →
 chunks + embeddings) so an LLM can retrieve coherent multi-file context
 instead of token-window slop.
 
-**Supported languages:** Python, Solidity, Go, JavaScript
+**Supported languages:** Python, Solidity, Go, Rust, JavaScript
 (`.js`/`.jsx`/`.mjs`/`.cjs`), TypeScript (`.ts`/`.tsx`).
 
 ## Prerequisites

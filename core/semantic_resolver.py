@@ -782,8 +782,17 @@ async def resolve_file(
         name = _extract_name_from_field(ts, rule.name_field)
         if not name:
             continue
-        if rule.confidence == "inferred":
-            # Try file-local name match for inferred confidence.
+        # Handler gets first shot via the optional `resolve_reference` hook
+        # so it can override the YAML rule's resolution + confidence when
+        # AST context gives a better answer than name-only lookup. Fall
+        # through to the rule's declared strategy if the hook abstains.
+        confidence = rule.confidence
+        target: int | None = None
+        handler_hit = handler.resolve_reference(ts, rule, sem_ctx)
+        if handler_hit is not None:
+            target = handler_hit.target_def_id
+            confidence = handler_hit.confidence
+        elif rule.confidence == "inferred":
             cands = file_name_index.get(name, [])
             target = cands[0] if len(cands) == 1 else None
         else:
@@ -793,7 +802,7 @@ async def resolve_file(
                 db_node_id=db_id_for[ts.id],
                 file_version_id=file_version_id,
                 name=name,
-                confidence=rule.confidence,
+                confidence=confidence,
                 target_def_id=target,
             )
         )

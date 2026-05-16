@@ -19,6 +19,7 @@ trident uses a local PostgreSQL database (managed via Homebrew). All queries run
 | TypeScript | `.ts`, `.tsx` |
 | JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` |
 | Go | `.go` |
+| Rust | `.rs` |
 | Solidity | `.sol` |
 
 Files with other extensions are not parsed or indexed.
@@ -74,6 +75,7 @@ Three layers of exclusion apply during indexing, in order:
 | JavaScript / TypeScript | `node_modules`, `dist`, `build`, `out`, `coverage`, `.next`, `.nuxt` |
 | Solidity | `lib`, `node_modules`, `out`, `cache`, `artifacts` |
 | Go | `vendor` |
+| Rust | `target` |
 
 **3. User-defined exclusions** — two channels, combined at index time:
 
