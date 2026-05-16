@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from ..base import ImportEntry, LanguageHandler
+from .crates import RustIndexState, finalize_rust_state
 from .imports import extract_rust_imports
 
 
@@ -15,6 +18,17 @@ class RustHandler(LanguageHandler):
         db_id_for: dict[int, int],
     ) -> list[ImportEntry]:
         return extract_rust_imports(file_version_id, source_rel_path, ts_root, db_id_for)
+
+    def init_state(self) -> RustIndexState:
+        return RustIndexState()
+
+    def index_file(self, fvid: int, rel_path: str, state: RustIndexState) -> None:
+        # Crate ownership requires the full crate set, which isn't known until
+        # finalize_index. Buffer the file here; finalize resolves owners.
+        state.pending_files.append((fvid, rel_path))
+
+    def finalize_index(self, repo_root: Path | None, state: RustIndexState) -> None:
+        finalize_rust_state(repo_root, state)
 
 
 __all__ = ["RustHandler"]

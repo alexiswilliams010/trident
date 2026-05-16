@@ -20,10 +20,9 @@ with native resolvers; the table shapes do not change.
 from __future__ import annotations
 
 import asyncio
-import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Iterable
+from typing import Any, Iterable
 
 import asyncpg
 
@@ -31,8 +30,6 @@ from .config_loader import LanguageConfig, load_language_config
 from .grammar_meta import LANGUAGES
 from .languages import ImportEntry, ResolvedImport, get_handler
 from .languages._shared.node_resolution import (
-    TsconfigPaths,
-    load_tsconfig_paths,
     package_name_for_specifier,
     resolve_relative as _resolve_relative_node,
     resolve_tsconfig_alias as _resolve_tsconfig_alias,
@@ -79,6 +76,11 @@ class BranchIndex:
     paths to file_version_ids). Two repos / branches won't collide because
     file_version_ids are globally unique and we only load ones reachable from
     this branch.
+
+    Per-language state (Python's dotted-module index, Go's package index,
+    Rust's crate/module map, tsconfig.json paths, etc.) lives in
+    `lang_state[<language>]` as a handler-defined dataclass. See
+    `core/languages/<lang>/index.py` for each language's state shape.
     """
 
     branch_id: int
@@ -86,25 +88,9 @@ class BranchIndex:
     file_index: dict[str, int]                          # rel_path → file_version_id (intra-repo only)
     name_index: dict[str, list[tuple[int, int]]]        # def_name → [(file_version_id, def_id), ...]
     qualified_to_def: dict[tuple[int, str], int]        # (file_version_id, def_name) → def_id
-    package_index_python: dict[str, int]                # dotted module path → file_version_id
-    package_index_go: dict[str, int]                    # module-relative pkg dir → representative file_version_id
-    go_pkg_files: dict[str, list[int]]                  # module-relative pkg dir → every file_version_id in that pkg
-    go_module_path: str | None                          # value from `module …` line in go.mod, if present
     files_by_id: dict[int, str]                         # file_version_id → rel_path
     file_languages: dict[int, str]                      # file_version_id → language
-    # JS/TS only: parsed `compilerOptions.paths` from tsconfig.json (None if no
-    # tsconfig present or no JS/TS files in the repo).
-    node_tsconfig: TsconfigPaths | None = None
-    # Rust only — workspace-aware indexes (a single-crate repo is just a
-    # workspace of one). Outer key is the crate name (cargo-normalised);
-    # inner key is the crate-relative module path. Per-file ownership is
-    # tracked separately so `super::` / `self::` / `crate::` can navigate
-    # within the source's own crate.
-    package_index_rust: dict[str, dict[str, int]] = field(default_factory=dict)
-    rust_module_for_file: dict[int, tuple[str, str]] = field(default_factory=dict)
-    # Set of all workspace member crate names seen. Used to classify
-    # `use other_crate::…` as intra-repo when it names a sibling member.
-    rust_crate_names: frozenset[str] = field(default_factory=frozenset)
+    lang_state: dict[str, Any] = field(default_factory=dict)
 
 
 # Backwards-compatible alias for the old name; some test code may reference it.
@@ -134,158 +120,6 @@ class ResolutionStats:
 # ────────────────────────────────────────────────────────────────────
 
 
-def _python_dotted_for(rel_path: str) -> str | None:
-    """`mypackage/utils.py` → `mypackage.utils`. `mypackage/__init__.py` → `mypackage`."""
-    if not rel_path.endswith(".py"):
-        return None
-    no_ext = rel_path[:-3]
-    parts = no_ext.split("/")
-    if parts and parts[-1] == "__init__":
-        parts = parts[:-1]
-    if not parts:
-        return None
-    return ".".join(parts)
-
-
-def _rust_module_path_for(rel_path: str, crate_root_path: str) -> str | None:
-    """Map a .rs file's repo-relative path to its crate-relative module path.
-
-    Examples (crate_root_path='src/lib.rs'):
-        'src/lib.rs'           → ''             (the crate root itself)
-        'src/utils.rs'         → 'utils'
-        'src/foo/bar.rs'       → 'foo::bar'
-        'src/foo/mod.rs'       → 'foo'
-        'src/foo/bar/mod.rs'   → 'foo::bar'
-
-    Returns None for files that don't sit under the crate root's directory
-    (e.g. test files in `tests/`, examples/, build scripts), which we leave
-    unindexed in the heuristic tier.
-    """
-    if not rel_path.endswith(".rs"):
-        return None
-    if rel_path == crate_root_path:
-        return ""
-    crate_dir = crate_root_path.rsplit("/", 1)[0] if "/" in crate_root_path else ""
-    if crate_dir:
-        if not rel_path.startswith(crate_dir + "/"):
-            return None
-        rel = rel_path[len(crate_dir) + 1:]
-    else:
-        rel = rel_path
-    no_ext = rel[:-3]
-    parts = no_ext.split("/")
-    if parts and parts[-1] == "mod":
-        parts = parts[:-1]
-    return "::".join(parts) if parts else ""
-
-
-# Directories never traversed when searching for Cargo.toml files. Build
-# artefacts (`target/`) carry per-dependency Cargo.tomls that would otherwise
-# pollute the crate set. The rest are common dependency / VCS dirs.
-_RUST_CARGO_SCAN_PRUNE = frozenset({"target", "node_modules", ".git", "vendor"})
-
-
-@dataclass(frozen=True)
-class RustCrate:
-    """One Cargo package discovered under the repo root.
-
-    `name` follows Cargo's normalisation (dashes → underscores) so it can be
-    matched against `use <name>::…` import heads literally. `root_path` and
-    `package_dir` are repo-relative POSIX paths; `package_dir` is "" when the
-    crate's Cargo.toml sits at the repo root.
-    """
-    name: str
-    root_path: str          # repo-relative path of lib.rs / main.rs (the crate's entry file)
-    package_dir: str        # repo-relative dir holding Cargo.toml ("" if at repo root)
-
-
-def _discover_rust_crates(repo_root: Path) -> list[RustCrate]:
-    """Walk the repo for every Cargo.toml with a `[package]` section. Members
-    of a workspace virtual root are picked up automatically because they each
-    carry their own Cargo.toml. Workspace virtual roots (no `[package]`) are
-    skipped — they only declare members.
-
-    Per-crate root file is determined in priority order:
-      1. `[lib].path` — explicit override.
-      2. `[[bin]]` first entry's `path` — for bin-only crates.
-      3. `<package_dir>/src/lib.rs` if it exists on disk.
-      4. `<package_dir>/src/main.rs` if it exists.
-    Every Cargo path is interpreted relative to the package's own directory,
-    matching Cargo's resolution rules.
-    """
-    crates: list[RustCrate] = []
-    for cargo in repo_root.rglob("Cargo.toml"):
-        rel = cargo.relative_to(repo_root)
-        if any(part in _RUST_CARGO_SCAN_PRUNE for part in rel.parts):
-            continue
-        try:
-            data = tomllib.loads(cargo.read_text())
-        except Exception:
-            continue
-        pkg = data.get("package")
-        if not isinstance(pkg, dict):
-            continue
-        name = pkg.get("name")
-        if not isinstance(name, str) or not name:
-            continue
-        crate_name = name.replace("-", "_")
-
-        package_dir_path = cargo.parent
-        package_dir = package_dir_path.relative_to(repo_root).as_posix()
-        if package_dir == ".":
-            package_dir = ""
-
-        # crate root: [lib].path → [[bin]][0].path → src/lib.rs → src/main.rs
-        crate_root_abs: Path | None = None
-        lib = data.get("lib")
-        if isinstance(lib, dict) and isinstance(lib.get("path"), str):
-            crate_root_abs = (package_dir_path / lib["path"]).resolve()
-        if crate_root_abs is None:
-            bins = data.get("bin", [])
-            if isinstance(bins, list) and bins:
-                first = bins[0]
-                if isinstance(first, dict) and isinstance(first.get("path"), str):
-                    crate_root_abs = (package_dir_path / first["path"]).resolve()
-        if crate_root_abs is None:
-            if (package_dir_path / "src" / "lib.rs").is_file():
-                crate_root_abs = package_dir_path / "src" / "lib.rs"
-            elif (package_dir_path / "src" / "main.rs").is_file():
-                crate_root_abs = package_dir_path / "src" / "main.rs"
-            else:
-                # Best-effort default — no source root found on disk. Module
-                # path mapping below will simply return None for every file
-                # in this crate, leaving its imports unresolved.
-                crate_root_abs = package_dir_path / "src" / "lib.rs"
-        try:
-            crate_root_rel = crate_root_abs.relative_to(repo_root.resolve()).as_posix()
-        except ValueError:
-            # crate root escapes the repo root (rare; ignore).
-            continue
-        crates.append(RustCrate(
-            name=crate_name,
-            root_path=crate_root_rel,
-            package_dir=package_dir,
-        ))
-    return crates
-
-
-def _crate_for_file(rel_path: str, crates: list[RustCrate]) -> RustCrate | None:
-    """Pick the crate whose `package_dir` is the longest path prefix of
-    `rel_path`. Falls back to a repo-root crate (package_dir="") if present
-    and nothing else matched."""
-    best: RustCrate | None = None
-    best_len = -1
-    for c in crates:
-        if c.package_dir == "":
-            if best_len < 0:
-                best = c
-                best_len = 0
-            continue
-        prefix = c.package_dir + "/"
-        if rel_path.startswith(prefix) and len(c.package_dir) > best_len:
-            best = c
-            best_len = len(c.package_dir)
-    return best
 
 
 async def build_branch_index(
@@ -297,6 +131,9 @@ async def build_branch_index(
     cross-file resolution sees only the file_versions visible in the branch.
     Definitions are content-shared, but we only load the ones whose
     file_version is mapped by this branch.
+
+    Per-language state is delegated to each handler via `init_state`,
+    `index_file`, and `finalize_index` — this function stays language-agnostic.
     """
     files = await conn.fetch(
         """
@@ -319,84 +156,29 @@ async def build_branch_index(
     repo_row = await conn.fetchrow(
         "SELECT root_path FROM repos WHERE id=$1", repo_id,
     )
-    repo_root = repo_row["root_path"] if repo_row else None
+    repo_root = Path(repo_row["root_path"]) if repo_row and repo_row["root_path"] else None
 
     file_index: dict[str, int] = {}
     files_by_id: dict[int, str] = {}
     file_languages: dict[int, str] = {}
-    pkg_index: dict[str, int] = {}
-    pkg_index_go: dict[str, int] = {}
-    pkg_files_go: dict[str, list[int]] = {}
-    rust_files: list[tuple[int, str]] = []  # (file_version_id, rel_path); built first, indexed below once we know the crate root
-    has_go = False
-    has_node = False
-    has_rust = False
+    lang_state: dict[str, Any] = {}
     for f in files:
         fvid = f["id"]
-        file_index[f["path"]] = fvid
-        files_by_id[fvid] = f["path"]
-        file_languages[fvid] = f["language"]
-        if f["language"] == "python":
-            dotted = _python_dotted_for(f["path"])
-            if dotted:
-                pkg_index[dotted] = fvid
-        elif f["language"] == "go":
-            has_go = True
-            # Package dir = parent directory. `pkg_index_go` maps to one
-            # representative for the imports.resolved_file_version_id FK
-            # (which is singular); `pkg_files_go` keeps the full list so
-            # Phase 3's cross-file linker can fuzzy-match across the whole
-            # package.
-            pkg_dir = "/".join(f["path"].split("/")[:-1])
-            pkg_index_go.setdefault(pkg_dir, fvid)
-            pkg_files_go.setdefault(pkg_dir, []).append(fvid)
-        elif f["language"] in ("javascript", "typescript"):
-            has_node = True
-        elif f["language"] == "rust":
-            has_rust = True
-            rust_files.append((fvid, f["path"]))
+        rel = f["path"]
+        lang = f["language"]
+        file_index[rel] = fvid
+        files_by_id[fvid] = rel
+        file_languages[fvid] = lang
+        try:
+            handler = get_handler(lang)
+        except KeyError:
+            continue
+        if lang not in lang_state:
+            lang_state[lang] = handler.init_state()
+        handler.index_file(fvid, rel, lang_state[lang])
 
-    # Read go.mod once if any Go file is present and a root_path is known.
-    go_module_path: str | None = None
-    if has_go and repo_root:
-        gomod = Path(repo_root) / "go.mod"
-        if gomod.is_file():
-            for line in gomod.read_text().splitlines():
-                stripped = line.strip()
-                if stripped.startswith("module "):
-                    go_module_path = stripped.split(None, 1)[1].strip().strip('"')
-                    break
-
-    # Read tsconfig.json once if any JS/TS file is present. The same parsed
-    # paths config applies to both javascript.yaml and typescript.yaml.
-    node_tsconfig: TsconfigPaths | None = None
-    if has_node and repo_root:
-        node_tsconfig = load_tsconfig_paths(Path(repo_root))
-
-    # Rust: discover every crate under the repo root (workspaces produce one
-    # Cargo.toml per member, all of which are picked up). For each indexed
-    # .rs file, find its owning crate and derive its crate-relative module
-    # path. Files that don't sit under any crate's source root are dropped
-    # from the index (e.g. integration tests in `tests/`, examples).
-    rust_pkg_index: dict[str, dict[str, int]] = {}
-    rust_module_for_file: dict[int, tuple[str, str]] = {}
-    rust_crate_names: frozenset[str] = frozenset()
-    if has_rust and repo_root:
-        crates = _discover_rust_crates(Path(repo_root))
-        rust_crate_names = frozenset(c.name for c in crates)
-        # Pre-create empty per-crate maps so the resolver's lookups don't
-        # have to special-case missing keys for known crates.
-        for c in crates:
-            rust_pkg_index.setdefault(c.name, {})
-        for fvid, rel in rust_files:
-            owner = _crate_for_file(rel, crates)
-            if owner is None:
-                continue
-            mod_path = _rust_module_path_for(rel, owner.root_path)
-            if mod_path is None:
-                continue
-            rust_pkg_index[owner.name].setdefault(mod_path, fvid)
-            rust_module_for_file[fvid] = (owner.name, mod_path)
+    for lang, state in lang_state.items():
+        get_handler(lang).finalize_index(repo_root, state)
 
     name_index: dict[str, list[tuple[int, int]]] = {}
     qualified_to_def: dict[tuple[int, str], int] = {}
@@ -410,16 +192,9 @@ async def build_branch_index(
         file_index=file_index,
         name_index=name_index,
         qualified_to_def=qualified_to_def,
-        package_index_python=pkg_index,
-        package_index_go=pkg_index_go,
-        go_pkg_files=pkg_files_go,
-        go_module_path=go_module_path,
         files_by_id=files_by_id,
         file_languages=file_languages,
-        node_tsconfig=node_tsconfig,
-        package_index_rust=rust_pkg_index,
-        rust_module_for_file=rust_module_for_file,
-        rust_crate_names=rust_crate_names,
+        lang_state=lang_state,
     )
 
 
@@ -469,11 +244,13 @@ def _resolve_python(entry: ImportEntry, idx: BranchIndex) -> ResolvedImport:
         return ResolvedImport(entry, "unresolved")
 
     # Absolute import: try the full dotted path + parent dotted prefixes.
+    py_state = idx.lang_state.get("python")
+    pkg_index = py_state.pkg_index if py_state is not None else {}
     parts = entry.import_path.split(".")
     while parts:
         cand = ".".join(parts)
-        if cand in idx.package_index_python:
-            return ResolvedImport(entry, "intra_repo", resolved_file_version_id=idx.package_index_python[cand])
+        if cand in pkg_index:
+            return ResolvedImport(entry, "intra_repo", resolved_file_version_id=pkg_index[cand])
         parts.pop()
 
     # Top-level segment isn't local → external (e.g., `import requests`).
@@ -546,10 +323,11 @@ def _resolve_go(entry: ImportEntry, idx: BranchIndex) -> ResolvedImport:
         up across multiple subpackage imports.
     """
     raw = entry.import_path
-    mod = idx.go_module_path
+    go_state = idx.lang_state.get("go")
+    mod = go_state.module_path if go_state is not None else None
     if mod and (raw == mod or raw.startswith(mod + "/")):
         suffix = "" if raw == mod else raw[len(mod) + 1 :]
-        target = idx.package_index_go.get(suffix)
+        target = go_state.pkg_index.get(suffix) if go_state is not None else None
         if target is not None:
             return ResolvedImport(entry, "intra_repo", resolved_file_version_id=target)
         return ResolvedImport(entry, "unresolved")
@@ -614,13 +392,16 @@ def _resolve_rust(entry: ImportEntry, idx: BranchIndex) -> ResolvedImport:
         return ResolvedImport(entry, "unresolved")
     parts = raw.split("::")
 
-    src_owner = idx.rust_module_for_file.get(entry.file_version_id)
+    rust_state = idx.lang_state.get("rust")
+    if rust_state is None:
+        return ResolvedImport(entry, "external", package_name=parts[0])
+    src_owner = rust_state.module_for_file.get(entry.file_version_id)
 
     if entry.is_relative:
         if src_owner is None:
             return ResolvedImport(entry, "unresolved")
         src_crate, src_module = src_owner
-        crate_index = idx.package_index_rust.get(src_crate, {})
+        crate_index = rust_state.package_index.get(src_crate, {})
         src_parts = src_module.split("::") if src_module else []
         ascend = 0
         i = 0
@@ -643,14 +424,14 @@ def _resolve_rust(entry: ImportEntry, idx: BranchIndex) -> ResolvedImport:
     if head == "crate":
         if src_owner is None:
             return ResolvedImport(entry, "unresolved")
-        crate_index = idx.package_index_rust.get(src_owner[0], {})
+        crate_index = rust_state.package_index.get(src_owner[0], {})
         return _try_rust_module_path(entry, crate_index, parts[1:])
 
     # Cargo normalises `-` to `_` in crate names *as referenced from code*,
     # so `use anchor_lang::…` matches a Cargo.toml declaring `anchor-lang`.
     head_norm = head.replace("-", "_")
-    if head_norm in idx.rust_crate_names:
-        crate_index = idx.package_index_rust.get(head_norm, {})
+    if head_norm in rust_state.crate_names:
+        crate_index = rust_state.package_index.get(head_norm, {})
         return _try_rust_module_path(entry, crate_index, parts[1:])
 
     # Fallback: bare path whose head names a top-level module of the source
@@ -660,7 +441,7 @@ def _resolve_rust(entry: ImportEntry, idx: BranchIndex) -> ResolvedImport:
     # 2015) uses the bare form. We require an exact module match (not just
     # any path prefix) to keep false positives low.
     if src_owner is not None:
-        src_crate_index = idx.package_index_rust.get(src_owner[0], {})
+        src_crate_index = rust_state.package_index.get(src_owner[0], {})
         if head in src_crate_index or any(k.startswith(head + "::") for k in src_crate_index):
             return _try_rust_module_path(entry, src_crate_index, parts)
 
@@ -684,8 +465,10 @@ def _resolve_node_import(entry: ImportEntry, idx: BranchIndex) -> ResolvedImport
     """
     raw = entry.import_path
 
-    if idx.node_tsconfig is not None:
-        target = _resolve_tsconfig_alias(raw, idx.node_tsconfig, idx.file_index)
+    node_state = idx.lang_state.get(entry.language)
+    tsconfig = node_state.tsconfig if node_state is not None else None
+    if tsconfig is not None:
+        target = _resolve_tsconfig_alias(raw, tsconfig, idx.file_index)
         if target is not None:
             return ResolvedImport(entry, "intra_repo", resolved_file_version_id=target)
 
@@ -826,7 +609,9 @@ async def _link_cross_file(
     # Go: files in the same package share scope without an explicit import. Seed
     # every Go file with its package peers so cross-file ref/call/inheritance
     # linking can find symbols declared by a sibling file.
-    for pkg_dir, peers in idx.go_pkg_files.items():
+    go_state = idx.lang_state.get("go")
+    go_pkg_files = go_state.pkg_files if go_state is not None else {}
+    for pkg_dir, peers in go_pkg_files.items():
         peer_set = set(peers)
         for fvid in peers:
             imported_files_by.setdefault(fvid, set()).update(peer_set - {fvid})
@@ -843,7 +628,7 @@ async def _link_cross_file(
         if idx.file_languages.get(target_file) == "go":
             target_path = idx.files_by_id.get(target_file, "")
             pkg_dir = "/".join(target_path.split("/")[:-1])
-            peers = idx.go_pkg_files.get(pkg_dir, [])
+            peers = go_pkg_files.get(pkg_dir, [])
             target_files.update(peers)
         imported_files_by.setdefault(importer, set()).update(target_files)
         for name in (row["imported_names"] or []):

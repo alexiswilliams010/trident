@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from .._shared.node_imports import extract_node_imports
+from .._shared.node_index import NodeIndexState, finalize_node_state
 from ..base import ImportEntry, LanguageHandler
 
 
@@ -18,6 +21,12 @@ class JavaScriptHandler(LanguageHandler):
         return extract_node_imports(
             "javascript", file_version_id, source_rel_path, ts_root, db_id_for,
         )
+
+    def init_state(self) -> NodeIndexState:
+        return NodeIndexState()
+
+    def finalize_index(self, repo_root: Path | None, state: NodeIndexState) -> None:
+        finalize_node_state(repo_root, state)
 
 
 __all__ = ["JavaScriptHandler"]
