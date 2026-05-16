@@ -3,7 +3,7 @@
         db-test-setup \
         diagnose graph \
         query-semantic query-lexical query-hybrid query-fake-hybrid \
-        index embed \
+        index embed profile-index profile-view \
         branches branch-set-default branch-drop gc \
         _require-db
 
@@ -171,6 +171,42 @@ embed: _require-db ## Index + embed a repo into $(DB) (real embedder, secrets vi
 		echo 'usage: make embed DB=name REPO_PATH=/path REPO_NAME=name [BRANCH=name] [EXCLUDE=...] [FORCE_RESOLVE=1]'; exit 2; \
 	fi
 	$(call inject_and_run,$(PYTHON) -m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) --embed real $(BRANCH_FLAG) $(EXCLUDE_FLAG) $(FORCE_RESOLVE_FLAG))
+
+# Function-call tracer over the index run. Emits a JSON trace at
+# profile/index-<timestamp>.json. Open it with `make profile-view
+# TRACE=profile/index-<timestamp>.json` for the interactive flame
+# graph + timeline (await spans are visible, so DB-wait shows up as
+# real time blocks, not CPU). No sudo required — viztracer is an
+# in-process tracer. Wipe + recreate the DB beforehand (e.g.
+# `make db-reset DB=...`) to profile the cold path.
+VIZTRACER ?= $(CURDIR)/.venv/bin/viztracer
+VIZVIEWER ?= $(CURDIR)/.venv/bin/vizviewer
+# Tunables: PROFILE_MIN_US drops calls shorter than N microseconds (skips
+# per-node tree-sitter walk noise). PROFILE_ENTRIES grows the circular
+# buffer if 1M still overflows after filtering.
+PROFILE_MIN_US ?= 100
+PROFILE_ENTRIES ?= 1000000
+profile-index: _require-db ## Trace an index run. REPO_PATH=/path REPO_NAME=name [BRANCH=name] [EXCLUDE='pat1,pat2']
+	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ]; then \
+		echo 'usage: make profile-index DB=name REPO_PATH=/path REPO_NAME=name [BRANCH=name] [EXCLUDE=...]'; exit 2; \
+	fi
+	@if [ ! -x "$(VIZTRACER)" ]; then \
+		echo "viztracer not found at $(VIZTRACER) — run: make install (or uv pip install viztracer)"; exit 2; \
+	fi
+	@mkdir -p profile
+	@OUT=profile/index-$$(date +%Y%m%d-%H%M%S).json; \
+		echo "tracing -> $$OUT (min_duration=$(PROFILE_MIN_US)us, entries=$(PROFILE_ENTRIES))"; \
+		env DATABASE_URL=$(DB_DSN) $(VIZTRACER) --output_file $$OUT \
+			--min_duration $(PROFILE_MIN_US)us --ignore_c_function --log_async \
+			--tracer_entries $(PROFILE_ENTRIES) \
+			-m cli.index $(REPO_PATH) --repo-name $(REPO_NAME) $(BRANCH_FLAG) $(EXCLUDE_FLAG) $(FORCE_RESOLVE_FLAG) && \
+		echo "wrote $$OUT — view with: make profile-view TRACE=$$OUT"
+
+profile-view: ## Open a viztracer JSON trace in the interactive viewer. TRACE=profile/index-<ts>.json
+	@if [ -z "$(TRACE)" ]; then \
+		echo 'usage: make profile-view TRACE=profile/index-<timestamp>.json'; exit 2; \
+	fi
+	@$(VIZVIEWER) $(TRACE)
 
 # Query targets accept REPO_LIST=a[:branch][,b[:branch]...]. A single entry
 # without a colon queries the repo's default branch; with a colon, the named

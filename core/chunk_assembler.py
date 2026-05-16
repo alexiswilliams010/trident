@@ -948,6 +948,15 @@ async def _bulk_persist_chunks(
     if not chunks:
         return
 
+    # Dedupe by (anchor_def_id, granularity), last write wins. The old
+    # per-row upsert absorbed in-list duplicates implicitly; the bulk
+    # path's snapshot can't, so fold them here to avoid colliding on the
+    # unique constraint.
+    deduped_by_key: dict[tuple[int, str], _ChunkRow] = {}
+    for c in chunks:
+        deduped_by_key[(c.anchor_def_id, c.granularity)] = c
+    chunks = list(deduped_by_key.values())
+
     existing = await conn.fetch(
         """
         SELECT id, anchor_def_id, granularity, content_hash
