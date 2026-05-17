@@ -26,6 +26,9 @@ dev = [
     "ruff>=0.3",
     "viztracer>=0.16",
 ]
+benchmark = [
+    "claude-agent-sdk>=0.1",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -39,10 +42,11 @@ target-version = "py312"
 
 [project.scripts]
 trident-graph = "cli.graph:main"
+trident-benchmark = "benchmark.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["core*", "cli*", "db*"]
+include = ["core*", "cli*", "db*", "benchmark*"]

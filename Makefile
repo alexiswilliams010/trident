@@ -5,6 +5,7 @@
         query-semantic query-lexical query-hybrid query-fake-hybrid \
         index embed profile-index profile-view \
         branches branch-set-default branch-drop gc \
+        benchmark \
         _require-db
 
 UV ?= uv
@@ -268,3 +269,22 @@ branch-drop: _require-db ## Delete a non-default branch (cascade). REPO_NAME=nam
 
 gc: _require-db ## Reclaim orphan file_versions and chunk_embeddings in $(DB).
 	@env DATABASE_URL=$(DB_DSN) $(PYTHON) -m cli.branches gc
+
+# ------------------------------------------------------------------------------
+# Benchmark: trident-vs-baseline agent comparison.
+# ------------------------------------------------------------------------------
+QUESTION ?=
+MODEL    ?=
+OUTPUT_DIR ?=
+VERBOSE  ?=
+
+MODEL_FLAG := $(if $(MODEL),--model $(MODEL),)
+BRANCH_BENCH_FLAG := $(if $(BRANCH),--branch $(BRANCH),)
+OUTPUT_DIR_FLAG := $(if $(OUTPUT_DIR),--output-dir $(OUTPUT_DIR),)
+VERBOSE_FLAG := $(if $(VERBOSE),--verbose,)
+
+benchmark: _require-db ## Run the trident-vs-baseline benchmark. REPO_PATH=/path REPO_NAME=name QUESTION="..." [BRANCH=name] [MODEL=claude-sonnet-4-6] [OUTPUT_DIR=path] [VERBOSE=1]
+	@if [ -z "$(REPO_PATH)" ] || [ -z "$(REPO_NAME)" ] || [ -z "$(QUESTION)" ]; then \
+		echo 'usage: make benchmark DB=name REPO_PATH=/path REPO_NAME=name QUESTION="..." [BRANCH=name] [MODEL=...] [OUTPUT_DIR=path] [VERBOSE=1]'; exit 2; \
+	fi
+	$(call inject_and_run,$(PYTHON) -m benchmark $(REPO_PATH) --db $(DB) --repo-name $(REPO_NAME) --question "$(QUESTION)" $(BRANCH_BENCH_FLAG) $(MODEL_FLAG) $(OUTPUT_DIR_FLAG) $(VERBOSE_FLAG))
