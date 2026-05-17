@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
@@ -204,6 +205,8 @@ async def embed_branch_chunks(
 
         all_hashes: list[str] = []
         all_vectors: list[str] = []
+        total = len(eligible)
+        is_tty = sys.stdout.isatty()
         try:
             for coro in asyncio.as_completed(tasks):
                 batch, vectors = await coro
@@ -211,7 +214,18 @@ async def embed_branch_chunks(
                     all_hashes.append(r["content_hash"])
                     all_vectors.append(_vector_literal(vec))
                 stats.embedded += len(batch)
+                pct = (stats.embedded / total) * 100 if total else 100.0
+                msg = f"[Tier 3 embed] {stats.embedded}/{total} chunks ({pct:.1f}%)"
+                if is_tty:
+                    print(f"\r{msg}", end="", flush=True)
+                else:
+                    print(msg, flush=True)
+            if is_tty:
+                # Terminate the progress line so subsequent logs start cleanly.
+                print(flush=True)
         except BaseException:
+            if is_tty:
+                print(flush=True)
             # On any failure, cancel the remaining in-flight API calls so we
             # don't keep burning the gateway after a fatal validation error.
             for t in tasks:
