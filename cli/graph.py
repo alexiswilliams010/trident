@@ -32,13 +32,18 @@ from core.graph import (
     callees_of,
     entrypoint_paths,
     entrypoints,
+    entrypoints_reaching,
     file_dependents,
     file_imports,
     get_source,
     inheritance_tree,
+    is_reachable,
     paths_between,
+    readers_of,
     reachable_from,
     resolve_definitions,
+    taint_paths,
+    writers_of,
 )
 from db.connection import pool_ctx
 
@@ -237,6 +242,82 @@ async def _cmd_dependents(pool, rids, args) -> int:
     return 0
 
 
+async def _cmd_is_reachable(pool, rids, args) -> int:
+    ok = await is_reachable(
+        pool, rids, args.source_name, args.target_name,
+        max_depth=args.max_depth, confidence=args.confidence, timeout_s=args.timeout,
+    )
+    if args.json:
+        emit({"command": "is-reachable", "source": args.source_name,
+              "target": args.target_name, "repo": _repo_label(args),
+              "reachable": ok}, True)
+    else:
+        verdict = "yes" if ok else "no"
+        print(f'is "{args.source_name}" reachable to "{args.target_name}"? {verdict}')
+    return 0
+
+
+async def _cmd_writers_of(pool, rids, args) -> int:
+    defs = await writers_of(pool, rids, args.name, timeout_s=args.timeout)
+    if args.json:
+        emit({"command": "writers-of", "target": args.name, "repo": _repo_label(args),
+              "results": [def_to_json(d) for d in defs]}, True)
+    else:
+        print(f'writers of "{args.name}" ({len(defs)} results):')
+        for d in defs:
+            print(format_def(d))
+    return 0
+
+
+async def _cmd_readers_of(pool, rids, args) -> int:
+    defs = await readers_of(pool, rids, args.name, timeout_s=args.timeout)
+    if args.json:
+        emit({"command": "readers-of", "target": args.name, "repo": _repo_label(args),
+              "results": [def_to_json(d) for d in defs]}, True)
+    else:
+        print(f'readers of "{args.name}" ({len(defs)} results):')
+        for d in defs:
+            print(format_def(d))
+    return 0
+
+
+async def _cmd_taint_paths(pool, rids, args) -> int:
+    sanitizers = [s for s in (args.sanitizer or []) if s]
+    result = await taint_paths(
+        pool, rids, args.source_name, args.sink_name,
+        sanitizer_names=sanitizers,
+        max_depth=args.max_depth, max_paths=args.max_paths, timeout_s=args.timeout,
+    )
+    if args.json:
+        emit({"command": "taint-paths", "source": args.source_name,
+              "sink": args.sink_name, "sanitizers": sanitizers,
+              "repo": _repo_label(args),
+              "paths": [[def_to_json(d) for d in path] for path in result]}, True)
+    else:
+        print(f'taint paths "{args.source_name}" → "{args.sink_name}" '
+              f'(sanitizers={sanitizers or "none"}, {len(result)} paths):')
+        for i, path in enumerate(result, 1):
+            names = " → ".join(d.qualified_name for d in path)
+            print(f"  [{i}] {names}")
+    return 0
+
+
+async def _cmd_entrypoints_reaching(pool, rids, args) -> int:
+    defs = await entrypoints_reaching(
+        pool, rids, args.name,
+        max_depth=args.max_depth, confidence=args.confidence, timeout_s=args.timeout,
+    )
+    if args.json:
+        emit({"command": "entrypoints-reaching", "target": args.name,
+              "repo": _repo_label(args),
+              "results": [def_to_json(d) for d in defs]}, True)
+    else:
+        print(f'entrypoints reaching "{args.name}" ({len(defs)} results):')
+        for d in defs:
+            print(format_def(d))
+    return 0
+
+
 async def _cmd_inheritance(pool, rids, args) -> int:
     nodes = await inheritance_tree(pool, rids, args.name, timeout_s=args.timeout)
     if args.json:
@@ -366,6 +447,44 @@ def main(argv: list[str] | None = None) -> int:
                         help="Inheritance hierarchy for a class")
     p.add_argument("name", type=str)
     p.set_defaults(func=_cmd_inheritance)
+
+    # is-reachable
+    p = subs.add_parser("is-reachable", parents=[common],
+                        help="Boolean: does any call path exist from source to target?")
+    p.add_argument("source_name", type=str)
+    p.add_argument("target_name", type=str)
+    p.add_argument("--max-depth", type=int, default=None)
+    p.set_defaults(func=_cmd_is_reachable)
+
+    # writers-of
+    p = subs.add_parser("writers-of", parents=[common],
+                        help="Functions that write to a target definition (via data_access)")
+    p.add_argument("name", type=str)
+    p.set_defaults(func=_cmd_writers_of)
+
+    # readers-of
+    p = subs.add_parser("readers-of", parents=[common],
+                        help="Functions that read a target definition (via data_access)")
+    p.add_argument("name", type=str)
+    p.set_defaults(func=_cmd_readers_of)
+
+    # taint-paths
+    p = subs.add_parser("taint-paths", parents=[common],
+                        help="Paths source→sink through call_edges ∪ data_access, excluding sanitizers")
+    p.add_argument("source_name", type=str)
+    p.add_argument("sink_name", type=str)
+    p.add_argument("--sanitizer", action="append", default=None,
+                   help="Sanitizer definition to exclude from paths (repeatable)")
+    p.add_argument("--max-depth", type=int, default=None)
+    p.add_argument("--max-paths", type=int, default=50)
+    p.set_defaults(func=_cmd_taint_paths)
+
+    # entrypoints-reaching
+    p = subs.add_parser("entrypoints-reaching", parents=[common],
+                        help="Entrypoints from which the target is reachable via the call graph")
+    p.add_argument("name", type=str)
+    p.add_argument("--max-depth", type=int, default=None)
+    p.set_defaults(func=_cmd_entrypoints_reaching)
 
     args = parser.parse_args(argv)
     try:

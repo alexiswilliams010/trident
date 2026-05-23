@@ -10,13 +10,18 @@ from core.graph import (
     callers_of,
     callees_of,
     entrypoints,
+    entrypoints_reaching,
     file_dependents,
     file_imports,
     get_source,
     inheritance_tree,
+    is_reachable,
     paths_between,
+    readers_of,
     reachable_from,
     resolve_definitions,
+    taint_paths,
+    writers_of,
 )
 from core.heuristic_resolver import resolve_branch_imports
 from core.semantic_resolver import resolve_repo
@@ -279,3 +284,117 @@ async def test_inheritance_tree_from_child(clean_repo, python_fixture_root: Path
     qnames = {n.def_info.qualified_name for n in tree}
     assert "policies.BasePolicy" in qnames
     assert "policies.StrictPolicy" in qnames
+
+
+# ────────────────────────────────────────────────────────────────────
+# is_reachable
+# ────────────────────────────────────────────────────────────────────
+
+
+async def test_is_reachable_true_for_existing_call_chain(
+    clean_repo, python_fixture_root: Path
+):
+    pool, repo_id, branch_id = clean_repo
+    await _seed(pool, repo_id, branch_id, python_fixture_root)
+    # run() → Calculator.add → helper  (this chain exists in the fixture)
+    assert await is_reachable(pool, branch_id, "run", "helper") is True
+
+
+async def test_is_reachable_false_when_no_path(clean_repo, python_fixture_root: Path):
+    pool, repo_id, branch_id = clean_repo
+    await _seed(pool, repo_id, branch_id, python_fixture_root)
+    # helper is a leaf — it doesn't call run.
+    assert await is_reachable(pool, branch_id, "helper", "run") is False
+
+
+async def test_is_reachable_false_when_name_unknown(
+    clean_repo, python_fixture_root: Path
+):
+    pool, repo_id, branch_id = clean_repo
+    await _seed(pool, repo_id, branch_id, python_fixture_root)
+    assert await is_reachable(pool, branch_id, "no_such_fn", "helper") is False
+    assert await is_reachable(pool, branch_id, "helper", "no_such_target") is False
+
+
+# ────────────────────────────────────────────────────────────────────
+# readers_of / writers_of (data_access)
+# ────────────────────────────────────────────────────────────────────
+
+
+async def test_readers_of_global_variable(clean_repo, python_fixture_root: Path):
+    pool, repo_id, branch_id = clean_repo
+    await _seed(pool, repo_id, branch_id, python_fixture_root)
+    # main.greet reads top-level GREETING (see fixture comment in main.py).
+    readers = await readers_of(pool, branch_id, "GREETING")
+    qnames = {d.qualified_name for d in readers}
+    assert "main.greet" in qnames
+
+
+async def test_writers_of_unwritten_constant_is_empty(
+    clean_repo, python_fixture_root: Path
+):
+    pool, repo_id, branch_id = clean_repo
+    await _seed(pool, repo_id, branch_id, python_fixture_root)
+    # GREETING is only read, never written after init.
+    writers = await writers_of(pool, branch_id, "GREETING")
+    assert writers == []
+
+
+# ────────────────────────────────────────────────────────────────────
+# taint_paths (call_edges ∪ data_access, sanitizer-aware)
+# ────────────────────────────────────────────────────────────────────
+
+
+async def test_taint_paths_finds_call_only_route(
+    clean_repo, python_fixture_root: Path
+):
+    pool, repo_id, branch_id = clean_repo
+    await _seed(pool, repo_id, branch_id, python_fixture_root)
+    # Pure call chain — should also be discoverable via taint_paths.
+    result = await taint_paths(pool, branch_id, "run", "helper")
+    assert len(result) >= 1
+    assert all(
+        path[0].qualified_name.endswith("run")
+        and path[-1].qualified_name.endswith("helper")
+        for path in result
+    )
+
+
+async def test_taint_paths_sanitizer_blocks_route(
+    clean_repo, python_fixture_root: Path
+):
+    pool, repo_id, branch_id = clean_repo
+    await _seed(pool, repo_id, branch_id, python_fixture_root)
+    # Excluding Calculator.add (an intermediate node on run→helper) should
+    # prune the only path in this fixture.
+    blocked = await taint_paths(
+        pool, branch_id, "run", "helper", sanitizer_names=["add"]
+    )
+    # Either zero paths or paths that don't traverse Calculator.add.
+    for path in blocked:
+        assert not any("Calculator.add" in d.qualified_name for d in path)
+
+
+# ────────────────────────────────────────────────────────────────────
+# entrypoints_reaching
+# ────────────────────────────────────────────────────────────────────
+
+
+async def test_entrypoints_reaching_includes_run(
+    clean_repo, python_fixture_root: Path
+):
+    pool, repo_id, branch_id = clean_repo
+    await _seed(pool, repo_id, branch_id, python_fixture_root)
+    eps = await entrypoints_reaching(pool, branch_id, "helper")
+    qnames = {d.qualified_name for d in eps}
+    # `run` is a public entrypoint and reaches helper via Calculator.add.
+    assert "main.run" in qnames
+
+
+async def test_entrypoints_reaching_empty_for_unreachable_target(
+    clean_repo, python_fixture_root: Path
+):
+    pool, repo_id, branch_id = clean_repo
+    await _seed(pool, repo_id, branch_id, python_fixture_root)
+    eps = await entrypoints_reaching(pool, branch_id, "no_such_target")
+    assert eps == []

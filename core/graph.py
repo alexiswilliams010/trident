@@ -775,3 +775,270 @@ async def inheritance_tree(
         )
         for did in defs_by_id
     ]
+
+
+# ────────────────────────────────────────────────────────────────────
+# Reachability & data-flow queries
+# ────────────────────────────────────────────────────────────────────
+
+
+async def is_reachable(
+    pool: asyncpg.Pool,
+    branch_ids: int | list[int],
+    source_name: str,
+    target_name: str,
+    *,
+    max_depth: int | None = None,
+    confidence: str | None = None,
+    timeout_s: int = 60,
+) -> bool:
+    """Boolean: does *any* call path exist from source to target?
+
+    Cheaper than `paths_between` when only a yes/no answer is needed — the
+    recursive CTE stops at the first hit via `LIMIT 1`.
+    """
+    bids = _norm_branch_ids(branch_ids)
+    depth_clause = (
+        f"AND array_length(p.path, 1) < {max_depth}"
+        if max_depth is not None else ""
+    )
+    conf_clause = "AND ce.confidence = $4" if confidence else ""
+    seed_conf_clause = "AND ce.confidence = $4" if confidence else ""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _set_timeout(conn, timeout_s)
+            src_ids = await _resolve_def_ids(conn, bids, source_name)
+            dst_ids = await _resolve_def_ids(conn, bids, target_name)
+            if not src_ids or not dst_ids:
+                return False
+            params: list = [src_ids, dst_ids, bids]
+            if confidence:
+                params.append(confidence)
+            row = await conn.fetchrow(
+                f"""
+                WITH RECURSIVE paths AS (
+                    SELECT ARRAY[ce.caller_def_id, ce.callee_def_id] AS path
+                    FROM call_edges ce
+                    WHERE ce.caller_def_id = ANY($1::bigint[])
+                      AND ce.callee_def_id IS NOT NULL
+                      AND ce.branch_id = ANY($3::bigint[])
+                      {seed_conf_clause}
+                    UNION ALL
+                    SELECT p.path || ce.callee_def_id
+                    FROM paths p
+                    JOIN call_edges ce ON ce.caller_def_id = p.path[array_length(p.path, 1)]
+                    WHERE ce.callee_def_id IS NOT NULL
+                      AND NOT p.path @> ARRAY[ce.callee_def_id]
+                      AND ce.branch_id = ANY($3::bigint[])
+                      {depth_clause}
+                      {conf_clause}
+                )
+                SELECT 1 FROM paths
+                WHERE path[array_length(path, 1)] = ANY($2::bigint[])
+                LIMIT 1
+                """,
+                *params,
+            )
+    return row is not None
+
+
+# ────────────────────────────────────────────────────────────────────
+# Data-access queries (over the data_access table)
+# ────────────────────────────────────────────────────────────────────
+
+
+async def writers_of(
+    pool: asyncpg.Pool,
+    branch_ids: int | list[int],
+    name: str,
+    *,
+    timeout_s: int = 120,
+) -> list[DefInfo]:
+    """Definitions that write to (or read+write) the named target.
+
+    The target is typically a state variable; `name` is resolved by the same
+    rules as `callers_of` (name, qualified_name, or `*.name` suffix). Returns
+    a deduped DefInfo list of the writing functions.
+    """
+    return await _data_accessors(pool, branch_ids, name, ("write", "readwrite"), timeout_s)
+
+
+async def readers_of(
+    pool: asyncpg.Pool,
+    branch_ids: int | list[int],
+    name: str,
+    *,
+    timeout_s: int = 120,
+) -> list[DefInfo]:
+    """Definitions that read (or read+write) the named target."""
+    return await _data_accessors(pool, branch_ids, name, ("read", "readwrite"), timeout_s)
+
+
+async def _data_accessors(
+    pool: asyncpg.Pool,
+    branch_ids: int | list[int],
+    name: str,
+    access_types: tuple[str, ...],
+    timeout_s: int,
+) -> list[DefInfo]:
+    bids = _norm_branch_ids(branch_ids)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _set_timeout(conn, timeout_s)
+            target_ids = await _resolve_def_ids(conn, bids, name)
+            if not target_ids:
+                return []
+            rows = await conn.fetch(
+                f"""
+                SELECT DISTINCT ON (d.id) {_DEF_COLS}
+                FROM data_access da
+                JOIN definitions d ON d.id = da.accessor_def_id
+                {_DEF_JOINS}
+                WHERE da.target_def_id = ANY($1::bigint[])
+                  AND da.access_type = ANY($2::text[])
+                  AND da.branch_id = ANY($3::bigint[])
+                  AND bf.branch_id = ANY($3::bigint[])
+                ORDER BY d.id, bf.branch_id
+                """,
+                target_ids, list(access_types), bids,
+            )
+    return [_row_to_def(r) for r in rows]
+
+
+# ────────────────────────────────────────────────────────────────────
+# Taint paths (call_edges ∪ data_access) with sanitizer exclusion
+# ────────────────────────────────────────────────────────────────────
+
+
+async def taint_paths(
+    pool: asyncpg.Pool,
+    branch_ids: int | list[int],
+    source_name: str,
+    sink_name: str,
+    *,
+    sanitizer_names: list[str] | None = None,
+    max_depth: int | None = None,
+    max_paths: int = 50,
+    timeout_s: int = 120,
+) -> list[list[DefInfo]]:
+    """Paths from source to sink through the UNION of call edges and data-access
+    edges, excluding any path that touches a sanitizer definition.
+
+    The walk treats data-access as a regular graph edge: A writes V means
+    A → V; B reads V means V → B. So a flow "A writes storage S, B reads S,
+    B calls sink" is captured as A → S → B → sink.
+
+    Sanitizer exclusion is applied at the recursive step — paths containing
+    a sanitizer def_id are pruned before they're extended further. Returns up
+    to `max_paths` simple (acyclic) paths.
+    """
+    bids = _norm_branch_ids(branch_ids)
+    depth_clause = (
+        f"AND array_length(p.path, 1) < {max_depth}"
+        if max_depth is not None else ""
+    )
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _set_timeout(conn, timeout_s)
+            src_ids = await _resolve_def_ids(conn, bids, source_name)
+            dst_ids = await _resolve_def_ids(conn, bids, sink_name)
+            if not src_ids or not dst_ids:
+                return []
+            sanitizer_ids: list[int] = []
+            for sname in sanitizer_names or []:
+                sanitizer_ids.extend(await _resolve_def_ids(conn, bids, sname))
+            path_rows = await conn.fetch(
+                f"""
+                WITH RECURSIVE
+                edges AS (
+                    -- call edges as (from -> to)
+                    SELECT caller_def_id AS src, callee_def_id AS dst
+                    FROM call_edges
+                    WHERE branch_id = ANY($4::bigint[])
+                      AND caller_def_id IS NOT NULL
+                      AND callee_def_id IS NOT NULL
+                    UNION ALL
+                    -- data writes: accessor writes -> target
+                    SELECT accessor_def_id AS src, target_def_id AS dst
+                    FROM data_access
+                    WHERE branch_id = ANY($4::bigint[])
+                      AND access_type IN ('write', 'readwrite')
+                    UNION ALL
+                    -- data reads: target -> accessor that reads it
+                    SELECT target_def_id AS src, accessor_def_id AS dst
+                    FROM data_access
+                    WHERE branch_id = ANY($4::bigint[])
+                      AND access_type IN ('read', 'readwrite')
+                ),
+                paths AS (
+                    SELECT ARRAY[e.src, e.dst] AS path
+                    FROM edges e
+                    WHERE e.src = ANY($1::bigint[])
+                      AND NOT (e.dst = ANY($5::bigint[]))
+                    UNION ALL
+                    SELECT p.path || e.dst
+                    FROM paths p
+                    JOIN edges e ON e.src = p.path[array_length(p.path, 1)]
+                    WHERE NOT p.path @> ARRAY[e.dst]
+                      AND NOT (e.dst = ANY($5::bigint[]))
+                      {depth_clause}
+                )
+                SELECT path FROM paths
+                WHERE path[array_length(path, 1)] = ANY($2::bigint[])
+                LIMIT $3
+                """,
+                src_ids, dst_ids, max_paths, bids, sanitizer_ids,
+            )
+            if not path_rows:
+                return []
+            all_ids: set[int] = set()
+            for pr in path_rows:
+                all_ids.update(pr["path"])
+            def_rows = await conn.fetch(
+                f"""
+                SELECT DISTINCT ON (d.id) {_DEF_COLS}
+                FROM definitions d
+                {_DEF_JOINS}
+                WHERE d.id = ANY($1::bigint[])
+                  AND bf.branch_id = ANY($2::bigint[])
+                ORDER BY d.id, bf.branch_id
+                """,
+                list(all_ids), bids,
+            )
+    defs_by_id = {r["def_id"]: _row_to_def(r) for r in def_rows}
+    result: list[list[DefInfo]] = []
+    for pr in path_rows:
+        path = [defs_by_id[did] for did in pr["path"] if did in defs_by_id]
+        if path:
+            result.append(path)
+    return result
+
+
+# ────────────────────────────────────────────────────────────────────
+# Entry-point filter
+# ────────────────────────────────────────────────────────────────────
+
+
+async def entrypoints_reaching(
+    pool: asyncpg.Pool,
+    branch_ids: int | list[int],
+    target_name: str,
+    *,
+    max_depth: int | None = None,
+    confidence: str | None = None,
+    timeout_s: int = 120,
+) -> list[DefInfo]:
+    """Entrypoints from which `target_name` is reachable via the call graph.
+
+    Useful for "who can drain my funds" / "who can trigger this sensitive
+    sink" investigations. Computed as `ancestors(target) ∩ entrypoints()`.
+    """
+    anc = await ancestors(
+        pool, branch_ids, target_name,
+        max_depth=max_depth, confidence=confidence, timeout_s=timeout_s,
+    )
+    if not anc:
+        return []
+    ep = await entrypoints(pool, branch_ids, timeout_s=timeout_s)
+    ep_ids = {e.def_id for e in ep}
+    return [a for a in anc if a.def_id in ep_ids]

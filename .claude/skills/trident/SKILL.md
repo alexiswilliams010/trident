@@ -184,8 +184,13 @@ Pass `--json` inside `CMD` for structured output suitable for further processing
 | `ancestors <name> [--max-depth N]` | All transitive callers (who can reach this?) |
 | `reachable <name> [--max-depth N]` | All transitive callees (blast radius of a change) |
 | `paths <src> <dst> [--max-paths N]` | All call paths between two definitions |
+| `is-reachable <src> <dst> [--max-depth N]` | Boolean yes/no — does *any* call path exist? Cheaper than `paths` when you only need a verdict. |
 | `entrypoints [--kind function] [--file path]` | Functions with no internal callers (public surface) |
 | `entrypoint-paths <name>` | Call paths from entrypoints down to a target |
+| `entrypoints-reaching <name> [--max-depth N]` | Entrypoints from which the target is reachable. The "who from outside can trigger this sensitive sink?" question in one call. |
+| `writers-of <name>` | Functions that write to a state variable / storage slot (via `data_access`). |
+| `readers-of <name>` | Functions that read a state variable (via `data_access`). |
+| `taint-paths <src> <sink> [--sanitizer <name>]... [--max-paths N]` | Paths through the union of call edges and data-access edges, excluding any path that touches a sanitizer. Use when the flow may be mediated by a shared state variable rather than a direct call chain. |
 | `source <name>` | Retrieve source code of a definition |
 | `imports [--file path] [--dep-class intra_repo\|external\|unresolved]` | List imports |
 | `dependents <file>` | Files that import a given file |
@@ -213,6 +218,19 @@ make graph DB=trident_repo REPO_NAME=repo CMD="imports --file services/user.py"
 
 # Public API surface
 make graph DB=trident_repo REPO_NAME=repo CMD="entrypoints --kind function"
+
+# Cheap "can A reach B?" yes/no
+make graph DB=trident_repo REPO_NAME=repo CMD="is-reachable handleRequest dbWrite"
+
+# Who from the outside can trigger withdraw?
+make graph DB=trident_repo REPO_NAME=repo CMD="entrypoints-reaching withdraw --json"
+
+# Who writes the balances mapping?
+make graph DB=trident_repo REPO_NAME=repo CMD="writers-of balances"
+
+# Show how externally-supplied amounts reach the SQL exec function,
+# excluding paths through the sanitize() helper.
+make graph DB=trident_repo REPO_NAME=repo CMD="taint-paths transfer_funds execute_query --sanitizer sanitize --sanitizer escape_sql"
 ```
 
 ---
@@ -227,7 +245,10 @@ make graph DB=trident_repo REPO_NAME=repo CMD="entrypoints --kind function"
 | Manually tracing callers | `make graph DB=... REPO_NAME=... CMD="callers-of <name>"` or `CMD="ancestors <name>"` |
 | Reading multiple files for context | `make query-hybrid DB=... REPO_LIST=... QUERY="<question>"` |
 | Searching for all uses of a class | `make query-lexical DB=... REPO_LIST=... QUERY="<ClassName>"` |
-| Understanding data flow | `make query-hybrid` + `make graph CMD="paths <src> <dst>"` |
+| Understanding data flow | `make graph DB=... REPO_NAME=... CMD="taint-paths <src> <sink> [--sanitizer ...]"` |
+| Finding writers of a state variable | `make graph DB=... REPO_NAME=... CMD="writers-of <var>"` |
+| "Can A reach B?" yes/no check | `make graph DB=... REPO_NAME=... CMD="is-reachable <src> <dst>"` |
+| Who from outside can trigger a sink? | `make graph DB=... REPO_NAME=... CMD="entrypoints-reaching <sink>"` |
 | Finding a change's blast radius | `make graph DB=... REPO_NAME=... CMD="reachable <changed-function>"` |
 
 trident queries are pre-indexed and return only relevant code, avoiding token waste from reading entire files.
