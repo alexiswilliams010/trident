@@ -50,3 +50,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["core*", "cli*", "db*", "benchmark*"]
+
+# Ship the schema migrations as package data — `db.connection.apply_migrations`
+# globs `db/migrations/*.up.sql` at runtime. Without this, wheels/git installs
+# omit the .sql files and `--init-schema` silently creates no tables.
+[tool.setuptools.package-data]
+db = ["migrations/*.sql"]
