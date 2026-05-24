@@ -49,10 +49,15 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["core*", "cli*", "db*", "benchmark*"]
+include = ["core*", "cli*", "db*", "benchmark*", "configs*"]
 
-# Ship the schema migrations as package data — `db.connection.apply_migrations`
-# globs `db/migrations/*.up.sql` at runtime. Without this, wheels/git installs
-# omit the .sql files and `--init-schema` silently creates no tables.
+# Ship runtime data files that are loaded by path, not import:
+#  - db/migrations/*.sql  → `db.connection.apply_migrations` (--init-schema).
+#  - configs/*.yaml,*.json → `core.config_loader` loads <language>.yaml +
+#    _schema.json via `Path(__file__).parent.parent / "configs"`. Without these,
+#    wheels/git installs silently skip Tier 2 resolution (0 definitions).
+# `configs/` is shipped as a package (it has an __init__.py) so packages.find
+# picks it up and this package-data entry travels with it.
 [tool.setuptools.package-data]
 db = ["migrations/*.sql"]
+configs = ["*.yaml", "*.json"]
