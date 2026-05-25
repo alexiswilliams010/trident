@@ -53,6 +53,24 @@ def _norm_branch_ids(x: int | list[int]) -> list[int]:
     return list(x)
 
 
+def _chunk_lang_filter(params: list, languages: list[str] | None) -> tuple[str, str]:
+    """Return (join_sql, where_sql) to restrict a chunk query to file languages.
+
+    Chunk queries don't join `file_versions` by default, so the join is added
+    only when filtering. Appends the languages list as a trailing positional
+    param — call it *after* the query's other params are appended so the
+    generated ``$N`` lands last. ``languages=None`` is a no-op (both strings
+    empty), leaving existing callers unchanged.
+    """
+    if not languages:
+        return "", ""
+    params.append(list(languages))
+    return (
+        "JOIN file_versions fv ON fv.id = c.file_version_id",
+        f"AND fv.language = ANY(${len(params)}::text[])",
+    )
+
+
 # ────────────────────────────────────────────────────────────────────
 # Structural — graph traversal from a named definition
 # ────────────────────────────────────────────────────────────────────
@@ -65,6 +83,7 @@ async def structural_query(
     *,
     depth: int = 2,
     granularity: str = "function",
+    languages: list[str] | None = None,
 ) -> list[RetrievedChunk]:
     """Find a definition by name (or qualified_name suffix) and return its
     chunk plus chunks for transitive callees up to `depth` hops, scoped to
@@ -114,6 +133,7 @@ async def structural_query(
 
         return await _fetch_chunks_for_anchors(
             conn, list(scores.keys()), scores, granularity, branch_ids=bids,
+            languages=languages,
         )
 
 
@@ -181,6 +201,7 @@ async def semantic_query(
     *,
     top_k: int = 10,
     granularities: tuple[str, ...] | None = None,
+    languages: list[str] | None = None,
 ) -> list[RetrievedChunk]:
     """Embed `query` and return the top-k nearest chunks by cosine distance,
     with a graph-signal penalty applied so signature-only defs don't crowd
@@ -193,6 +214,8 @@ async def semantic_query(
 
     async with pool.acquire() as conn:
         if granularities:
+            params: list = [qvec, bids, list(granularities), top_k]
+            lang_join, lang_clause = _chunk_lang_filter(params, languages)
             rows = await conn.fetch(
                 f"""
                 SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
@@ -204,15 +227,19 @@ async def semantic_query(
                 JOIN branches b ON b.id = c.branch_id
                 JOIN branch_files bf ON bf.branch_id = c.branch_id AND bf.file_version_id = c.file_version_id
                 LEFT JOIN definitions d ON d.id = c.anchor_def_id
+                {lang_join}
                 {_SKELETON_JOINS_SQL}
                 JOIN chunk_embeddings ce ON ce.content_hash = c.content_hash
                 WHERE c.branch_id = ANY($2::bigint[]) AND c.granularity = ANY($3::text[])
+                  {lang_clause}
                 ORDER BY score DESC
                 LIMIT $4
                 """,
-                qvec, bids, list(granularities), top_k,
+                *params,
             )
         else:
+            params = [qvec, bids, top_k]
+            lang_join, lang_clause = _chunk_lang_filter(params, languages)
             rows = await conn.fetch(
                 f"""
                 SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
@@ -224,13 +251,15 @@ async def semantic_query(
                 JOIN branches b ON b.id = c.branch_id
                 JOIN branch_files bf ON bf.branch_id = c.branch_id AND bf.file_version_id = c.file_version_id
                 LEFT JOIN definitions d ON d.id = c.anchor_def_id
+                {lang_join}
                 {_SKELETON_JOINS_SQL}
                 JOIN chunk_embeddings ce ON ce.content_hash = c.content_hash
                 WHERE c.branch_id = ANY($2::bigint[])
+                  {lang_clause}
                 ORDER BY score DESC
                 LIMIT $3
                 """,
-                qvec, bids, top_k,
+                *params,
             )
     return [_row_to_chunk(r) for r in rows]
 
@@ -275,6 +304,7 @@ async def lexical_query(
     *,
     top_k: int = 10,
     granularities: tuple[str, ...] | None = None,
+    languages: list[str] | None = None,
 ) -> list[RetrievedChunk]:
     """Lexical retrieval via Postgres full-text search."""
     tsq = _build_tsquery(query)
@@ -284,6 +314,8 @@ async def lexical_query(
 
     async with pool.acquire() as conn:
         if granularities:
+            params: list = [tsq, bids, list(granularities), top_k]
+            lang_join, lang_clause = _chunk_lang_filter(params, languages)
             rows = await conn.fetch(
                 f"""
                 SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
@@ -295,15 +327,19 @@ async def lexical_query(
                 JOIN branches b ON b.id = c.branch_id
                 JOIN branch_files bf ON bf.branch_id = c.branch_id AND bf.file_version_id = c.file_version_id
                 LEFT JOIN definitions d ON d.id = c.anchor_def_id
+                {lang_join}
                 {_SKELETON_JOINS_SQL}
                 WHERE c.branch_id = ANY($2::bigint[]) AND c.granularity = ANY($3::text[])
                   AND c.fts_doc @@ to_tsquery('english', $1)
+                  {lang_clause}
                 ORDER BY score DESC
                 LIMIT $4
                 """,
-                tsq, bids, list(granularities), top_k,
+                *params,
             )
         else:
+            params = [tsq, bids, top_k]
+            lang_join, lang_clause = _chunk_lang_filter(params, languages)
             rows = await conn.fetch(
                 f"""
                 SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
@@ -315,13 +351,15 @@ async def lexical_query(
                 JOIN branches b ON b.id = c.branch_id
                 JOIN branch_files bf ON bf.branch_id = c.branch_id AND bf.file_version_id = c.file_version_id
                 LEFT JOIN definitions d ON d.id = c.anchor_def_id
+                {lang_join}
                 {_SKELETON_JOINS_SQL}
                 WHERE c.branch_id = ANY($2::bigint[])
                   AND c.fts_doc @@ to_tsquery('english', $1)
+                  {lang_clause}
                 ORDER BY score DESC
                 LIMIT $3
                 """,
-                tsq, bids, top_k,
+                *params,
             )
     return [_row_to_chunk(r) for r in rows]
 
@@ -373,16 +411,20 @@ async def hybrid_query(
     override_weight: float = 0.5,
     mmr_repo_lambda: float = 0.3,
     mmr_file_lambda: float = 0.15,
+    languages: list[str] | None = None,
 ) -> list[RetrievedChunk]:
     """Pull `candidate_pool` candidates from BOTH the semantic (cosine) and
     lexical (BM25 / FTS) retrievers, fuse via Reciprocal Rank Fusion, then
     expand each anchor via call_edges + inherits_edges + overrides_edges
     (all branch-scoped), then MMR-rerank for repo/file diversity.
+
+    A `languages` filter restricts the candidate pool (via the semantic/lexical
+    children) and the graph-expansion chunk fetch to files in those languages.
     """
     bids = _norm_branch_ids(branch_ids)
     sem_results, lex_results = await asyncio.gather(
-        semantic_query(pool, bids, query, embed_fn, top_k=candidate_pool),
-        lexical_query(pool, bids, query, top_k=candidate_pool),
+        semantic_query(pool, bids, query, embed_fn, top_k=candidate_pool, languages=languages),
+        lexical_query(pool, bids, query, top_k=candidate_pool, languages=languages),
     )
     if not sem_results and not lex_results:
         return []
@@ -501,7 +543,7 @@ async def hybrid_query(
             related_ids = sorted(related_bonus.keys())
             related_chunks = await _fetch_chunks_for_anchors(
                 conn, related_ids, scores={cid: 1.0 for cid in related_ids},
-                granularity="function", branch_ids=bids,
+                granularity="function", branch_ids=bids, languages=languages,
             )
             for nc in related_chunks:
                 bonus = related_bonus.get(nc.anchor_def_id or -1, 0.0)
@@ -614,12 +656,15 @@ async def _fetch_chunks_for_anchors(
     granularity: str,
     *,
     branch_ids: list[int] | None = None,
+    languages: list[str] | None = None,
 ) -> list[RetrievedChunk]:
     if not anchor_ids:
         return []
     if branch_ids:
+        params: list = [anchor_ids, granularity, branch_ids]
+        lang_join, lang_clause = _chunk_lang_filter(params, languages)
         rows = await conn.fetch(
-            """
+            f"""
             SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
                    c.branch_id, c.file_version_id,
                    d.qualified_name, bf.path AS file_path,
@@ -629,14 +674,18 @@ async def _fetch_chunks_for_anchors(
             JOIN branches b ON b.id = c.branch_id
             JOIN branch_files bf ON bf.branch_id = c.branch_id AND bf.file_version_id = c.file_version_id
             LEFT JOIN definitions d ON d.id = c.anchor_def_id
+            {lang_join}
             WHERE c.anchor_def_id = ANY($1::bigint[]) AND c.granularity = $2
               AND c.branch_id = ANY($3::bigint[])
+              {lang_clause}
             """,
-            anchor_ids, granularity, branch_ids,
+            *params,
         )
     else:
+        params = [anchor_ids, granularity]
+        lang_join, lang_clause = _chunk_lang_filter(params, languages)
         rows = await conn.fetch(
-            """
+            f"""
             SELECT c.id, c.anchor_def_id, c.granularity, c.token_count, c.content,
                    c.branch_id, c.file_version_id,
                    d.qualified_name, bf.path AS file_path,
@@ -646,9 +695,11 @@ async def _fetch_chunks_for_anchors(
             JOIN branches b ON b.id = c.branch_id
             JOIN branch_files bf ON bf.branch_id = c.branch_id AND bf.file_version_id = c.file_version_id
             LEFT JOIN definitions d ON d.id = c.anchor_def_id
+            {lang_join}
             WHERE c.anchor_def_id = ANY($1::bigint[]) AND c.granularity = $2
+              {lang_clause}
             """,
-            anchor_ids, granularity,
+            *params,
         )
     out: list[RetrievedChunk] = []
     for r in rows:

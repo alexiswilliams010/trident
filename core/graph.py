@@ -82,6 +82,21 @@ async def _set_timeout(conn: asyncpg.Connection, timeout_s: int) -> None:
     await conn.execute(f"SET LOCAL statement_timeout = '{timeout_s}s'")
 
 
+def _lang_clause(params: list, languages: list[str] | None) -> str:
+    """Append a `fv.language` filter as a trailing positional param, if requested.
+
+    Returns the SQL fragment referencing the just-appended ``$N`` (or ``''`` when
+    no languages are given). Call it *after* every other param for the query has
+    been appended so ``$N`` lands last, and only interpolate the fragment where
+    the ``fv`` (file_versions) alias is in scope. ``languages=None`` is a no-op,
+    keeping every existing caller's behavior unchanged.
+    """
+    if not languages:
+        return ""
+    params.append(list(languages))
+    return f"AND fv.language = ANY(${len(params)}::text[])"
+
+
 # ────────────────────────────────────────────────────────────────────
 # Resolve definitions by name
 # ────────────────────────────────────────────────────────────────────
@@ -93,6 +108,7 @@ async def resolve_definitions(
     name: str,
     *,
     kind: str | None = None,
+    languages: list[str] | None = None,
     timeout_s: int = 120,
 ) -> list[DefInfo]:
     bids = _norm_branch_ids(branch_ids)
@@ -100,6 +116,7 @@ async def resolve_definitions(
     params: list = [bids, name]
     if kind:
         params.append(kind)
+    lang_clause = _lang_clause(params, languages)
     async with pool.acquire() as conn:
         async with conn.transaction():
             await _set_timeout(conn, timeout_s)
@@ -112,6 +129,7 @@ async def resolve_definitions(
                   AND (d.name = $2 OR d.qualified_name = $2
                        OR d.qualified_name LIKE '%%.' || $2)
                   {kind_clause}
+                  {lang_clause}
                 ORDER BY d.id, bf.branch_id
                 """,
                 *params,
@@ -148,6 +166,7 @@ async def callers_of(
     name: str,
     *,
     confidence: str | None = None,
+    languages: list[str] | None = None,
     timeout_s: int = 120,
 ) -> list[DefInfo]:
     bids = _norm_branch_ids(branch_ids)
@@ -155,6 +174,7 @@ async def callers_of(
     params: list = [bids, name]
     if confidence:
         params.append(confidence)
+    lang_clause = _lang_clause(params, languages)
     async with pool.acquire() as conn:
         async with conn.transaction():
             await _set_timeout(conn, timeout_s)
@@ -170,6 +190,7 @@ async def callers_of(
                   AND (target.name = $2 OR target.qualified_name = $2
                        OR target.qualified_name LIKE '%%.' || $2)
                   {conf_clause}
+                  {lang_clause}
                 ORDER BY d.id, bf.branch_id
                 """,
                 *params,
@@ -183,6 +204,7 @@ async def callees_of(
     name: str,
     *,
     confidence: str | None = None,
+    languages: list[str] | None = None,
     timeout_s: int = 120,
 ) -> list[DefInfo]:
     bids = _norm_branch_ids(branch_ids)
@@ -190,6 +212,7 @@ async def callees_of(
     params: list = [bids, name]
     if confidence:
         params.append(confidence)
+    lang_clause = _lang_clause(params, languages)
     async with pool.acquire() as conn:
         async with conn.transaction():
             await _set_timeout(conn, timeout_s)
@@ -205,6 +228,7 @@ async def callees_of(
                   AND (caller.name = $2 OR caller.qualified_name = $2
                        OR caller.qualified_name LIKE '%%.' || $2)
                   {conf_clause}
+                  {lang_clause}
                 ORDER BY d.id, bf.branch_id
                 """,
                 *params,
@@ -224,6 +248,7 @@ async def ancestors(
     *,
     max_depth: int | None = None,
     confidence: str | None = None,
+    languages: list[str] | None = None,
     timeout_s: int = 120,
 ) -> list[DefInfo]:
     """Transitive callers — upward call-graph slice."""
@@ -234,6 +259,7 @@ async def ancestors(
     params: list = [None, bids]  # placeholder; filled in below
     if confidence:
         params.append(confidence)
+    lang_clause = _lang_clause(params, languages)
     async with pool.acquire() as conn:
         async with conn.transaction():
             await _set_timeout(conn, timeout_s)
@@ -265,6 +291,7 @@ async def ancestors(
                 JOIN definitions d ON d.id = anc.def_id
                 {_DEF_JOINS}
                 WHERE bf.branch_id = ANY($2::bigint[])
+                  {lang_clause}
                 ORDER BY d.id, anc.depth, bf.branch_id
                 """,
                 *params,
@@ -284,6 +311,7 @@ async def reachable_from(
     *,
     max_depth: int | None = None,
     confidence: str | None = None,
+    languages: list[str] | None = None,
     timeout_s: int = 120,
 ) -> list[DefInfo]:
     """Transitive callees — downward call-graph slice (blast radius)."""
@@ -294,6 +322,7 @@ async def reachable_from(
     params: list = [None, bids]
     if confidence:
         params.append(confidence)
+    lang_clause = _lang_clause(params, languages)
     async with pool.acquire() as conn:
         async with conn.transaction():
             await _set_timeout(conn, timeout_s)
@@ -325,6 +354,7 @@ async def reachable_from(
                 JOIN definitions d ON d.id = reach.def_id
                 {_DEF_JOINS}
                 WHERE bf.branch_id = ANY($2::bigint[])
+                  {lang_clause}
                 ORDER BY d.id, reach.depth, bf.branch_id
                 """,
                 *params,
@@ -425,6 +455,7 @@ async def entrypoints(
     kind: str | None = None,
     file_path: str | None = None,
     include_internal: bool = False,
+    languages: list[str] | None = None,
     timeout_s: int = 120,
 ) -> list[DefInfo]:
     """Functions/methods with no internal callers and no override relationships,
@@ -447,6 +478,9 @@ async def entrypoints(
         clauses.append("AND (d.visibility IS NULL OR d.visibility NOT IN ('internal', 'private'))")
         clauses.append("AND bf.path NOT LIKE '%%/interfaces/%%'")
         clauses.append("AND bf.path NOT LIKE '%%/interface/%%'")
+    lang_clause = _lang_clause(params, languages)
+    if lang_clause:
+        clauses.append(lang_clause)
     extra = "\n                  ".join(clauses)
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -511,6 +545,7 @@ async def get_source(
     name: str,
     *,
     kind: str | None = None,
+    languages: list[str] | None = None,
     timeout_s: int = 120,
 ) -> list[DefInfo]:
     """Resolve definitions and populate source from raw file content."""
@@ -519,6 +554,7 @@ async def get_source(
     params: list = [bids, name]
     if kind:
         params.append(kind)
+    lang_clause = _lang_clause(params, languages)
     async with pool.acquire() as conn:
         async with conn.transaction():
             await _set_timeout(conn, timeout_s)
@@ -531,6 +567,7 @@ async def get_source(
                   AND (d.name = $2 OR d.qualified_name = $2
                        OR d.qualified_name LIKE '%%.' || $2)
                   {kind_clause}
+                  {lang_clause}
                 ORDER BY d.id, bf.branch_id
                 """,
                 *params,
@@ -565,6 +602,7 @@ async def file_imports(
     *,
     file_path: str | None = None,
     dep_class: str | None = None,
+    languages: list[str] | None = None,
     timeout_s: int = 120,
 ) -> list[ImportInfo]:
     bids = _norm_branch_ids(branch_ids)
@@ -579,6 +617,9 @@ async def file_imports(
         clauses.append(f"AND i.dep_class = ${idx}")
         params.append(dep_class)
         idx += 1
+    lang_clause = _lang_clause(params, languages)
+    if lang_clause:
+        clauses.append(lang_clause)
     extra = " ".join(clauses)
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -619,15 +660,18 @@ async def file_dependents(
     branch_ids: int | list[int],
     file_path: str,
     *,
+    languages: list[str] | None = None,
     timeout_s: int = 120,
 ) -> list[ImportInfo]:
     """Files that import a given file (reverse import lookup)."""
     bids = _norm_branch_ids(branch_ids)
+    params: list = [bids, file_path]
+    lang_clause = _lang_clause(params, languages)
     async with pool.acquire() as conn:
         async with conn.transaction():
             await _set_timeout(conn, timeout_s)
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT i.import_path, i.imported_names, i.dep_class,
                        tbf.path AS resolved_file,
                        bf.path AS file_path, fv.id AS file_version_id
@@ -640,9 +684,10 @@ async def file_dependents(
                        AND tbf.branch_id = i.branch_id
                 WHERE i.branch_id = ANY($1::bigint[])
                   AND tbf.path = $2
+                  {lang_clause}
                 ORDER BY bf.path
                 """,
-                bids, file_path,
+                *params,
             )
     return [
         ImportInfo(
@@ -674,6 +719,7 @@ async def inheritance_tree(
     branch_ids: int | list[int],
     name: str,
     *,
+    languages: list[str] | None = None,
     timeout_s: int = 120,
 ) -> list[InheritanceNode]:
     """Full inheritance hierarchy (up and down) from a named class, scoped to
@@ -685,6 +731,8 @@ async def inheritance_tree(
             seed_ids = await _resolve_def_ids(conn, bids, name)
             if not seed_ids:
                 return []
+            params: list = [seed_ids, bids]
+            lang_clause = _lang_clause(params, languages)
             rows = await conn.fetch(
                 f"""
                 WITH RECURSIVE tree AS (
@@ -724,13 +772,16 @@ async def inheritance_tree(
                 JOIN definitions d ON d.id = a.def_id
                 {_DEF_JOINS}
                 WHERE bf.branch_id = ANY($2::bigint[])
+                  {lang_clause}
                 ORDER BY d.id, bf.branch_id
                 """,
-                seed_ids, bids,
+                *params,
             )
             all_ids = [r["def_id"] for r in rows]
             if not all_ids:
                 all_ids = seed_ids
+                fb_params: list = [all_ids, bids]
+                fb_lang_clause = _lang_clause(fb_params, languages)
                 rows = await conn.fetch(
                     f"""
                     SELECT DISTINCT ON (d.id) {_DEF_COLS}
@@ -738,9 +789,10 @@ async def inheritance_tree(
                     {_DEF_JOINS}
                     WHERE d.id = ANY($1::bigint[])
                       AND bf.branch_id = ANY($2::bigint[])
+                      {fb_lang_clause}
                     ORDER BY d.id, bf.branch_id
                     """,
-                    all_ids, bids,
+                    *fb_params,
                 )
             edge_rows = await conn.fetch(
                 """
@@ -852,6 +904,7 @@ async def writers_of(
     branch_ids: int | list[int],
     name: str,
     *,
+    languages: list[str] | None = None,
     timeout_s: int = 120,
 ) -> list[DefInfo]:
     """Definitions that write to (or read+write) the named target.
@@ -860,7 +913,9 @@ async def writers_of(
     rules as `callers_of` (name, qualified_name, or `*.name` suffix). Returns
     a deduped DefInfo list of the writing functions.
     """
-    return await _data_accessors(pool, branch_ids, name, ("write", "readwrite"), timeout_s)
+    return await _data_accessors(
+        pool, branch_ids, name, ("write", "readwrite"), timeout_s, languages=languages
+    )
 
 
 async def readers_of(
@@ -868,10 +923,13 @@ async def readers_of(
     branch_ids: int | list[int],
     name: str,
     *,
+    languages: list[str] | None = None,
     timeout_s: int = 120,
 ) -> list[DefInfo]:
     """Definitions that read (or read+write) the named target."""
-    return await _data_accessors(pool, branch_ids, name, ("read", "readwrite"), timeout_s)
+    return await _data_accessors(
+        pool, branch_ids, name, ("read", "readwrite"), timeout_s, languages=languages
+    )
 
 
 async def _data_accessors(
@@ -880,6 +938,8 @@ async def _data_accessors(
     name: str,
     access_types: tuple[str, ...],
     timeout_s: int,
+    *,
+    languages: list[str] | None = None,
 ) -> list[DefInfo]:
     bids = _norm_branch_ids(branch_ids)
     async with pool.acquire() as conn:
@@ -888,6 +948,8 @@ async def _data_accessors(
             target_ids = await _resolve_def_ids(conn, bids, name)
             if not target_ids:
                 return []
+            params: list = [target_ids, list(access_types), bids]
+            lang_clause = _lang_clause(params, languages)
             rows = await conn.fetch(
                 f"""
                 SELECT DISTINCT ON (d.id) {_DEF_COLS}
@@ -898,9 +960,10 @@ async def _data_accessors(
                   AND da.access_type = ANY($2::text[])
                   AND da.branch_id = ANY($3::bigint[])
                   AND bf.branch_id = ANY($3::bigint[])
+                  {lang_clause}
                 ORDER BY d.id, bf.branch_id
                 """,
-                target_ids, list(access_types), bids,
+                *params,
             )
     return [_row_to_def(r) for r in rows]
 
@@ -1026,19 +1089,22 @@ async def entrypoints_reaching(
     *,
     max_depth: int | None = None,
     confidence: str | None = None,
+    languages: list[str] | None = None,
     timeout_s: int = 120,
 ) -> list[DefInfo]:
     """Entrypoints from which `target_name` is reachable via the call graph.
 
     Useful for "who can drain my funds" / "who can trigger this sensitive
     sink" investigations. Computed as `ancestors(target) ∩ entrypoints()`.
+    The `languages` filter applies to both the ancestor walk's returned rows and
+    the entrypoint set, so only in-language entrypoints come back.
     """
     anc = await ancestors(
         pool, branch_ids, target_name,
-        max_depth=max_depth, confidence=confidence, timeout_s=timeout_s,
+        max_depth=max_depth, confidence=confidence, languages=languages, timeout_s=timeout_s,
     )
     if not anc:
         return []
-    ep = await entrypoints(pool, branch_ids, timeout_s=timeout_s)
+    ep = await entrypoints(pool, branch_ids, languages=languages, timeout_s=timeout_s)
     ep_ids = {e.def_id for e in ep}
     return [a for a in anc if a.def_id in ep_ids]
