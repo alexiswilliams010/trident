@@ -9,6 +9,7 @@ from core.graph import (
     ancestors,
     callers_of,
     callees_of,
+    definitions_in_file,
     entrypoints,
     entrypoints_reaching,
     file_dependents,
@@ -31,6 +32,27 @@ async def _seed(pool, repo_id: int, branch_id: int, root: Path):
     await index_repo(pool, repo_id, branch_id, root)
     await resolve_repo(pool, repo_id, branch_id)
     await resolve_branch_imports(pool, repo_id, branch_id)
+
+
+async def test_definitions_in_file_lists_all_functions(clean_repo, python_fixture_root: Path):
+    pool, repo_id, branch_id = clean_repo
+    await _seed(pool, repo_id, branch_id, python_fixture_root)
+
+    # Module-level functions (would not all be entrypoints) are listed.
+    utils = await definitions_in_file(pool, branch_id, "utils.py", kind="function")
+    names = {d.name for d in utils}
+    assert {"helper", "double"} <= names
+
+    # Suffix match works, and the kind filter narrows to functions only.
+    main_all = await definitions_in_file(pool, branch_id, "mypackage/main.py")
+    main_fns = await definitions_in_file(pool, branch_id, "main.py", kind="function")
+    assert len(main_all) >= len(main_fns)
+    main_names = {d.name for d in main_fns}
+    # Includes the free function AND class methods (the enumeration entrypoints misses).
+    assert {"run", "greet", "add"} <= main_names
+
+    # Unknown file → empty, never an error.
+    assert await definitions_in_file(pool, branch_id, "does_not_exist.py") == []
 
 
 # ────────────────────────────────────────────────────────────────────

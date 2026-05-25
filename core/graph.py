@@ -505,6 +505,52 @@ async def entrypoints(
     return [_row_to_def(r) for r in rows]
 
 
+async def definitions_in_file(
+    pool: asyncpg.Pool,
+    branch_ids: int | list[int],
+    file_path: str,
+    *,
+    kind: str | None = None,
+    languages: list[str] | None = None,
+    timeout_s: int = 120,
+) -> list[DefInfo]:
+    """Every definition declared in `file_path`, optionally filtered by `kind`.
+
+    A straight listing from the definitions table — unlike `entrypoints` (only
+    externally-reachable defs) and `structural_query` (a call-graph walk, so it
+    returns nothing for definitions with no resolved call edges, e.g. signature-only
+    declarations), this returns the file's full surface: every definition regardless
+    of visibility or whether it has a body. Language-agnostic — it lists whatever the
+    indexer recorded for the file. Use it to enumerate a file's definitions.
+
+    `file_path` is matched as a suffix of the branch path, so "src/app.py" and
+    "app.py" both work (mirrors `entrypoints(file_path=...)`).
+    """
+    bids = _norm_branch_ids(branch_ids)
+    kind_clause = "AND d.kind = $3" if kind else ""
+    params: list = [bids, file_path]
+    if kind:
+        params.append(kind)
+    lang_clause = _lang_clause(params, languages)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _set_timeout(conn, timeout_s)
+            rows = await conn.fetch(
+                f"""
+                SELECT DISTINCT ON (d.id) {_DEF_COLS}
+                FROM definitions d
+                {_DEF_JOINS}
+                WHERE bf.branch_id = ANY($1::bigint[])
+                  AND bf.path LIKE '%%' || $2
+                  {kind_clause}
+                  {lang_clause}
+                ORDER BY d.id, bf.branch_id
+                """,
+                *params,
+            )
+    return [_row_to_def(r) for r in rows]
+
+
 async def entrypoint_paths(
     pool: asyncpg.Pool,
     branch_ids: int | list[int],
