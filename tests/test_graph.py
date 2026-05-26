@@ -9,6 +9,7 @@ from core.graph import (
     ancestors,
     callers_of,
     callees_of,
+    definitions_in_branch,
     definitions_in_file,
     entrypoints,
     entrypoints_reaching,
@@ -53,6 +54,34 @@ async def test_definitions_in_file_lists_all_functions(clean_repo, python_fixtur
 
     # Unknown file → empty, never an error.
     assert await definitions_in_file(pool, branch_id, "does_not_exist.py") == []
+
+
+async def test_definitions_in_branch_enumerates_whole_branch(
+    clean_repo, python_fixture_root: Path
+):
+    pool, repo_id, branch_id = clean_repo
+    await _seed(pool, repo_id, branch_id, python_fixture_root)
+
+    # Branch-wide enumeration is the union of every file's definitions: it must
+    # cover functions from multiple files in one call.
+    all_fns = await definitions_in_branch(pool, branch_id, kind="function")
+    names = {d.name for d in all_fns}
+    assert {"helper", "double", "run", "greet", "add"} <= names
+
+    # Grouping by file_path reconstructs each file's listing; the per-file slice
+    # must match definitions_in_file for that file (same source, no path filter).
+    by_file: dict[str, set[str]] = {}
+    for d in all_fns:
+        by_file.setdefault(d.file_path, set()).add(d.name)
+    utils_path = next(p for p in by_file if p.endswith("utils.py"))
+    utils_direct = await definitions_in_file(pool, branch_id, "utils.py", kind="function")
+    assert by_file[utils_path] == {d.name for d in utils_direct}
+
+    # No kind filter returns at least as much as the function-only filter.
+    assert len(await definitions_in_branch(pool, branch_id)) >= len(all_fns)
+
+    # An empty branch set → empty, never an error.
+    assert await definitions_in_branch(pool, []) == []
 
 
 # ────────────────────────────────────────────────────────────────────

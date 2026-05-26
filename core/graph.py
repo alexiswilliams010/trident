@@ -551,6 +551,47 @@ async def definitions_in_file(
     return [_row_to_def(r) for r in rows]
 
 
+async def definitions_in_branch(
+    pool: asyncpg.Pool,
+    branch_ids: int | list[int],
+    *,
+    kind: str | None = None,
+    languages: list[str] | None = None,
+    timeout_s: int = 120,
+) -> list[DefInfo]:
+    """Every definition across the branch set, optionally filtered by `kind`.
+
+    The branch-wide counterpart of `definitions_in_file`: the same straight listing
+    from the definitions table, but with no path filter, so it enumerates the full
+    indexed surface of the branch in one call. Language-agnostic; pass `languages`
+    to restrict to specific languages. Use it to build a complete file/definition
+    inventory of an indexed repo (e.g. group the results by `file_path`) without
+    iterating file-by-file.
+    """
+    bids = _norm_branch_ids(branch_ids)
+    kind_clause = "AND d.kind = $2" if kind else ""
+    params: list = [bids]
+    if kind:
+        params.append(kind)
+    lang_clause = _lang_clause(params, languages)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _set_timeout(conn, timeout_s)
+            rows = await conn.fetch(
+                f"""
+                SELECT DISTINCT ON (d.id) {_DEF_COLS}
+                FROM definitions d
+                {_DEF_JOINS}
+                WHERE bf.branch_id = ANY($1::bigint[])
+                  {kind_clause}
+                  {lang_clause}
+                ORDER BY d.id, bf.branch_id
+                """,
+                *params,
+            )
+    return [_row_to_def(r) for r in rows]
+
+
 async def entrypoint_paths(
     pool: asyncpg.Pool,
     branch_ids: int | list[int],
