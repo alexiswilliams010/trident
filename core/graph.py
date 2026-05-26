@@ -668,6 +668,54 @@ async def get_source(
     return result
 
 
+@dataclass
+class FileSource:
+    path: str
+    language: str
+    source: str
+
+
+async def get_file_source(
+    pool: asyncpg.Pool,
+    branch_ids: int | list[int],
+    file_path: str,
+    *,
+    languages: list[str] | None = None,
+    timeout_s: int = 120,
+) -> list[FileSource]:
+    """Return the full raw source of a file by path (vs `get_source`, which
+    returns a single definition's span). Matches an exact `branch_files.path`
+    or a trailing-path suffix, so callers can pass either the repo-relative
+    path or just a file name. Empty list when nothing matches."""
+    bids = _norm_branch_ids(branch_ids)
+    params: list = [bids, file_path]
+    lang_clause = _lang_clause(params, languages)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _set_timeout(conn, timeout_s)
+            rows = await conn.fetch(
+                f"""
+                SELECT DISTINCT ON (fv.id) bf.path, fv.language, fv.raw_content
+                FROM file_versions fv
+                JOIN branch_files bf ON bf.file_version_id = fv.id
+                JOIN branches b ON b.id = bf.branch_id
+                WHERE bf.branch_id = ANY($1::bigint[])
+                  AND (bf.path = $2 OR bf.path LIKE '%%/' || $2)
+                  {lang_clause}
+                ORDER BY fv.id
+                """,
+                *params,
+            )
+    return [
+        FileSource(
+            path=r["path"],
+            language=r["language"] or "",
+            source=r["raw_content"] or "",
+        )
+        for r in rows
+    ]
+
+
 # ────────────────────────────────────────────────────────────────────
 # Import queries
 # ────────────────────────────────────────────────────────────────────

@@ -15,6 +15,7 @@ from core.graph import (
     entrypoints_reaching,
     file_dependents,
     file_imports,
+    get_file_source,
     get_source,
     inheritance_tree,
     is_reachable,
@@ -266,6 +267,37 @@ async def test_get_source_handles_multibyte_utf8(clean_repo, tmp_path: Path):
     assert src is not None
     assert src.startswith("def regression_target")
     assert "return x + 1" in src
+
+
+# ────────────────────────────────────────────────────────────────────
+# get_file_source
+# ────────────────────────────────────────────────────────────────────
+
+
+async def test_get_file_source(clean_repo, python_fixture_root: Path):
+    pool, repo_id, branch_id = clean_repo
+    await _seed(pool, repo_id, branch_id, python_fixture_root)
+    files = await get_file_source(pool, branch_id, "utils.py")
+    assert len(files) >= 1
+    fs = files[0]
+    assert fs.path.endswith("utils.py")
+    # Whole file: multiple definitions present, not just one def's span.
+    assert "def helper" in fs.source
+    assert "def double" in fs.source
+
+
+async def test_get_file_source_matches_path_suffix(clean_repo, python_fixture_root: Path):
+    # A bare filename matches a repo-relative path by trailing-suffix.
+    pool, repo_id, branch_id = clean_repo
+    await _seed(pool, repo_id, branch_id, python_fixture_root)
+    by_name = await get_file_source(pool, branch_id, "utils.py")
+    assert by_name and "def helper" in by_name[0].source
+
+
+async def test_get_file_source_missing_returns_empty(clean_repo, python_fixture_root: Path):
+    pool, repo_id, branch_id = clean_repo
+    await _seed(pool, repo_id, branch_id, python_fixture_root)
+    assert await get_file_source(pool, branch_id, "does_not_exist_xyz.py") == []
 
 
 # ────────────────────────────────────────────────────────────────────
