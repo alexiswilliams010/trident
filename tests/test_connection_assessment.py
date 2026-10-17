@@ -118,7 +118,11 @@ class FixtureClient:
 
     async def decide(self, state, questions):
         self.calls += 1
-        assert json.loads(state)['focus']['candidate_id']
+        assert state.startswith('INSTRUCTIONS\n')
+        assert '\nSOURCE\n' in state and '\nTARGET\n' in state
+        assert 'candidate_id' not in state
+        assert 'Only Exact code identifies the endpoint' in state
+        assert len(questions) == 9
         if self.fail and self.calls == 2:
             raise RuntimeError('fixture failed')
         return response_for(questions)
@@ -150,6 +154,14 @@ async def test_persist_reuse_and_dependencies(corpus):
             assert await conn.fetchval("SELECT count(*) FROM connection_decision_dependencies WHERE decision_id=$1 AND path='missing.conf' AND content_hash IS NULL", UUID(did)) == 1
             proposal = json.loads(await conn.fetchval('SELECT proposal FROM connection_assessments WHERE decision_id=$1', UUID(did)))
             assert proposal['edges'][0]['verb'] == 'INVOKES'
+            request = json.loads(await conn.fetchval('SELECT request FROM connection_assessments WHERE decision_id=$1', UUID(did)))
+            assert request['state'].startswith('INSTRUCTIONS\n')
+            assert request['compact_input']['source']['exact_code']
+            assert set(request['evidence_map']) == {'source', 'target'}
+            assert set(proposal['evidence_roles']) == set(request['evidence_map'].values())
+            for eid in request['evidence_map'].values():
+                assert eid not in request['state']
+                assert await conn.fetchval('SELECT EXISTS(SELECT 1 FROM connection_evidence WHERE id=$1)', UUID(eid))
         assert not await conn.fetchval('SELECT EXISTS(SELECT 1 FROM cross_connections WHERE snapshot_id=$1)', snapshot.id)
 
 

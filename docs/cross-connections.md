@@ -281,9 +281,12 @@ decision_ids = await assess_packet(pool, packet_id, client)
 
 Obtain packet IDs from `connection_evidence_packets` for the preparation run.
 Assessment processes selected candidates only; an empty packet makes no model
-calls. It supplies the full bounded packet, alternatives, focused endpoint IDs,
-repository revisions, and context fingerprint. Source text is explicitly treated
-as data, never instructions. Jev chooses an outcome, direction/topology, established
+calls. Each candidate receives compact JSON evidence rendered as plaintext: exact
+source and target code, separately labeled surrounding context, and any explicitly
+requested additional context. Unrelated candidates and internal provenance IDs are
+excluded from model input. Clipping is marked explicitly. The full assessment
+policy appears once, followed by simplified questions without repeated policy text.
+Source text is explicitly treated as data, never instructions. Jev chooses an outcome, direction/topology, established
 or unresolved conditions, applicable verbs, and a role for each provided citation.
 Each question includes its own criteria; question identifiers carry no implicit
 meaning. No free-form graph JSON, generated citations, or protocol-specific
@@ -305,7 +308,12 @@ one interaction shape per candidate; unresolved conditional or multiple incompat
 behaviors must abstain rather than flatten into an inaccurate edge.
 
 Requests, returned model identity, distributions, confidence, usage/metadata, and
-proposals are stored for audit. Provider confidence is not treated as calibrated
+proposals are stored for audit. Stored requests also retain the compact JSON and
+the mapping from short evidence labels to immutable source citations; those
+sidecars are not sent to the model. Evidence labels in proposals are converted back
+to stored citation IDs before persistence. The policy version
+`cross-repo-assessment-v2-compact-plaintext` prevents reuse of older prompt results.
+Provider confidence is not treated as calibrated
 certainty or copied into `connection_decisions.score`; the full answer is retained.
 Malformed choices, incomplete distributions, unexpected models, failed HTTP calls,
 and timeouts fail the operation rather than becoming negative decisions. No silent
