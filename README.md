@@ -12,8 +12,9 @@ Cross-repository candidate retrieval is available through Python APIs: capture
 committed snapshots of at least two repositories, extract calls and searchable
 targets, embed their inputs, and retrieve candidates using vector, lexical, and
 exact-token matches. See [cross-repository connections](docs/cross-connections.md)
-for usage and limits. Decision-model classification and component projection are
-not implemented yet.
+for usage and limits. Reranking through an injected scorer and bounded, cited
+evidence packets are also available. Decision-model classification and component
+projection are not implemented yet.
 
 ## Prerequisites
 

@@ -1,9 +1,10 @@
 # Cross-repository connections
 
 Status: contracts, committed-source capture, decision reuse tracking, call-site
-extraction, and cross-repository candidate retrieval are implemented as Python
-APIs. Retrieval can invoke an explicitly supplied embedder. Reranking, decision
-model calls, connection CLI, and component projection are not implemented yet.
+extraction, cross-repository retrieval, reranking, and bounded evidence assembly
+are implemented as Python APIs. Embedding and reranking use explicitly supplied
+callables. Decision model calls, connection CLI, and component projection are
+not implemented yet.
 
 ## Eligibility and scope
 
@@ -37,6 +38,9 @@ is retrieval metadata, not a traversable connection.
 | connection_retrieval_runs | Corpus identity, retrieval settings, and completed runs |
 | connection_candidate_sets | Per-call candidate fingerprints, including empty results |
 | connection_candidate_matches | Run-specific ranks and channel provenance |
+| connection_preparation_runs | Reranker identity, preparation settings, and completion |
+| connection_evidence_packets | Per-source alternatives and bounded cited context |
+| connection_packet_evidence | Snapshot-checked links to stored excerpts |
 | connection_resources | Snapshot-scoped shared resources |
 | connection_candidates | Cross-repository site pairs and retrieval metadata |
 | connection_evidence | Source coordinates, content hash, and retained excerpt |
@@ -190,14 +194,66 @@ proof of behavioral correspondence or guaranteed recall.
 channel scores, and fingerprints. Changing retrieval settings creates a separate
 run without overwriting earlier rankings. Repeated identical runs reuse their
 records. It creates no decisions, verbs, or graph edges. Empty results do not prove
-that no cross-repository behavior exists; reranking and evidence assessment come
-next. Direct SQL mutation of completed indexes/runs is not a supported update path;
+that no cross-repository behavior exists; preparation follows, then decision-model
+assessment. Direct SQL mutation of completed indexes/runs is not a supported update path;
 change inputs/settings and create a new version instead.
 
 This initial implementation uses exact vector scans and serial per-input retrieval,
 with repeated inputs cached within a run. It has no ANN index or large-corpus
 performance claim. Tests use controlled vectors to verify channel behavior and
 fixture recall, not to measure production embedding quality.
+
+## Reranking and evidence packets
+
+```python
+from core.connections.preparation import RerankerIdentity, prepare_candidates
+
+prepared = await prepare_candidates(
+    pool, run.id, rerank_fn,
+    RerankerIdentity(provider="your-provider", model_version="pinned-model-version"),
+    additional_paths=((repo_id, "config/routing.yaml"),),
+)
+```
+
+`rerank_fn(query, documents)` is an async callable returning one finite numeric
+score per document **in input order**. Higher scores rank first; ties preserve
+retrieval order. Provider adapters that return sorted results must restore input
+order. No provider endpoint or SDK is assumed, and no default heuristic silently
+substitutes for a reranker. The caller supplies the adapter and explicitly pins
+its provider/model/input versions. Reranking is relative relevance, not calibrated
+confidence or acceptance of a relationship.
+
+All retrieved alternatives are scored. Each packet retains candidate IDs, original
+ranks/channel provenance, scores, selection status, and input clipping flags.
+Defaults select five targets and cap each query/document at 4,000 characters.
+Empty candidate sets produce explicit empty packets without invoking the scorer.
+Changing identity, options, or requested context creates a new preparation run;
+repeating identical inputs reuses completed packets without external calls.
+
+Evidence comes only from captured source blobs. Source and selected targets each
+receive a reserved excerpt budget, prioritizing the endpoint over surrounding
+context. Default limits are 3,000 UTF-8 bytes per excerpt, 500 surrounding bytes,
+24,000 excerpt bytes per packet, and 12 excerpts. Limits concern excerpt content,
+not JSON metadata or model tokens. Large sites retain their original coordinates
+in `interaction_sites`; packet citations record the actual aligned excerpt range
+and whether site/context was clipped. Text is source material for later assessment,
+not an instruction to a model and not pre-labelled support or contradiction.
+
+Up to 32 explicit additional paths can supply configuration or other context from
+any snapshot member. No protocol-specific path discovery or evidence-expansion
+agent is introduced. Dependencies retain path, mode, and content hash; missing,
+binary, non-UTF-8, symlink/gitlink, and budget-omitted context is reported explicitly.
+The later decision stage must carry packet dependencies, including missing paths,
+into decision-input tracking. Bounded context may be insufficient; that must remain
+a valid outcome for the decision model.
+
+Packets live in `connection_evidence_packets.payload`, with a fingerprint and
+normalized links to `connection_evidence`. Preparation writes no decisions or
+graph edges, and leaves prior retrieval rankings unchanged. Publication is atomic
+for the entire run: malformed scores, exceptions, and scorer timeouts roll back
+all its packets. The default timeout is 60 seconds per source. This initial API
+serializes preparation under the snapshot lock and holds its database transaction
+during scorer calls; it has no parallel worker or partial-run resume mechanism.
 
 ## Directed vocabulary, version 1
 
@@ -265,7 +321,6 @@ decision may be staged without edges, but cannot publish any edge without suppor
 
 ## Remaining phases
 
-4. Reranking and bounded evidence assembly.
 5. Jev integration, support assessment, and verb selection/normalization.
 6. Atomic graph revisions, CLI, and combined graph queries.
 7. Component membership and projection with drill-down evidence.
@@ -286,3 +341,7 @@ Snapshot/invalidation coverage is in `tests/test_snapshot_dependencies.py`; vect
 identity and legacy migration coverage is in `tests/test_embedding_identity.py`.
 Call extraction, vector reuse, channel fusion, and snapshot-scoped retrieval are
 covered by `tests/test_connection_retrieval.py`.
+
+Reranker validation, packet budgets, captured excerpts, rollback, and reuse are
+covered by `tests/test_connection_preparation.py`. Tests use controlled scorers;
+provider integration and model-quality evaluation remain separate work.
