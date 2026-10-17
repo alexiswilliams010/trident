@@ -3,8 +3,8 @@
 Status: contracts, committed-source capture, decision reuse tracking, call-site
 extraction, cross-repository retrieval, reranking, and bounded evidence assembly
 are implemented as Python APIs. Embedding and reranking use explicitly supplied
-callables. Decision model calls, connection CLI, and component projection are
-not implemented yet.
+callables. Jev assessment through Vercel AI Gateway is implemented. Graph
+publication, connection CLI, and component projection are not implemented yet.
 
 ## Eligibility and scope
 
@@ -45,6 +45,7 @@ is retrieval metadata, not a traversable connection.
 | connection_candidates | Cross-repository site pairs and retrieval metadata |
 | connection_evidence | Source coordinates, content hash, and retained excerpt |
 | connection_decisions | Outcome, model/policy provenance, evidence fingerprint, conditions |
+| connection_assessments | Exact typed requests/answers, packet identity, and proposed verbs |
 | connection_decision_evidence | Evidence association and support/contradiction/context role |
 | connection_decision_inputs | Versioned input and decision fingerprints |
 | connection_decision_dependencies | Endpoint/evidence file dependencies, including missing files |
@@ -243,7 +244,7 @@ Up to 32 explicit additional paths can supply configuration or other context fro
 any snapshot member. No protocol-specific path discovery or evidence-expansion
 agent is introduced. Dependencies retain path, mode, and content hash; missing,
 binary, non-UTF-8, symlink/gitlink, and budget-omitted context is reported explicitly.
-The later decision stage must carry packet dependencies, including missing paths,
+The decision stage carries packet dependencies, including missing paths,
 into decision-input tracking. Bounded context may be insufficient; that must remain
 a valid outcome for the decision model.
 
@@ -254,6 +255,72 @@ for the entire run: malformed scores, exceptions, and scorer timeouts roll back
 all its packets. The default timeout is 60 seconds per source. This initial API
 serializes preparation under the snapshot lock and holds its database transaction
 during scorer calls; it has no parallel worker or partial-run resume mechanism.
+
+## Jev assessment through Vercel
+
+The adapter uses Vercel's documented [TypeSafe-compatible endpoint](https://vercel.com/docs/ai-gateway/sdks-and-apis/typesafe)
+with typed Choice questions, rather than chat completions. It defaults to
+`https://ai-gateway.vercel.sh/typesafe/v1/systemone` and the pinned model
+`typesafe-ai/jev-1.14.0`. Vercel documents that versioned model ID in its
+[Jev integration guide](https://vercel.com/i/jev-integrations). Authentication uses
+`AI_GATEWAY_API_KEY` or `VERCEL_OIDC_TOKEN`. `JEV_MODEL` can select another pinned
+model. Credentials are not included in stored requests or configuration reprs.
+The HTTP client is separately configurable for compatible HTTPS endpoints.
+
+```python
+from core.connections.jev import JevClient, JevConfig
+from core.connections.assessment import assess_packet
+
+client = JevClient(JevConfig.from_env())
+decision_ids = await assess_packet(pool, packet_id, client)
+```
+
+Obtain packet IDs from `connection_evidence_packets` for the preparation run.
+Assessment processes selected candidates only; an empty packet makes no model
+calls. It supplies the full bounded packet, alternatives, focused endpoint IDs,
+repository revisions, and context fingerprint. Source text is explicitly treated
+as data, never instructions. Jev chooses an outcome, direction/topology, established
+or unresolved conditions, applicable verbs, and a role for each provided citation.
+Each question includes its own criteria; question identifiers carry no implicit
+meaning. No free-form graph JSON, generated citations, or protocol-specific
+classification rules are required.
+
+Supported decisions require supporting citations at both actual endpoint sites.
+Unresolved conditions, missing endpoint support, missing verbs, or an unidentified
+shared resource downgrade to insufficient evidence. Contradictory evidence causes
+abstention as ambiguous. Unsupported, ambiguous, and insufficient-evidence outcomes
+produce no proposed edges. The code checks citation membership, source identity,
+site overlap, packet fingerprints, and candidate membership before inference.
+
+Direct proposals carry an allowed site-target verb in either direction. Shared
+resource proposals carry two site-to-resource verbs, including PRODUCES/CONSUMES,
+and an evidence anchor selected from supplied excerpts. That anchor is **not** a
+canonical resource ID or permission to merge similarly named resources. Resource
+identity and materialization remain publication work. This initial policy handles
+one interaction shape per candidate; unresolved conditional or multiple incompatible
+behaviors must abstain rather than flatten into an inaccurate edge.
+
+Requests, returned model identity, distributions, confidence, usage/metadata, and
+proposals are stored for audit. Provider confidence is not treated as calibrated
+certainty or copied into `connection_decisions.score`; the full answer is retained.
+Malformed choices, incomplete distributions, unexpected models, failed HTTP calls,
+and timeouts fail the operation rather than becoming negative decisions. No silent
+fallback model is enabled. The client retries transport errors and transient HTTP
+statuses with bounded exponential backoff (two retries by default). A 180-second
+outer deadline bounds each decision request including retries.
+
+Assessment publishes a packet's decisions atomically and reuses identical packet,
+candidate, provider/model, question, and policy inputs. Like preparation, it holds
+a snapshot lock and transaction during model calls. Dependency tracking includes
+all packet paths, missing paths, and endpoint files; proposal/request/response
+mutation invalidates recorded reuse. Cross-snapshot reuse is conservative because
+candidate-set fingerprints currently include snapshot-specific site IDs.
+
+This stage writes decisions and proposals only, never `cross_connections` or
+resource rows. Decision-model quality is not established by mocked transport tests;
+live credentials and a labeled cross-repository evaluation set are still needed
+for deployment validation. The adapter makes real paid requests only when called
+by the application; no live model request is part of the test suite.
 
 ## Directed vocabulary, version 1
 
@@ -321,7 +388,6 @@ decision may be staged without edges, but cannot publish any edge without suppor
 
 ## Remaining phases
 
-5. Jev integration, support assessment, and verb selection/normalization.
 6. Atomic graph revisions, CLI, and combined graph queries.
 7. Component membership and projection with drill-down evidence.
 8. Neptune orchestration, caching, and held-out-family evaluation.
@@ -345,3 +411,6 @@ covered by `tests/test_connection_retrieval.py`.
 Reranker validation, packet budgets, captured excerpts, rollback, and reuse are
 covered by `tests/test_connection_preparation.py`. Tests use controlled scorers;
 provider integration and model-quality evaluation remain separate work.
+
+Jev HTTP contract, abstention, proposal direction, persistence, and failure coverage
+live in `tests/test_connection_assessment.py`.

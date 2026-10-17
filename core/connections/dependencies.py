@@ -57,6 +57,10 @@ async def _decision_state(conn, decision_id):
                "score": decision["score"],
                "conditions": json.loads(decision["conditions"]),
                "sites": [dict(row) for row in sites], "evidence": [dict(row) for row in evidence]}
+    assessment = await conn.fetchrow(
+        "SELECT request,response,proposal FROM connection_assessments WHERE decision_id=$1", decision_id)
+    if assessment:
+        payload["assessment"] = {key: json.loads(value) for key, value in assessment.items()}
     paths = {(row["repo_id"], row["path"]) for row in (*sites, *evidence)}
     return decision, fingerprint(payload), paths
 
