@@ -5,7 +5,7 @@ extraction, cross-repository retrieval, reranking, and bounded evidence assembly
 are implemented as Python APIs. Embedding and reranking use explicitly supplied
 callables. Jev assessment through Vercel AI Gateway is implemented. Graph
 publication, pipeline CLI, and combined call-graph queries are implemented.
-Component projection is not implemented yet.
+Deterministic component membership and evidence-backed projection are implemented.
 
 ## Eligibility and scope
 
@@ -54,6 +54,7 @@ is retrieval metadata, not a traversable connection.
 | cross_connections | Directed edges supported by a decision; retained across revisions |
 | connection_graph_revisions | Immutable graph payloads with captured evidence and optional parser links |
 | connection_active_graphs | Atomic active-revision pointer for each snapshot |
+| connection_component_projections | Immutable membership maps and aggregated graphs tied to graph revisions |
 
 Parser node/definition references on sites are optional navigation hints and can
 be cleared when parser objects are removed. They are not historical evidence.
@@ -411,8 +412,87 @@ this. Jev configuration is shared with assessment. No command runs a model durin
 `show`, `neighbors`, or `publish`. Repeat `--decision` for full desired membership;
 use `--empty` for an explicit retraction. Add `--parser-branch ID` at publication,
 then `--include-parser` for combined neighborhoods. Use `--revision ID` instead of
-`--snapshot ID` to inspect historical revisions. Component projection and Neptune
-orchestration remain separate work.
+`--snapshot ID` to inspect historical revisions. Component commands are described below. Neptune orchestration remains separate work.
+
+## Component membership and projection
+
+A component graph is derived from one immutable published graph revision. It makes
+no model calls and infers no new relationships. By default, code nodes belong to
+one component per canonical repository. Optional `ComponentRule(repo_id, key,
+label, prefix="")` entries partition a repository into named services, packages,
+or other components using explicit path boundaries.
+
+Rules match a complete path or a directory prefix followed by `/`; `src/pay` does
+not match `src/payments`. The longest matching prefix wins. An empty prefix covers
+the whole repository, and unmatched paths use the repository fallback. Multiple
+prefixes may share a component key and label. Conflicting assignments at one
+prefix or conflicting labels for one key are rejected. Keys are repository-scoped,
+so a shared label never collapses nodes from different repositories. There are no
+implicit service guesses, glob rules, or protocol-specific manifest handlers.
+
+Membership is recorded for code nodes present in the published graph, including
+optional captured parser nodes; it is not a full inventory of every file or symbol
+in a repository. Rules matching no published nodes are reported as unused. Component
+nodes may be isolated when only parser nodes belong to them. Parser edges are
+excluded from the component connection graph, keeping projected relationships
+strictly cross-repository. No CONTAINS or similarity edges are generated.
+
+Connections aggregate only when component source, component/resource target, verb,
+vocabulary version, and conditions all match. Different environments/conditions,
+verbs, or directions stay separate. Resource nodes retain their published identity
+and direction; PRODUCES/CONSUMES legs never become an invented direct call. The
+existing candidate-pair resource scope is retained, without cross-pair merging.
+
+Each projected edge stores original connection indices and decision IDs plus counts.
+These counts describe stored connections and distinct decisions, not independent
+corroboration or confidence. No averaging of model confidence occurs. Drill-down
+returns contributing connections, all connection legs for their decisions, endpoint
+metadata, resource anchors, conditions, and the exact historical evidence excerpts.
+This preserves both resource participants even when drilling into just one leg.
+
+```python
+from core.connections.components import (
+    ComponentRule, create_projection, read_projection, explain_component_edge,
+)
+
+projection_id = await create_projection(pool, revision_id, (
+    ComponentRule(1, "billing", "Billing service", "services/billing"),
+    ComponentRule(2, "reporting", "Reporting worker", "src/reporting"),
+))
+view = await read_projection(pool, projection_id)
+detail = await explain_component_edge(pool, projection_id, edge_id)
+```
+
+The projection stores its parent graph revision ID/fingerprint, rules, memberships,
+lightweight nodes, and aggregate edges in one immutable database record. Repeating
+the same graph and rules reuses it; changing rules or parent revision creates a
+new projection. Activating a newer code graph does not rewrite old projections or
+change their drill-down evidence. Deleting the parent snapshot/revision cascades to
+its projections. Projection currently loads full graph JSON and stores membership
+maps in JSON; large-corpus indexing/streaming remains future work.
+
+The CLI accepts a JSON list of rules (omit `--rules` for repository defaults):
+
+```json
+[
+  {"repo_id": 1, "key": "billing", "label": "Billing service", "prefix": "services/billing"},
+  {"repo_id": 2, "key": "reporting", "label": "Reporting worker", "prefix": "src/reporting"}
+]
+```
+
+```sh
+python -m cli.connections project --revision REVISION_ID --rules components.json
+python -m cli.connections components --projection PROJECTION_ID
+python -m cli.connections component-neighbors --projection PROJECTION_ID --node COMPONENT_ID --hops 2
+python -m cli.connections explain-component-edge --projection PROJECTION_ID --edge EDGE_ID
+```
+
+`components` omits the code-node membership map by default; add `--memberships` to
+inspect it. Neighborhoods support direction and node limits with truncation flags,
+using the same bounds as code-graph queries. Resource traversal retains directed
+verbs. No command in this projection sequence uses an embedding or decision model.
+An empty graph yields an empty projection; it is not evidence that the repositories
+have no interactions.
 
 ## Directed vocabulary, version 1
 
@@ -480,11 +560,8 @@ decision may be staged without edges, but cannot publish any edge without suppor
 
 ## Remaining phases
 
-7. Component membership and projection with drill-down evidence.
 8. Neptune orchestration, caching, and held-out-family evaluation.
 
-Component tables are intentionally deferred to Phase 7. They will project these
-connections, not ask a second model to independently infer component edges.
 
 ## Validation
 
@@ -509,3 +586,6 @@ live in `tests/test_connection_assessment.py`.
 Publication atomicity, historical graph isolation, parser capture, resource
 direction, and a mocked end-to-end CLI flow are covered by
 `tests/test_connection_publication.py`.
+
+Component rules, aggregation boundaries, historical drill-down, resource direction,
+and CLI behavior are covered by `tests/test_connection_components.py`.

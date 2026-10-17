@@ -8,6 +8,9 @@ from dataclasses import asdict, replace
 from pathlib import Path
 import sys
 
+from core.connections.components import (
+    ComponentRule, create_projection, read_projection, explain_component_edge, component_neighborhood,
+)
 from core.connections.assessment import assess_packet
 from core.connections.jev import JevClient, JevConfig, JevReranker
 from core.connections.snapshots import RepositoryInput, capture_snapshot
@@ -46,6 +49,21 @@ def parser():
     selection.add_argument('--decision', action='append')
     selection.add_argument('--empty', action='store_true', help='Publish an explicitly empty cross-repository graph')
     publish.add_argument('--parser-branch', type=int, action='append', default=[])
+    project = commands.add_parser('project', help='Project a published revision into a component graph (no model calls)')
+    project.add_argument('--revision', required=True)
+    project.add_argument('--rules', type=Path, help='JSON list of repository/path component rules')
+    for name in ('components', 'component-neighbors', 'explain-component-edge'):
+        command = commands.add_parser(name)
+        command.add_argument('--projection', required=True)
+        if name == 'components':
+            command.add_argument('--memberships', action='store_true', help='Include the full code-node membership map')
+        elif name == 'explain-component-edge':
+            command.add_argument('--edge', required=True)
+        else:
+            command.add_argument('--node', required=True)
+            command.add_argument('--hops', type=int, default=1)
+            command.add_argument('--direction', choices=('both', 'out', 'in'), default='both')
+            command.add_argument('--max-nodes', type=int, default=200)
     for name in ('show', 'neighbors'):
         command = commands.add_parser(name)
         selector = command.add_mutually_exclusive_group(required=True)
@@ -62,6 +80,27 @@ def parser():
 
 async def run(args):
     async with pool_ctx() as pool:
+        if args.command == 'project':
+            rules = ()
+            if args.rules:
+                try:
+                    raw = json.loads(args.rules.read_text())
+                    if not isinstance(raw, list):
+                        raise ValueError('Component rules must be a JSON list')
+                    rules = tuple(ComponentRule(**rule) for rule in raw)
+                except (OSError, TypeError) as error:
+                    raise ValueError(f'Cannot load component rules: {error}') from None
+            return {'projection_id': await create_projection(pool, args.revision, rules)}
+        if args.command == 'explain-component-edge':
+            return await explain_component_edge(pool, args.projection, args.edge)
+        if args.command in {'components', 'component-neighbors'}:
+            result = await read_projection(pool, args.projection)
+            if args.command == 'component-neighbors':
+                result['projection'] = component_neighborhood(result['projection'], args.node,
+                    hops=args.hops, direction=args.direction, max_nodes=args.max_nodes)
+            elif not args.memberships:
+                result['projection'].pop('memberships')
+            return result
         if args.command == 'capture':
             repositories = []
             for spec in args.repo:

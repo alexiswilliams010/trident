@@ -15,8 +15,8 @@ exact-token matches. See [cross-repository connections](docs/cross-connections.m
 for usage and limits. Reranking through an injected scorer and bounded, cited
 evidence packets are also available. Jev assessment through Vercel AI Gateway
 records evidence-backed decisions and proposed verbs. Use `python -m cli.connections --help` for the pipeline, atomic graph publication, historical
-reads, and combined call-graph queries. Component projection is not implemented
-yet.
+reads, and combined call-graph queries. Component projections group published connections with configurable path rules
+and preserve drill-down to their original evidence.
 
 ## Prerequisites
 
