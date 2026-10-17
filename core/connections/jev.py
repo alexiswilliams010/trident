@@ -85,7 +85,12 @@ def validate_answers(result: dict, questions: dict, model: str):
         if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
                or not 0 <= v <= 1 for v in values):
             raise ValueError("Jev probabilities and confidence must be finite in [0,1]")
-        if not math.isclose(sum(probabilities.values()), 1, abs_tol=1e-4):
+        # Live Jev responses round probabilities to hundredths. Allow only the
+        # accumulated rounding error for that precision; retain the raw values.
+        rounded = all(math.isclose(p * 100, round(p * 100), abs_tol=1e-9)
+                      for p in probabilities.values())
+        tolerance = .005 * len(probabilities) + 1e-9 if rounded else 1e-4
+        if sum(probabilities.values()) <= 0 or not math.isclose(sum(probabilities.values()), 1, abs_tol=tolerance):
             raise ValueError("Jev probabilities must sum to one")
         if probabilities[answer["choice"]] < max(probabilities.values()) - 1e-6:
             raise ValueError("Jev choice disagrees with its distribution")
@@ -98,7 +103,7 @@ class JevReranker:
         from .preparation import RerankerIdentity
         self.client = client
         self.identity = RerankerIdentity(client.identity['provider'], client.identity['model_version'],
-                                         'jev-relevance-v1')
+                                         'jev-relevance-v2')
 
     async def rerank(self, query: str, documents: list[str]) -> list[float]:
         import json
@@ -113,5 +118,6 @@ class JevReranker:
         for document in documents:
             result = await self.client.decide(json.dumps({'source': query, 'target': document}), questions)
             probabilities = result['answers']['relevance']['probabilities']
-            scores.append(probabilities['possible'] + 2 * probabilities['relevant'])
+            scores.append((probabilities['possible'] + 2 * probabilities['relevant'])
+                          / sum(probabilities.values()))
         return scores

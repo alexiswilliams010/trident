@@ -227,9 +227,12 @@ async def retrieve_candidates(
 async def retrieve_all_candidates(
     pool: asyncpg.Pool, snapshot_id: str | UUID, index_version: str,
     identity: EmbeddingIdentity, options: RetrievalOptions = RetrievalOptions(),
+    *, source_site_ids: tuple[str | UUID, ...] | None = None,
 ) -> RetrievalRun:
     """Persist bounded candidate sets for every call, including empty sets.
 
+    An explicit source subset supports bounded evaluation against the full target
+    corpus. Its IDs are recorded in run settings; None retains all-call behavior.
     Rankings are run-scoped. Reranking, evidence assembly, and relationship
     classification consume these records separately.
     """
@@ -245,6 +248,12 @@ async def retrieve_all_candidates(
         corpus = fingerprint([[r["repo_id"], r["path"], r["start_byte"], r["end_byte"],
                                r["kind"], r["content_hash"], r["retrieval_hash"]] for r in sites])
         settings = {"algorithm": RETRIEVAL_VERSION, **asdict(options)}
+        selected = None if source_site_ids is None else {UUID(str(value)) for value in source_site_ids}
+        if selected is not None:
+            available = {row["id"] for row in sites if row["kind"] == "call"}
+            if not selected <= available:
+                raise ValueError("Selected sources must be call sites in this snapshot index")
+            settings["source_site_ids"] = sorted(str(value) for value in selected)
         run_key = fingerprint([str(sid), index_version, corpus, asdict(identity), settings])
         existing = await conn.fetchrow("SELECT * FROM connection_retrieval_runs WHERE run_key=$1", run_key)
         if existing:
@@ -263,7 +272,7 @@ async def retrieve_all_candidates(
         source_count = candidate_count = 0
         cache = {}
         for source in sites:
-            if source["kind"] != "call":
+            if source["kind"] != "call" or (selected is not None and source["id"] not in selected):
                 continue
             source_count += 1
             # Equal input in the same repo has the same retrieval neighborhood,

@@ -210,3 +210,26 @@ async def test_changed_proposal_invalidates_reuse(corpus):
         assert (await assess_decision_reuse(conn, did, snapshot.id, versions)).reusable
         await conn.execute("UPDATE connection_assessments SET proposal='{}' WHERE decision_id=$1", did)
         assert 'decision_or_evidence_changed' in (await assess_decision_reuse(conn, did, snapshot.id, versions)).reasons
+
+
+@pytest.mark.parametrize('distribution,valid', [
+    ({'unrelated': .81, 'possible': .17, 'relevant': .01}, True),
+    ({'unrelated': .81, 'possible': .19, 'relevant': .01}, True),
+    ({'unrelated': .80, 'possible': .17, 'relevant': .01}, False),
+    ({'unrelated': .811, 'possible': .17, 'relevant': .01}, False),
+])
+async def test_gateway_rounded_probabilities(distribution, valid):
+    from core.connections.jev import JevReranker
+    response = {'model': MODEL, 'answers': {'relevance': {
+        'type': 'choice', 'choice': 'unrelated', 'confidence': .72,
+        'probabilities': distribution}}}
+    client = JevClient(JevConfig('fixture'), transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json=response)))
+    if valid:
+        score = (await JevReranker(client).rerank('source', ['target']))[0]
+        assert score == pytest.approx((distribution['possible'] + 2 * distribution['relevant'])
+                                      / sum(distribution.values()))
+        assert response['answers']['relevance']['probabilities'] == distribution
+    else:
+        with pytest.raises(ValueError, match='sum to one'):
+            await JevReranker(client).rerank('source', ['target'])

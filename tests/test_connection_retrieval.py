@@ -217,3 +217,23 @@ async def test_failed_extraction_rolls_back_and_unsealed_rejected(corpus, monkey
     with pytest.raises(ValueError, match="sealed"):
         await index_snapshot_sites(pool, draft)
     assert embedder.inputs == []
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_explicit_source_subset_keeps_full_target_corpus(corpus):
+    pool, inputs, snapshot = corpus
+    index = await index_snapshot_sites(pool, snapshot.id)
+    embedder = Embedder()
+    await embed_snapshot_sites(pool, snapshot.id, index.index_version, embedder.embed)
+    async with pool.acquire() as conn:
+        source = await conn.fetchval("SELECT id FROM interaction_sites WHERE snapshot_id=$1 AND repo_id=$2 AND kind='call' LIMIT 1", snapshot.id, inputs[0].repo_id)
+    run = await retrieve_all_candidates(pool, snapshot.id, index.index_version, embedder.embedding_identity,
+                                       source_site_ids=(source,))
+    assert run.source_count == 1 and run.candidate_count > 0
+    assert await retrieve_all_candidates(pool, snapshot.id, index.index_version, embedder.embedding_identity,
+                                         source_site_ids=(source, source)) == run
+    async with pool.acquire() as conn:
+        assert await conn.fetchval('SELECT count(*) FROM connection_candidate_sets WHERE run_id=$1', UUID(run.id)) == 1
+    with pytest.raises(ValueError, match='Selected sources'):
+        await retrieve_all_candidates(pool, snapshot.id, index.index_version, embedder.embedding_identity,
+                                      source_site_ids=(UUID(int=0),))
