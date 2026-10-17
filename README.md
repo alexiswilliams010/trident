@@ -14,8 +14,9 @@ targets, embed their inputs, and retrieve candidates using vector, lexical, and
 exact-token matches. See [cross-repository connections](docs/cross-connections.md)
 for usage and limits. Reranking through an injected scorer and bounded, cited
 evidence packets are also available. Jev assessment through Vercel AI Gateway
-records evidence-backed decisions and proposed verbs. Graph publication and
-component projection are not implemented yet.
+records evidence-backed decisions and proposed verbs. Use `python -m cli.connections --help` for the pipeline, atomic graph publication, historical
+reads, and combined call-graph queries. Component projection is not implemented
+yet.
 
 ## Prerequisites
 

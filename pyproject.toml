@@ -43,6 +43,7 @@ target-version = "py312"
 
 [project.scripts]
 trident-graph = "cli.graph:main"
+trident-connections = "cli.connections:main"
 trident-benchmark = "benchmark.cli:main"
 
 [build-system]

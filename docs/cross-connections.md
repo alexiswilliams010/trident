@@ -4,7 +4,8 @@ Status: contracts, committed-source capture, decision reuse tracking, call-site
 extraction, cross-repository retrieval, reranking, and bounded evidence assembly
 are implemented as Python APIs. Embedding and reranking use explicitly supplied
 callables. Jev assessment through Vercel AI Gateway is implemented. Graph
-publication, connection CLI, and component projection are not implemented yet.
+publication, pipeline CLI, and combined call-graph queries are implemented.
+Component projection is not implemented yet.
 
 ## Eligibility and scope
 
@@ -50,7 +51,9 @@ is retrieval metadata, not a traversable connection.
 | connection_decision_inputs | Versioned input and decision fingerprints |
 | connection_decision_dependencies | Endpoint/evidence file dependencies, including missing files |
 | connection_verbs | Versioned definitions and allowed endpoint kinds |
-| cross_connections | Directed edges supported by a decision |
+| cross_connections | Directed edges supported by a decision; retained across revisions |
+| connection_graph_revisions | Immutable graph payloads with captured evidence and optional parser links |
+| connection_active_graphs | Atomic active-revision pointer for each snapshot |
 
 Parser node/definition references on sites are optional navigation hints and can
 be cleared when parser objects are removed. They are not historical evidence.
@@ -295,8 +298,8 @@ site overlap, packet fingerprints, and candidate membership before inference.
 Direct proposals carry an allowed site-target verb in either direction. Shared
 resource proposals carry two site-to-resource verbs, including PRODUCES/CONSUMES,
 and an evidence anchor selected from supplied excerpts. That anchor is **not** a
-canonical resource ID or permission to merge similarly named resources. Resource
-identity and materialization remain publication work. This initial policy handles
+canonical resource ID or permission to merge similarly named resources. Publication materializes this as an evidence-scoped resource without globally
+merging matching names. This initial policy handles
 one interaction shape per candidate; unresolved conditional or multiple incompatible
 behaviors must abstain rather than flatten into an inaccurate edge.
 
@@ -316,11 +319,100 @@ all packet paths, missing paths, and endpoint files; proposal/request/response
 mutation invalidates recorded reuse. Cross-snapshot reuse is conservative because
 candidate-set fingerprints currently include snapshot-specific site IDs.
 
-This stage writes decisions and proposals only, never `cross_connections` or
-resource rows. Decision-model quality is not established by mocked transport tests;
+Assessment writes decisions and proposals only. The separate publication
+operation materializes `cross_connections` and resource rows. Decision-model quality is not established by mocked transport tests;
 live credentials and a labeled cross-repository evaluation set are still needed
 for deployment validation. The adapter makes real paid requests only when called
 by the application; no live model request is part of the test suite.
+
+## Publication and combined queries
+
+`publish_graph(pool, snapshot_id, decision_ids, branch_ids=())` replaces active
+membership with **exactly** the explicitly selected decisions. It rejects
+unsupported/untracked decisions, mixed snapshots or site-index versions, multiple
+decisions for one candidate, invalid endpoints/verbs, and inputs changed since
+assessment. A revision may be explicitly empty to retract all active connections.
+Supported decisions not selected for the new revision are not carried forward.
+
+Resource proposals become nodes scoped to the candidate endpoint pair, context,
+and source evidence anchor. Both legs publish together. Matching topic names do
+not automatically unify resources across different candidate pairs; broader
+resource reconciliation needs additional identity evidence. This conservative
+scope avoids accidentally merging environments, at the cost of duplicate resource
+nodes for some real fan-out interactions.
+
+Edge materialization, revision insertion, and active-pointer replacement commit in
+one transaction. A failure leaves the prior active graph intact. Repeating the
+same inputs reuses the existing immutable revision; selecting an older set can
+reactivate it. Concurrent writers may receive a PostgreSQL serialization error
+and should retry the operation. There is no automatic model call during publication.
+
+Revisions copy nodes, edges, decision provenance, conditions, and evidence excerpts
+into an immutable payload. Later parser changes, decision changes, or active-set
+replacement do not rewrite that history. Updates to revision rows are forbidden;
+deleting the parent snapshot still removes its graph history. `cross_connections`
+is a historical materialization pool, **not** the active view: read through
+`read_graph(pool, snapshot_id=...)` or `read_graph(pool, revision_id=...)`.
+
+Optional parser branches add resolved local CALLS links and their recorded caller
+membership (HAS_CALL). These come from existing parser tables, not model inference.
+Only one parser branch per snapshot repository is allowed; every indexed local
+file must match a captured path and content hash. Dependency-only and unresolved
+calls are excluded. Exact path/hash/span/kind matches join parser nodes to
+interaction sites. Missing parser coverage stays missing; no guessed links fill it.
+
+Parser resolution is explicitly marked `byte_matched_branch_resolution`: matching
+source bytes does not certify all environment/configuration inputs used by an
+older resolver run. Confidence and parser edge/branch IDs remain on each captured
+link. The combined graph freezes those links at publication time. Inheritance and
+data-access exploration remain available through the existing graph CLI; this
+combined view currently includes parser calls and cross-repository interactions.
+
+`neighborhood(graph, node_id, hops=1, direction="both", include_parser=False,
+max_nodes=200)` traverses the published payload. Parser links require explicit
+inclusion. Resource legs retain their directed verbs; a two-hop bidirectional
+traversal finds both participants without synthesizing an INVOKES edge. Direction,
+hop (maximum 10), and node (maximum 5,000) limits are validated, with node-budget
+truncation reported. Evidence for returned decisions is included. The implementation
+loads the full revision JSON before filtering; large graphs will need indexed or
+streamed storage before this becomes a large-corpus query service.
+
+## CLI workflow
+
+Use `python -m cli.connections` or the installed `trident-connections` entry point.
+All output is JSON. As with the other raw CLIs, configure `DATABASE_URL` and apply
+migrations first. Repository IDs and checkout roots must already be registered.
+Each command prints IDs needed by the next command:
+
+```sh
+python -m cli.connections capture --repo 1=HEAD --repo 2=HEAD --context '{"environment":"dev"}'
+python -m cli.connections index --snapshot SNAPSHOT_ID
+python -m cli.connections embed --snapshot SNAPSHOT_ID --index INDEX_VERSION
+python -m cli.connections retrieve --snapshot SNAPSHOT_ID --index INDEX_VERSION
+python -m cli.connections prepare --run RETRIEVAL_RUN_ID --context-path 1=config/routing.yaml
+python -m cli.connections assess --packet PACKET_ID
+python -m cli.connections publish --snapshot SNAPSHOT_ID --decision DECISION_ID
+python -m cli.connections show --snapshot SNAPSHOT_ID
+python -m cli.connections neighbors --snapshot SNAPSHOT_ID --node site:SITE_ID --hops 2
+```
+
+`capture` rejects single-repository input before reading Git. `embed` uses the
+existing EMBEDDING_* configuration with a dedicated `site-v1` identity and closes
+its HTTP client afterward. `retrieve` uses the same model/version/dimensions but
+needs no API key. `prepare` offers Jev as a concrete reranker: per target it asks a
+typed relevance choice and converts its distribution into an ordinal score for
+selection. This is retrieval relevance, not acceptance confidence. It is serial
+and may be slower than a dedicated batched reranker; the Python API still accepts
+other rerankers. Preparation prints packet IDs. `assess` prints decision IDs;
+select supported decisions for publication after inspecting their assessments.
+
+`embed`, `prepare`, and `assess` make paid model calls; their help text identifies
+this. Jev configuration is shared with assessment. No command runs a model during
+`show`, `neighbors`, or `publish`. Repeat `--decision` for full desired membership;
+use `--empty` for an explicit retraction. Add `--parser-branch ID` at publication,
+then `--include-parser` for combined neighborhoods. Use `--revision ID` instead of
+`--snapshot ID` to inspect historical revisions. Component projection and Neptune
+orchestration remain separate work.
 
 ## Directed vocabulary, version 1
 
@@ -388,7 +480,6 @@ decision may be staged without edges, but cannot publish any edge without suppor
 
 ## Remaining phases
 
-6. Atomic graph revisions, CLI, and combined graph queries.
 7. Component membership and projection with drill-down evidence.
 8. Neptune orchestration, caching, and held-out-family evaluation.
 
@@ -414,3 +505,7 @@ provider integration and model-quality evaluation remain separate work.
 
 Jev HTTP contract, abstention, proposal direction, persistence, and failure coverage
 live in `tests/test_connection_assessment.py`.
+
+Publication atomicity, historical graph isolation, parser capture, resource
+direction, and a mocked end-to-end CLI flow are covered by
+`tests/test_connection_publication.py`.

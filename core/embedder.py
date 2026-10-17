@@ -85,6 +85,9 @@ class OpenAICompatibleEmbedder:
         self.config = config
         self._client = AsyncOpenAI(base_url=config.base_url, api_key=config.api_key)
 
+    async def aclose(self):
+        await self._client.close()
+
     @property
     def model_name(self) -> str:
         return self.config.model
