@@ -20,6 +20,8 @@ def response_for(questions, overrides=None):
     defaults = {'outcome': 'supported', 'topology': 'forward', 'condition': 'established',
                 'direct_verb': 'INVOKES', 'source_verb': 'PRODUCES', 'target_verb': 'CONSUMES',
                 'resource_anchor': 'none'}
+    if 'exact_target' in questions.get('condition', {}).get('criteria', {}):
+        defaults['condition'] = 'exact_target'
     defaults.update(overrides or {})
     answers = {}
     for key, question in questions.items():
@@ -119,7 +121,9 @@ class FixtureClient:
     async def decide(self, state, questions):
         self.calls += 1
         assert state.startswith('INSTRUCTIONS\n')
-        assert '\nSOURCE\n' in state and '\nTARGET\n' in state
+        assert '\nSOURCE\n' in state and '\nCANDIDATE TARGET\n' in state
+        assert '\nENDPOINT COMPARISON\n' in state
+        assert 'exact_target' in questions['condition']['criteria']
         assert 'candidate_id' not in state
         assert 'Only Exact code identifies the endpoint' in state
         assert len(questions) == 9
@@ -131,7 +135,7 @@ class FixtureClient:
 async def prepared(corpus):
     pool, inputs, snapshot, retrieval = await retrieved(corpus)
     async def rerank(query, docs):
-        return [1.] * len(docs)
+        return [10. if d.startswith(('publish(', 'local(')) else 0. for d in docs]
     run = await prepare_candidates(pool, retrieval.id, rerank, RerankerIdentity('fixture', 'v1'),
                                    PreparationOptions(target_limit=2),
                                    additional_paths=((inputs[0].repo_id, 'missing.conf'),))

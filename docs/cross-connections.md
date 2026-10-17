@@ -292,12 +292,41 @@ Each question includes its own criteria; question identifiers carry no implicit
 meaning. No free-form graph JSON, generated citations, or protocol-specific
 classification rules are required.
 
+Evidence preparation also reads the frozen source with the existing language grammars.
+It preserves complete matching import and binding statements from enclosing lexical
+scopes, plus enclosing definition headers with byte ranges. These are potential
+bindings and lexical containment, not assertions of runtime resolution or execution.
+Binding excerpts have a 2,400-byte total budget and a 1,200-byte statement limit;
+omissions are reported rather than silently truncating statements. Stored citations
+cover the added evidence, and structured requests retain its exact ranges.
+
+Generic overlapping passages are explicitly labeled as retrieved passages, even
+when older indexes call them declarations or configuration. They remain retrieval
+evidence, but supported proposals involving them are downgraded with
+`endpoint_not_identified` until a precise endpoint is identified. This also applies
+to shared-resource proposals; automatic endpoint localization is not yet implemented.
+
 Supported decisions require supporting citations at both actual endpoint sites.
 Unresolved conditions, missing endpoint support, missing verbs, or an unidentified
 shared resource downgrade to insufficient evidence. Contradictory evidence causes
 abstention as ambiguous. Unsupported, ambiguous, and insufficient-evidence outcomes
 produce no proposed edges. The code checks citation membership, source identity,
 site overlap, packet fingerprints, and candidate membership before inference.
+
+The default plaintext puts a concrete comparison of endpoint names, paths, binding
+statements and containment before the endpoint excerpts. Repository labels come
+from the actual repositories. The recipient question names the selected source,
+target and enclosing definitions. It distinguishes `exact_target`, `intermediate`,
+`shared_resource`, `different_destination`, and `unresolved`. An intermediate
+recipient always blocks graph edges (`intermediate_recipient`), even when topology
+says direct. Shared-resource identity satisfies this check only with shared-resource
+topology. Raw recipient answers remain in responses and proposals for audit.
+
+The topology question distinguishes direct recipients from relationships through an
+intermediate operation. An `indirect` selection is retained in the proposal
+relationship field and raw response, but creates no graph edge. A supported model
+outcome with indirect topology is stored as insufficient evidence for a publishable
+edge, with reason `indirect_relationship`; it is not treated as a verified path.
 
 Direct proposals carry an allowed site-target verb in either direction. Shared
 resource proposals carry two site-to-resource verbs, including PRODUCES/CONSUMES,
@@ -312,7 +341,7 @@ proposals are stored for audit. Stored requests also retain the compact JSON and
 the mapping from short evidence labels to immutable source citations; those
 sidecars are not sent to the model. Evidence labels in proposals are converted back
 to stored citation IDs before persistence. The policy version
-`cross-repo-assessment-v2-compact-plaintext` prevents reuse of older prompt results.
+`cross-repo-assessment-v5-concrete-recipient` prevents reuse of older prompt results.
 Provider confidence is not treated as calibrated
 certainty or copied into `connection_decisions.score`; the full answer is retained.
 Malformed choices, incomplete distributions, unexpected models, failed HTTP calls,

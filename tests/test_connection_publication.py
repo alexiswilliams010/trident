@@ -91,7 +91,7 @@ async def test_parser_capture_and_historical_isolation(corpus):
     await embed_snapshot_sites(pool, snapshot.id, index.index_version, embedder.embed)
     retrieval = await retrieve_all_candidates(pool, snapshot.id, index.index_version, embedder.embedding_identity)
     async def rerank(query, docs):
-        return [1.] * len(docs)
+        return [10. if d.startswith(('publish(', 'local(')) else 0. for d in docs]
     preparation = await prepare_candidates(pool, retrieval.id, rerank, RerankerIdentity('fixture', 'v1'))
     async with pool.acquire() as conn:
         bid = await conn.fetchval("INSERT INTO branches(repo_id,name) VALUES ($1,'parser') RETURNING id", inputs[0].repo_id)
@@ -173,9 +173,14 @@ async def test_cli_pipeline_with_mocked_models(corpus, monkeypatch):
     common = ('--snapshot', sid, '--index', indexed['index_version'])
     assert (await command('embed', *common))['embedded_inputs'] > 0 and closed
     retrieval = await command('retrieve', *common)
-    preparation = await command('prepare', '--run', retrieval['id'], '--target-limit', '1')
+    preparation = await command('prepare', '--run', retrieval['id'], '--target-limit', '5')
     decisions = await command('assess', '--packet', preparation['packet_ids'][0])
-    published = await command('publish', '--snapshot', sid, '--decision', decisions['decision_ids'][0])
+    async with pool.acquire() as conn:
+        supported = await conn.fetchval("SELECT id FROM connection_decisions WHERE id=ANY($1::uuid[]) AND outcome='supported' LIMIT 1",
+                                        [UUID(d) for d in decisions['decision_ids']])
+        assert await conn.fetchval("SELECT EXISTS(SELECT 1 FROM connection_decisions WHERE id=ANY($1::uuid[]) AND outcome='insufficient_evidence')",
+                                   [UUID(d) for d in decisions['decision_ids']])
+    published = await command('publish', '--snapshot', sid, '--decision', str(supported))
     view = await command('show', '--revision', published['revision_id'])
     source = view['graph']['edges'][0]['source']
     neighbors = await command('neighbors', '--snapshot', sid, '--node', source)

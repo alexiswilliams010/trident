@@ -35,7 +35,7 @@ def endpoint(site, content, *, code_bytes=1200, context_before=600, context_afte
     }
 
 
-def prepare(source, source_content, target, target_content, *, additional=()):
+def prepare(source, source_content, target, target_content, *, additional=(), enrich=False):
     from .assessment import build_questions, RULES
     # Short local evidence names map back to stored site IDs outside model input.
     packet = {'excerpts': [
@@ -59,6 +59,8 @@ def prepare(source, source_content, target, target_content, *, additional=()):
         'target': 'Target evidence identifies the shared resource.',
         **{f'context_{i}': f'Context {i} identifies the shared resource.' for i in range(1, len(additional) + 1)},
     }
+    from .questions import relationship_questions, recipient_questions
+    questions = recipient_questions(relationship_questions(questions))
     state = {'instructions': POLICY,
              'source': endpoint(source, source_content),
              'target': endpoint(target, target_content)}
@@ -67,6 +69,11 @@ def prepare(source, source_content, target, target_content, *, additional=()):
             {'label': f'context_{i}', 'path': e['path'], 'text': e['excerpt'].encode()[:1200].decode('utf-8', errors='ignore'),
              'clipped': len(e['excerpt'].encode()) > 1200}
             for i, e in enumerate(additional, 1)]
+    if enrich:
+        from .evidence_context import enrich_endpoint
+        for label, site, content in [('source', source, source_content), ('target', target, target_content)]:
+            state[label] = enrich_endpoint(state[label], site, content)
+            next(e for e in packet['excerpts'] if e['evidence_id'] == label)['is_endpoint'] = state[label]['is_endpoint']
     return json.dumps(state, ensure_ascii=False), questions, packet
 
 
@@ -80,14 +87,22 @@ def plaintext(state):
     for label in ('source', 'target'):
         item = data[label]
         sections.extend(['', label.upper(), f"Path: {item['path']}",
-                         f"Kind: {item['kind']}", f"Name: {item['name'] if item['name'] is not None else '(not specified)'}",
+                         f"Kind: {item['kind'] if item.get('is_endpoint') is not False else 'retrieved passage'}", f"Name: {item['name'] if item['name'] is not None else '(not specified)'}",
                          'Scope: ' + (' > '.join(item['scope']) if item['scope'] else '(none)'),
                          f"Line: {item['line']}"])
+        if 'is_endpoint' in item:
+            from .evidence_context import render_context
+            def fenced(code):
+                fence = '`' * max(3, 1 + max((len(m.group()) for m in re.finditer(r'`+', code)), default=0))
+                return fence + '\n' + code + '\n' + fence
+            sections.extend(render_context(item, fenced))
         for key, title in [('exact_code', 'Exact code'), ('context_before', 'Preceding context'),
                            ('context_after', 'Following context')]:
             code = item[key]
             # A fence longer than any source run cannot be closed by source text.
             fence = '`' * max(3, 1 + max((len(m.group()) for m in re.finditer(r'`+', code)), default=0))
+            if key == 'exact_code' and item.get('is_endpoint') is False:
+                title = 'Retrieved passage (endpoint not identified)'
             sections.extend([title + ':', fence + '\n' + code + '\n' + fence])
             if key == 'exact_code':
                 sections.append('Exact code clipped: ' + ('yes' if item['exact_code_clipped'] else 'no'))
@@ -106,8 +121,9 @@ async def prepare_assessment_input(conn, snapshot_id, candidate, packet):
 
     sites, contents, evidence_map = [], [], {}
     for label, field in [('source', 'source_site_id'), ('target', 'target_site_id')]:
-        row = await conn.fetchrow('''SELECT s.*,b.content FROM interaction_sites s
+        row = await conn.fetchrow('''SELECT s.*,b.content,r.name AS repository FROM interaction_sites s
             JOIN connection_source_blobs b USING(content_hash)
+            JOIN repos r ON r.id=s.repo_id
             WHERE s.snapshot_id=$1 AND s.id=$2''', snapshot_id, candidate[field])
         if row is None:
             raise ValueError('Candidate endpoint is outside the captured snapshot')
@@ -117,6 +133,12 @@ async def prepare_assessment_input(conn, snapshot_id, candidate, packet):
         # The stored source interval contains all displayed focus/context pieces.
         # Compact JSON records exactly which parts were shown or clipped.
         start, end = max(0, site['start_byte'] - 600), min(len(raw), site['end_byte'] + 100)
+        from .evidence_context import enrich_endpoint
+        context = enrich_endpoint(endpoint(site, raw), site, raw)
+        ranges = context['bindings'] + [c for c in context['containment'] if 'start_byte' in c]
+        if ranges:
+            start = min(start, *(c['start_byte'] for c in ranges))
+            end = max(end, *(c['end_byte'] for c in ranges))
         while start < len(raw) and raw[start] & 0xC0 == 0x80:
             start += 1
         while end < len(raw) and raw[end] & 0xC0 == 0x80:
@@ -132,7 +154,11 @@ async def prepare_assessment_input(conn, snapshot_id, candidate, packet):
     additional = [e for e in packet['excerpts'] if e['role'] == 'additional']
     for index, excerpt in enumerate(additional, 1):
         evidence_map[f'context_{index}'] = excerpt['evidence_id']
-    structured, questions, focused = prepare(sites[0], contents[0], sites[1], contents[1], additional=additional)
+    structured, questions, focused = prepare(sites[0], contents[0], sites[1], contents[1], additional=additional, enrich=True)
+    data = json.loads(structured)
+    for label, site in zip(('source', 'target'), sites):
+        data[label]['repository'] = site['repository']
+    structured = json.dumps(data, ensure_ascii=False)
     return structured, questions, focused, evidence_map
 
 
