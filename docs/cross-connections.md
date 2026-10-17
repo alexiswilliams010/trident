@@ -1,9 +1,9 @@
 # Cross-repository connections
 
-Status: contracts, committed-source capture, and decision reuse tracking are
-implemented. No automatic connection processing, model calls, connection CLI,
-or component projection yet. Existing embedding writes and semantic queries now
-use explicit vector-space identities.
+Status: contracts, committed-source capture, decision reuse tracking, call-site
+extraction, and cross-repository candidate retrieval are implemented as Python
+APIs. Retrieval can invoke an explicitly supplied embedder. Reranking, decision
+model calls, connection CLI, and component projection are not implemented yet.
 
 ## Eligibility and scope
 
@@ -32,6 +32,11 @@ is retrieval metadata, not a traversable connection.
 | connection_snapshot_files | Sealed paths, file modes, Git object IDs, and content hashes |
 | connection_source_blobs | Hash-verified immutable bytes, shared across snapshots |
 | interaction_sites | Calls and candidate definitions/declarations/configuration sites |
+| connection_site_indexes | Versioned extraction settings and completion statistics |
+| interaction_embeddings | Deduplicated retrieval inputs in explicitly versioned vector spaces |
+| connection_retrieval_runs | Corpus identity, retrieval settings, and completed runs |
+| connection_candidate_sets | Per-call candidate fingerprints, including empty results |
+| connection_candidate_matches | Run-specific ranks and channel provenance |
 | connection_resources | Snapshot-scoped shared resources |
 | connection_candidates | Cross-repository site pairs and retrieval metadata |
 | connection_evidence | Source coordinates, content hash, and retained excerpt |
@@ -129,6 +134,71 @@ name), and `EMBEDDING_REPRESENTATION_VERSION` (default `chunk-v1`). For moving m
 aliases, explicitly pin/update the model version when the provider changes weights;
 the application cannot detect a provider's silent alias change.
 
+## Call inventory and candidate retrieval
+
+After capturing a sealed snapshot, use the APIs in this order:
+
+```python
+from core.connections.sites import index_snapshot_sites
+from core.connections.retrieval import embed_snapshot_sites, retrieve_all_candidates
+
+index = await index_snapshot_sites(pool, snapshot.id)
+await embed_snapshot_sites(pool, snapshot.id, index.index_version, embedder.embed)
+run = await retrieve_all_candidates(
+    pool, snapshot.id, index.index_version, embedder.embedding_identity,
+)
+```
+
+The supplied embedder must declare an `EmbeddingIdentity` with representation
+version `site-v1`, or an undeclared callable must receive an explicit
+`embedding_identity=` argument. Configure a dedicated embedder for this input;
+the normal chunk embedder's `chunk-v1` identity deliberately does not qualify.
+No embedding API is called by extraction, migrations, or retrieval itself.
+
+Extraction reparses captured bytes with the existing language call/definition
+rules. It inventories every configured call shape, including locally resolved
+calls, without protocol handlers or a confidence cutoff. Supported languages are
+Python, Solidity, Go, Rust, JavaScript, and TypeScript. This does not promise to
+discover calls the grammars/rules cannot identify, dynamically constructed calls,
+or call sites in unsupported languages. Generic overlapping text passages make
+configuration, build files, unsupported source, and declarations searchable as
+targets. Binary/non-UTF-8 files, empty files, symlinks, and gitlinks are reported
+as skipped. Parser relationships are neither regenerated as connection edges nor
+required to retrieve candidates.
+
+Inputs are plain source expressions plus bounded enclosing context and module
+paths. Source coordinates retain full node spans even when the input is clipped.
+Index identity includes extraction settings, language rules, and grammar versions.
+Extraction publishes atomically and repeated calls reuse a completed index.
+Embedding inputs deduplicate by text hash and complete vector-space identity;
+each original call occurrence keeps its own site and candidate set. Failed
+embedding batches can resume from already cached batches. Zero, nonfinite, or
+wrong-dimension vectors are rejected.
+
+Each call searches only other repositories within its snapshot and index using
+cosine similarity, PostgreSQL full-text search, and exact shared tokens such as
+identifiers, paths, and event names. Reciprocal-rank fusion combines these channels;
+a configurable exact-match reserve protects some candidates from semantic
+ranking. Defaults are 50 results per channel, 30 candidates per call, and up to 8
+reserved exact matches. There is no semantic similarity threshold. Overlapping
+generic passages collapse within the retrieved pool; calls and definitions retain
+distinct occurrences. Bounds and token matching are retrieval heuristics, not
+proof of behavioral correspondence or guaranteed recall.
+
+`retrieve_candidates(...)` inspects one call without persisting a run.
+`retrieve_all_candidates(...)` stores every call's set, even when empty, plus ranks,
+channel scores, and fingerprints. Changing retrieval settings creates a separate
+run without overwriting earlier rankings. Repeated identical runs reuse their
+records. It creates no decisions, verbs, or graph edges. Empty results do not prove
+that no cross-repository behavior exists; reranking and evidence assessment come
+next. Direct SQL mutation of completed indexes/runs is not a supported update path;
+change inputs/settings and create a new version instead.
+
+This initial implementation uses exact vector scans and serial per-input retrieval,
+with repeated inputs cached within a run. It has no ANN index or large-corpus
+performance claim. Tests use controlled vectors to verify channel behavior and
+fixture recall, not to measure production embedding quality.
+
 ## Directed vocabulary, version 1
 
 All sources are code/configuration sites. Both sides of event/data interactions
@@ -195,7 +265,6 @@ decision may be staged without edges, but cannot publish any edge without suppor
 
 ## Remaining phases
 
-3. All-call-site input extraction and cross-repository candidate retrieval.
 4. Reranking and bounded evidence assembly.
 5. Jev integration, support assessment, and verb selection/normalization.
 6. Atomic graph revisions, CLI, and combined graph queries.
@@ -215,3 +284,5 @@ test command at a production database. Schema tests verify migration tracking,
 registry parity, eligibility, evidence requirements, and atomic resource pairs.
 Snapshot/invalidation coverage is in `tests/test_snapshot_dependencies.py`; vector
 identity and legacy migration coverage is in `tests/test_embedding_identity.py`.
+Call extraction, vector reuse, channel fusion, and snapshot-scoped retrieval are
+covered by `tests/test_connection_retrieval.py`.
