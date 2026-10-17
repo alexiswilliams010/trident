@@ -116,4 +116,14 @@ async def get_context(repo_name: str, question: str, budget: int = 8000) -> str:
 The query-time embedding model **must** match the one used at index
 time, otherwise cosine distances are meaningless.
 
+Embedding writes and queries now match model name/version, dimensions, and input
+representation version. After upgrading an existing database through migration
+0007, rerun `make embed DB=... REPO_PATH=... REPO_NAME=...` to populate the current
+identity; retained legacy vectors are not silently reused. For moving model aliases,
+set `EMBEDDING_MODEL_VERSION` to a pinned revision and update it when weights change.
+
+The [cross-repository connection contracts](docs/cross-connections.md) document
+committed-source snapshots and dependency-based reuse. Connection retrieval and
+model processing are not wired into indexing yet.
+
 `make help` lists every target.

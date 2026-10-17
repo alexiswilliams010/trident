@@ -44,7 +44,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--force-reindex", action="store_true",
-        help="Pass force_rehash=True to the extractor; useful when content hash didn't change.",
+        help="Compatibility option; the extractor always verifies file content hashes.",
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true",

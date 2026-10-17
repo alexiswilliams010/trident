@@ -66,8 +66,8 @@ TRIDENT_IGNORE_FILE = ".tridentignore"
 ROOT_DIR_PATH = ""  # branch_dirs stores the repo root with empty-string path.
 
 # Leaf provider contract: given (rel_path, size, abs_path), return the
-# file's SHA-256 hex digest. The extractor implements this with a size-cache
-# shortcut; tests and the basic `walk_repo` path bypass tree-building and
+# file's SHA-256 hex digest. The extractor verifies the file bytes on each walk;
+# tests and the basic `walk_repo` path bypass tree-building and
 # don't call any provider.
 LeafHashProvider = Callable[[str, int, Path], str]
 
@@ -142,7 +142,7 @@ class DiscoveredFile:
     path: Path           # absolute path
     rel_path: str        # path relative to repo_root, forward-slash separated
     language: str
-    size: int            # bytes (from os.stat); cached on branch_files for the size-cache shortcut
+    size: int            # bytes (from os.stat); recorded on branch_files
 
 
 def _scan_one_dir(

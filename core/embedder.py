@@ -6,9 +6,11 @@ OpenAI-compat endpoint, OpenAI itself) can be slotted in:
     EMBEDDING_BASE_URL   e.g. https://api.openai.com/v1
     EMBEDDING_API_KEY
     EMBEDDING_MODEL      e.g. text-embedding-3-large, voyage-code-3, nomic-embed-code
-    EMBEDDING_DIM        defaults to 1024 (matches schema vector(1024))
+    EMBEDDING_DIM        defaults to 4096
+    EMBEDDING_MODEL_VERSION  pin provider/model revisions when using a moving alias
+    EMBEDDING_REPRESENTATION_VERSION  defaults to chunk-v1
 
-Branch model: `chunk_embeddings` is keyed by chunk content_hash. Two
+Branch model: `chunk_embeddings` is keyed by content hash and vector-space identity. Two
 chunks (across branches) with byte-identical content share one embedding
 row. When indexing a feature branch whose content is mostly identical to
 main, the SELECT below finds existing embeddings and the API call count
@@ -24,6 +26,8 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 import asyncpg
+
+from .embedding_identity import CHUNK_REPRESENTATION_VERSION, EmbeddingIdentity, identity_for
 
 try:
     from openai import AsyncOpenAI
@@ -45,8 +49,15 @@ class EmbedderConfig:
     base_url: str
     api_key: str
     model: str
-    dim: int = 1024
+    dim: int = 4096
     batch_size: int = 64
+    model_version: str | None = None
+    representation_version: str = CHUNK_REPRESENTATION_VERSION
+
+    @property
+    def embedding_identity(self) -> EmbeddingIdentity:
+        return EmbeddingIdentity(self.model, self.model_version or self.model, self.dim,
+                                 self.representation_version)
 
     @classmethod
     def from_env(cls) -> "EmbedderConfig":
@@ -57,9 +68,12 @@ class EmbedderConfig:
             raise RuntimeError(
                 "Set EMBEDDING_BASE_URL, EMBEDDING_API_KEY, EMBEDDING_MODEL to enable embedding."
             )
-        dim = int(os.environ.get("EMBEDDING_DIM", "1024"))
+        dim = int(os.environ.get("EMBEDDING_DIM", "4096"))
         batch_size = int(os.environ.get("EMBEDDING_BATCH_SIZE", "64"))
-        return cls(base_url=base_url, api_key=api_key, model=model, dim=dim, batch_size=batch_size)
+        return cls(base_url=base_url, api_key=api_key, model=model, dim=dim, batch_size=batch_size,
+                   model_version=os.environ.get("EMBEDDING_MODEL_VERSION") or model,
+                   representation_version=os.environ.get("EMBEDDING_REPRESENTATION_VERSION")
+                   or CHUNK_REPRESENTATION_VERSION)
 
 
 class OpenAICompatibleEmbedder:
@@ -74,6 +88,10 @@ class OpenAICompatibleEmbedder:
     @property
     def model_name(self) -> str:
         return self.config.model
+
+    @property
+    def embedding_identity(self) -> EmbeddingIdentity:
+        return self.config.embedding_identity
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
@@ -124,14 +142,14 @@ async def embed_branch_chunks(
     embed_fn: EmbedFn,
     model_name: str,
     *,
-    dim: int = 4096,
+    dim: int | None = None,
+    embedding_identity: EmbeddingIdentity | None = None,
     batch_size: int = 64,
     max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS,
 ) -> EmbedStats:
-    """Embed every chunk in `branch_id` whose content_hash isn't yet in
-    chunk_embeddings.
+    """Embed chunks missing from the requested vector space in chunk_embeddings.
 
-    `chunk_embeddings` is keyed by content_hash (not chunk_id), so two
+    `chunk_embeddings` is keyed by content_hash and vector-space identity, so two
     chunks with the same content text — typical across branches that share
     most files — produce a single embedding row. Re-running this on a
     feature branch identical to main yields zero API calls.
@@ -143,6 +161,15 @@ async def embed_branch_chunks(
     than sent to the gateway: most embedding endpoints reject inputs above
     their context window with HTTP 422.
     """
+    if embedding_identity is None:
+        declared = getattr(getattr(embed_fn, "__self__", embed_fn), "embedding_identity", None)
+        embedding_identity = declared or EmbeddingIdentity(model_name, model_name, dim or 4096)
+    identity = identity_for(embed_fn, embedding_identity)
+    if model_name != identity.model_name or (dim is not None and dim != identity.dimensions):
+        raise ValueError("Embedding identity disagrees with model_name or dim")
+    dim = identity.dimensions
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
     stats = EmbedStats()
     async with pool.acquire() as conn:
         # DISTINCT ON content_hash so each unique chunk text is embedded once
@@ -154,10 +181,13 @@ async def embed_branch_chunks(
                    c.id, c.content, c.token_count, c.content_hash
             FROM chunks c
             LEFT JOIN chunk_embeddings ce ON ce.content_hash = c.content_hash
+                AND ce.model_name = $2 AND ce.model_version = $3
+                AND ce.dimensions = $4 AND ce.representation_version = $5
             WHERE c.branch_id = $1 AND ce.id IS NULL
             ORDER BY c.content_hash, c.id
             """,
             branch_id,
+            identity.model_name, identity.model_version, dim, identity.representation_version,
         )
         stats.chunks_seen = len(rows)
         if not rows:
@@ -236,14 +266,17 @@ async def embed_branch_chunks(
         if all_hashes:
             await conn.execute(
                 """
-                INSERT INTO chunk_embeddings (content_hash, embedding, model_name)
-                SELECT content_hash, embedding::vector, $3
+                INSERT INTO chunk_embeddings
+                    (content_hash, embedding, model_name, model_version, dimensions,
+                     representation_version)
+                SELECT content_hash, embedding::vector, $3, $4, $5, $6
                 FROM UNNEST($1::text[], $2::text[]) AS t(content_hash, embedding)
-                ON CONFLICT (content_hash) DO NOTHING
+                ON CONFLICT (content_hash, model_name, model_version, dimensions,
+                             representation_version) DO NOTHING
                 """,
                 all_hashes,
                 all_vectors,
-                model_name,
+                identity.model_name, identity.model_version, dim, identity.representation_version,
             )
     return stats
 
@@ -257,7 +290,7 @@ def embed_branch_sync(
     embed_fn: EmbedFn,
     model_name: str,
     *,
-    dim: int = 4096,
+    dim: int | None = None,
     dsn: str | None = None,
 ) -> EmbedStats:
     from db.connection import pool_ctx
@@ -279,7 +312,7 @@ embed_repo_sync = embed_branch_sync
 
 
 def make_fake_embedder(dim: int = 4096) -> tuple[EmbedFn, str]:
-    """Hash-based deterministic embedder. Used by Phase 4 retrieval tests so
+    """Hash-based deterministic embedder. Used by retrieval tests so
     the suite doesn't need an API key. Same input always → same vector."""
 
     import hashlib
@@ -306,4 +339,5 @@ def make_fake_embedder(dim: int = 4096) -> tuple[EmbedFn, str]:
     async def _embed(texts: list[str]) -> list[list[float]]:
         return [_vec_from_text(t) for t in texts]
 
+    _embed.embedding_identity = EmbeddingIdentity("fake-deterministic", "fake-deterministic", dim)
     return _embed, "fake-deterministic"

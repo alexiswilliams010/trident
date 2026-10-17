@@ -22,14 +22,9 @@ Branch-aware indexing model:
     3. Otherwise parse, INSERT file_versions, COPY nodes tied to the new
        file_version_id, then upsert branch_files.
 
-Size-cache shortcut: branch_files.size stores each file's byte length, and
-`branch_dirs` stores a per-directory SHA-256 over its sorted manifest
-(forming a Merkle tree rooted at the branch). On re-index the walker
-compares `os.stat().st_size` against the cached size; on a match we trust
-the cached content_hash and skip read+SHA-256 entirely. Size is chosen
-over mtime because it's the only filesystem-metadata signal that's reliable
-across platforms. Same-size content edits slip past — pass `--rehash` to
-bypass the cache when that matters.
+Every walk hashes file bytes; size and timestamps are not freshness signals.
+Unchanged content still reuses parsed file versions. Directory hashes summarize
+the verified content manifest rather than trusting filesystem metadata.
 """
 
 from __future__ import annotations
@@ -210,9 +205,9 @@ async def index_repo(
 ) -> IndexRepoResult:
     """Walk a repo and index every supported file under (repo_id, branch_id).
 
-    Re-uses cached `(size, content_hash)` from `branch_files` so files whose
-    byte size hasn't changed skip read+SHA-256 entirely. The walker also
-    builds per-directory Merkle hashes which are persisted to `branch_dirs`.
+    Reads and hashes every supported file, reusing parsed content when its hash
+    matches. The walker builds directory hashes persisted to `branch_dirs`.
+    force_rehash is retained for API compatibility; every walk now rehashes.
 
     The per-file loop only writes for truly new content (cold path: parse +
     COPY nodes) and for hash-hit files whose `branch_files` mapping or
@@ -229,10 +224,7 @@ async def index_repo(
     indexed: list[IndexFileResult] = []
     skipped: list[IndexFileResult] = []
 
-    # Prefetch the branch's current (path, fv_id, size, content_hash) so the
-    # walker's leaf-hash provider can skip read+SHA-256 when size matches.
-    # JOIN file_versions to pull content_hash in the same round-trip — FK
-    # guarantees every branch_files row has a matching file_versions row.
+    # Prefetch mappings to reuse parsed versions after verifying file content.
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE repos SET root_path=$2 WHERE id=$1",
@@ -254,25 +246,19 @@ async def index_repo(
     cached_hash_by_path: dict[str, str] = {}
     for r in bf_rows:
         cached_fv_by_path[r["path"]] = r["file_version_id"]
+        cached_hash_by_path[r["path"]] = r["content_hash"]
         if r["size"] is not None:
             cached_size_by_path[r["path"]] = r["size"]
-            cached_hash_by_path[r["path"]] = r["content_hash"]
 
-    # Provider closure: returns the file's content hash, reading from disk
-    # only on cache miss. Cache-hit files contribute to the walk for tree
-    # purposes but never get read or retained in memory.
+    # Only retain changed bytes for parsing, keeping unchanged files out of memory.
     raw_by_path: dict[str, bytes] = {}
     hash_by_path: dict[str, str] = {}
 
     def leaf_hash_provider(rel_path: str, size: int, abs_path: Path) -> str:
-        if not force_rehash:
-            cached_h = cached_hash_by_path.get(rel_path)
-            if cached_h is not None and cached_size_by_path.get(rel_path) == size:
-                hash_by_path[rel_path] = cached_h
-                return cached_h
         raw = abs_path.read_bytes()
         h = _hash_bytes(raw)
-        raw_by_path[rel_path] = raw
+        if h != cached_hash_by_path.get(rel_path) or size != cached_size_by_path.get(rel_path):
+            raw_by_path[rel_path] = raw
         hash_by_path[rel_path] = h
         return h
 
@@ -322,7 +308,7 @@ async def index_repo(
                     # Mapping changed, size needs backfill, or both.
                     rebinds.append((f.rel_path, fv_id, f.language, f.size))
             else:
-                # Cache hit: trust prefetched fv_id; truly skipped.
+                # Verified hash matches the prefetched file version.
                 fv_id = cached_fv_by_path[f.rel_path]
                 skipped.append(IndexFileResult(
                     file_version_id=fv_id,
@@ -359,7 +345,7 @@ async def index_repo(
 
         # Prune branch_files mappings for user files no longer reached by the
         # walker (deletes, moves, newly excluded). Dependency mappings are
-        # kept — they're populated by Phase 3, not the walker, so absence
+        # kept — they're populated by import resolution, so absence
         # here is not evidence of removal. file_versions are not deleted
         # here; orphans are reclaimed by `make gc`.
         deleted_rows = await conn.fetch(

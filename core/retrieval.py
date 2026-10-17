@@ -15,8 +15,8 @@
 
 Branch model: every retrieval is scoped to a list of branch_ids. Each chunk
 is per-branch (the inlined skeleton encodes branch-resolved cross-file
-targets). chunk_embeddings is content-hash keyed and shared across branches
-so identical chunk text reuses one vector.
+targets). chunk_embeddings is content-hash keyed within each versioned vector
+space and shared across branches, so identical input reuses one compatible vector.
 """
 
 from __future__ import annotations
@@ -26,6 +26,8 @@ import re
 from dataclasses import dataclass
 
 import asyncpg
+
+from .embedding_identity import EmbeddingIdentity, identity_for
 
 from .chunk_assembler import _split_camel
 from .embedder import EmbedFn, _vector_literal
@@ -202,19 +204,24 @@ async def semantic_query(
     top_k: int = 10,
     granularities: tuple[str, ...] | None = None,
     languages: list[str] | None = None,
+    embedding_identity: EmbeddingIdentity | None = None,
 ) -> list[RetrievedChunk]:
     """Embed `query` and return the top-k nearest chunks by cosine distance,
     with a graph-signal penalty applied so signature-only defs don't crowd
     out real implementations."""
+    identity = identity_for(embed_fn, embedding_identity)
     vectors = await embed_fn([query])
     if not vectors:
         return []
+    if len(vectors) != 1 or len(vectors[0]) != identity.dimensions:
+        raise ValueError("Query embedding dimensions disagree with the requested vector space")
     qvec = _vector_literal(vectors[0])
     bids = _norm_branch_ids(branch_ids)
 
     async with pool.acquire() as conn:
         if granularities:
             params: list = [qvec, bids, list(granularities), top_k]
+            space_clause = _embedding_filter(params, identity)
             lang_join, lang_clause = _chunk_lang_filter(params, languages)
             rows = await conn.fetch(
                 f"""
@@ -230,6 +237,7 @@ async def semantic_query(
                 {lang_join}
                 {_SKELETON_JOINS_SQL}
                 JOIN chunk_embeddings ce ON ce.content_hash = c.content_hash
+                  {space_clause}
                 WHERE c.branch_id = ANY($2::bigint[]) AND c.granularity = ANY($3::text[])
                   {lang_clause}
                 ORDER BY score DESC
@@ -239,6 +247,7 @@ async def semantic_query(
             )
         else:
             params = [qvec, bids, top_k]
+            space_clause = _embedding_filter(params, identity)
             lang_join, lang_clause = _chunk_lang_filter(params, languages)
             rows = await conn.fetch(
                 f"""
@@ -254,6 +263,7 @@ async def semantic_query(
                 {lang_join}
                 {_SKELETON_JOINS_SQL}
                 JOIN chunk_embeddings ce ON ce.content_hash = c.content_hash
+                  {space_clause}
                 WHERE c.branch_id = ANY($2::bigint[])
                   {lang_clause}
                 ORDER BY score DESC
@@ -262,6 +272,17 @@ async def semantic_query(
                 *params,
             )
     return [_row_to_chunk(r) for r in rows]
+
+
+def _embedding_filter(params: list, identity: EmbeddingIdentity) -> str:
+    clauses = []
+    for column, value in (("model_name", identity.model_name),
+                          ("model_version", identity.model_version),
+                          ("dimensions", identity.dimensions),
+                          ("representation_version", identity.representation_version)):
+        params.append(value)
+        clauses.append(f"AND ce.{column} = ${len(params)}")
+    return " ".join(clauses)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -412,6 +433,7 @@ async def hybrid_query(
     mmr_repo_lambda: float = 0.3,
     mmr_file_lambda: float = 0.15,
     languages: list[str] | None = None,
+    embedding_identity: EmbeddingIdentity | None = None,
 ) -> list[RetrievedChunk]:
     """Pull `candidate_pool` candidates from BOTH the semantic (cosine) and
     lexical (BM25 / FTS) retrievers, fuse via Reciprocal Rank Fusion, then
@@ -423,7 +445,8 @@ async def hybrid_query(
     """
     bids = _norm_branch_ids(branch_ids)
     sem_results, lex_results = await asyncio.gather(
-        semantic_query(pool, bids, query, embed_fn, top_k=candidate_pool, languages=languages),
+        semantic_query(pool, bids, query, embed_fn, top_k=candidate_pool, languages=languages,
+                       embedding_identity=embedding_identity),
         lexical_query(pool, bids, query, top_k=candidate_pool, languages=languages),
     )
     if not sem_results and not lex_results:

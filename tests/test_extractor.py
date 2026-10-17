@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from core.extractor import index_repo
 from core.file_walker import WalkConfig, walk_dependency_files, walk_repo
 
@@ -302,7 +300,7 @@ async def test_in_place_modify_then_revert_reuses_file_version(clean_repo, tmp_p
 
     src = tmp_path / "module.py"
     original = "def hello():\n    return 1\n"
-    modified = "def hello():\n    return 22\n"  # different length so the size-cache shortcut misses
+    modified = "def hello():\n    return 2\n"  # same length must still invalidate parsed content
     src.write_text(original)
 
     # Initial index → one file_version, one branch_files mapping.

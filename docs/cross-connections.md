@@ -1,7 +1,9 @@
-# Cross-repository connections: Phase 1 contracts
+# Cross-repository connections
 
-Status: schema and Python contracts only. No automatic processing, model calls,
-CLI command, component projection, or changes to existing parser queries.
+Status: contracts, committed-source capture, and decision reuse tracking are
+implemented. No automatic connection processing, model calls, connection CLI,
+or component projection yet. Existing embedding writes and semantic queries now
+use explicit vector-space identities.
 
 ## Eligibility and scope
 
@@ -27,12 +29,16 @@ is retrieval metadata, not a traversable connection.
 | --- | --- |
 | connection_snapshots | Analysis identity and configuration fingerprint |
 | connection_snapshot_members | Canonical repository and exact revision |
+| connection_snapshot_files | Sealed paths, file modes, Git object IDs, and content hashes |
+| connection_source_blobs | Hash-verified immutable bytes, shared across snapshots |
 | interaction_sites | Calls and candidate definitions/declarations/configuration sites |
 | connection_resources | Snapshot-scoped shared resources |
 | connection_candidates | Cross-repository site pairs and retrieval metadata |
 | connection_evidence | Source coordinates, content hash, and retained excerpt |
 | connection_decisions | Outcome, model/policy provenance, evidence fingerprint, conditions |
 | connection_decision_evidence | Evidence association and support/contradiction/context role |
+| connection_decision_inputs | Versioned input and decision fingerprints |
+| connection_decision_dependencies | Endpoint/evidence file dependencies, including missing files |
 | connection_verbs | Versioned definitions and allowed endpoint kinds |
 | cross_connections | Directed edges supported by a decision |
 
@@ -41,10 +47,87 @@ be cleared when parser objects are removed. They are not historical evidence.
 Source paths, byte offsets (end-exclusive), content hashes, retained excerpts,
 repository revisions, and configuration context identify the evidence.
 
-Phase 2 will implement snapshot capture/sealing, content verification, dependency
-fingerprints, and incremental invalidation. Non-empty revision strings are accepted
-by these contracts; resolving them to exact Git objects is the capture stage's job.
-The schema alone does not freeze a mutable branch or verify an excerpt against Git.
+## Snapshot capture and source verification
+
+`capture_snapshot(pool, repositories, context=...)` resolves each requested Git
+revision to a commit and reads its tree and blobs directly. It captures all tracked
+files, including configuration/build files and binaries, independently of the
+language parser. Dirty or untracked working-tree files are excluded. Symlinks are
+captured as link text without following them; submodules retain their pinned Git
+commit as a gitlink and are not recursively ingested. Register a submodule as a
+separate repository to analyze its source. Non-UTF-8 Git filenames are rejected.
+
+Repository IDs must match their registered checkout roots. Repeated IDs, repeated
+checkouts, and worktrees sharing a Git common directory do not qualify as separate
+repositories. Separate clones must still be assigned their canonical repository
+identity by the caller; local Git directories cannot establish remote identity.
+
+The capture key includes sorted repository/commit pairs and a canonical hash of
+the supplied configuration context. The context itself is not stored verbatim.
+Repeated/concurrent captures converge on one sealed snapshot. Manifest and context
+edits are forbidden after sealing, while deleting the entire snapshot is supported.
+Source blobs remain deduplicated; blob garbage collection is not implemented yet.
+Capture currently buffers Git blob output in memory, so very large repositories
+will need a streaming implementation before scaling this path.
+
+`read_source` reads captured bytes rather than the current checkout. Sites inserted
+into sealed snapshots must match a captured file's hash and byte bounds. Evidence
+must also match the exact UTF-8 excerpt at the end-exclusive byte range. Binary
+files can be captured/read but cannot serve as arbitrary text excerpts. Parser IDs
+remain optional; future call-site extraction must match captured content before
+attaching parser objects. Sealing happens before adding sites or evidence.
+
+The existing working-tree indexer separately verifies file bytes on every walk,
+including same-size edits. Unchanged hashes still reuse parse results. `--rehash`
+remains accepted for compatibility but no longer changes this behavior. This costs
+file-read I/O on each index run in exchange for reliable freshness.
+
+## Decision reuse and invalidation
+
+`record_decision_inputs` requires a sealed snapshot. It records dependencies on
+both endpoint files and every linked evidence file automatically. Callers must
+also supply files inspected during investigation, including paths that were absent
+but whose later appearance could affect the answer. File mode changes count as
+changes even when bytes are identical.
+
+`ResolutionVersions` records provider/model, policy, vocabulary, representation,
+retrieval, reranker, and candidate-set identities. The candidate-set fingerprint
+must cover the actual alternatives and relevant context, not merely their names.
+Retrieval must be refreshed when its corpus changes: file dependencies alone cannot
+detect a new alternative that the original decision never inspected.
+
+`assess_decision_reuse` compares tracked inputs with a new sealed snapshot and
+returns explicit invalidation reasons. Unchanged inputs may be reused across
+commits; changed endpoints, evidence, missing-file presence, repository membership,
+configuration context, or processing versions block reuse. Edits to the original
+decision/evidence are detected as well. Re-recording different inputs on the same
+decision is rejected.
+
+Historical decisions and connections are preserved. A reusable assessment does
+not copy database IDs into a new snapshot or publish edges automatically. Future
+decision processing must rebind validated source references and write a new
+snapshot-specific decision. Component projections will consume those decisions.
+
+## Embedding identity and migration
+
+Embeddings are unique by `(content_hash, model_name, model_version, dimensions,
+representation_version)`. Both indexing and semantic/hybrid queries select that
+same identity. The vector column accepts different dimensions, with a constraint
+ensuring each row matches its declared dimensions. No ANN index is added here.
+
+Migration 0007 retains previous rows as `legacy-unversioned` for model and input
+versions. They are not automatically reused by current indexing or queries.
+Run the normal embedding command after upgrading to populate the current identity;
+semantic search can return no results until those embeddings exist. The migration
+does not call an embedding service or spend API credits.
+
+`OpenAICompatibleEmbedder` and the fake embedder expose their identities. Custom
+query callables must pass `embedding_identity=EmbeddingIdentity(...)`; querying
+an undeclared vector space fails before the embedding call. Configure dimensions
+with `EMBEDDING_DIM` (default 4096), `EMBEDDING_MODEL_VERSION` (defaults to the model
+name), and `EMBEDDING_REPRESENTATION_VERSION` (default `chunk-v1`). For moving model
+aliases, explicitly pin/update the model version when the provider changes weights;
+the application cannot detect a provider's silent alias change.
 
 ## Directed vocabulary, version 1
 
@@ -112,7 +195,6 @@ decision may be staged without edges, but cannot publish any edge without suppor
 
 ## Remaining phases
 
-2. Reliable snapshots, embedding identities, and invalidation.
 3. All-call-site input extraction and cross-repository candidate retrieval.
 4. Reranking and bounded evidence assembly.
 5. Jev integration, support assessment, and verb selection/normalization.
@@ -131,3 +213,5 @@ pgvector available, then run `python -m pytest tests/test_connection_schema.py`.
 The existing pg_pool fixture applies migrations to that database; never point this
 test command at a production database. Schema tests verify migration tracking,
 registry parity, eligibility, evidence requirements, and atomic resource pairs.
+Snapshot/invalidation coverage is in `tests/test_snapshot_dependencies.py`; vector
+identity and legacy migration coverage is in `tests/test_embedding_identity.py`.

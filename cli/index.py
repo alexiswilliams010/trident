@@ -165,8 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force-resolve", action="store_true",
                         help="Re-run semantic resolution on all files, not just changed ones.")
     parser.add_argument("--rehash", action="store_true",
-                        help="Ignore the (size, content_hash) cache and re-read every file. "
-                             "Use when a content edit preserved file size.")
+                        help="Compatibility option; file content is always rehashed.")
     args = parser.parse_args(argv)
 
     if not args.repo_path.is_dir():
