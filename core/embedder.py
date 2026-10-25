@@ -56,8 +56,9 @@ class EmbedderConfig:
 
     @property
     def embedding_identity(self) -> EmbeddingIdentity:
-        return EmbeddingIdentity(self.model, self.model_version or self.model, self.dim,
-                                 self.representation_version)
+        return EmbeddingIdentity(
+            self.model, self.model_version or self.model, self.dim, self.representation_version
+        )
 
     @classmethod
     def from_env(cls) -> "EmbedderConfig":
@@ -70,10 +71,16 @@ class EmbedderConfig:
             )
         dim = int(os.environ.get("EMBEDDING_DIM", "4096"))
         batch_size = int(os.environ.get("EMBEDDING_BATCH_SIZE", "64"))
-        return cls(base_url=base_url, api_key=api_key, model=model, dim=dim, batch_size=batch_size,
-                   model_version=os.environ.get("EMBEDDING_MODEL_VERSION") or model,
-                   representation_version=os.environ.get("EMBEDDING_REPRESENTATION_VERSION")
-                   or CHUNK_REPRESENTATION_VERSION)
+        return cls(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            dim=dim,
+            batch_size=batch_size,
+            model_version=os.environ.get("EMBEDDING_MODEL_VERSION") or model,
+            representation_version=os.environ.get("EMBEDDING_REPRESENTATION_VERSION")
+            or CHUNK_REPRESENTATION_VERSION,
+        )
 
 
 class OpenAICompatibleEmbedder:
@@ -190,7 +197,10 @@ async def embed_branch_chunks(
             ORDER BY c.content_hash, c.id
             """,
             branch_id,
-            identity.model_name, identity.model_version, dim, identity.representation_version,
+            identity.model_name,
+            identity.model_version,
+            dim,
+            identity.representation_version,
         )
         stats.chunks_seen = len(rows)
         if not rows:
@@ -279,7 +289,10 @@ async def embed_branch_chunks(
                 """,
                 all_hashes,
                 all_vectors,
-                identity.model_name, identity.model_version, dim, identity.representation_version,
+                identity.model_name,
+                identity.model_version,
+                dim,
+                identity.representation_version,
             )
     return stats
 

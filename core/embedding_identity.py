@@ -13,8 +13,9 @@ class EmbeddingIdentity:
     representation_version: str = CHUNK_REPRESENTATION_VERSION
 
     def __post_init__(self):
-        if not all(s.strip() for s in
-                   (self.model_name, self.model_version, self.representation_version)):
+        if not all(
+            s.strip() for s in (self.model_name, self.model_version, self.representation_version)
+        ):
             raise ValueError("Embedding model and representation versions must be explicit")
         if not 1 <= self.dimensions <= 16000:
             raise ValueError("Embedding dimensions must be between 1 and 16000")

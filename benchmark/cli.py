@@ -22,32 +22,41 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("repo_path", type=Path, help="Absolute path to the repo to benchmark.")
     parser.add_argument("--question", required=True, help="The question both agents will answer.")
     parser.add_argument(
-        "--repo-name", required=True,
+        "--repo-name",
+        required=True,
         help="Trident's name for the repo (created on first run).",
     )
     parser.add_argument("--branch", default="main", help="Branch name (default: main).")
     parser.add_argument(
-        "--db", default=None,
+        "--db",
+        default=None,
         help="Postgres DB name. Default: trident_bench_<sha8(repo_path)>.",
     )
     parser.add_argument(
-        "--model", default="claude-sonnet-4-6",
+        "--model",
+        default="claude-sonnet-4-6",
         help="Model ID passed to claude-agent-sdk for both agents.",
     )
     parser.add_argument(
-        "--output-dir", default="benchmark_runs", type=Path,
+        "--output-dir",
+        default="benchmark_runs",
+        type=Path,
         help="Directory to write the JSON report (default: ./benchmark_runs).",
     )
     parser.add_argument(
-        "--no-embed", action="store_true",
+        "--no-embed",
+        action="store_true",
         help="Skip the embedding step (queries that need vectors will fail).",
     )
     parser.add_argument(
-        "--force-reindex", action="store_true",
+        "--force-reindex",
+        action="store_true",
         help="Compatibility option; the extractor always verifies file content hashes.",
     )
     parser.add_argument(
-        "-v", "--verbose", action="store_true",
+        "-v",
+        "--verbose",
+        action="store_true",
         help="Stream every tool call and tool result from both agents to stdout.",
     )
     args = parser.parse_args(argv)

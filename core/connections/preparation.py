@@ -68,15 +68,23 @@ def source_window(raw: bytes, start: int, end: int, budget: int, context: int) -
         left += 1
     while right < len(raw) and right > left and raw[right] & 0xC0 == 0x80:
         right -= 1
-    return {"start_byte": left, "end_byte": right, "excerpt": raw[left:right].decode(),
-            "site_clipped": left > start or right < end,
-            "context_clipped": left > max(0, start - context) or right < min(len(raw), end + context)}
+    return {
+        "start_byte": left,
+        "end_byte": right,
+        "excerpt": raw[left:right].decode(),
+        "site_clipped": left > start or right < end,
+        "context_clipped": left > max(0, start - context) or right < min(len(raw), end + context),
+    }
 
 
 async def prepare_candidates(
-    pool, retrieval_run_id: str | UUID, rerank_fn: RerankFn,
-    identity: RerankerIdentity, options: PreparationOptions = PreparationOptions(),
-    *, additional_paths: tuple[tuple[int, str], ...] = (),
+    pool,
+    retrieval_run_id: str | UUID,
+    rerank_fn: RerankFn,
+    identity: RerankerIdentity,
+    options: PreparationOptions = PreparationOptions(),
+    *,
+    additional_paths: tuple[tuple[int, str], ...] = (),
 ) -> PreparationRun:
     """Prepare every retrieved source, preserving scores and unselected alternatives.
 
@@ -100,65 +108,120 @@ async def prepare_candidates(
         # Serialize publication and reuse. A failed scorer rolls back all packets.
         await conn.execute("SELECT id FROM connection_snapshots WHERE id=$1 FOR UPDATE", sid)
         key = fingerprint([str(rid), asdict(identity), settings])
-        existing = await conn.fetchrow("SELECT * FROM connection_preparation_runs WHERE run_key=$1", key)
+        existing = await conn.fetchrow(
+            "SELECT * FROM connection_preparation_runs WHERE run_key=$1", key
+        )
         if existing:
             if existing["completed_at"] is None:
                 raise ValueError("Incomplete preparation run")
-            count = await conn.fetchval("SELECT count(*) FROM connection_evidence_packets WHERE preparation_run_id=$1", existing["id"])
+            count = await conn.fetchval(
+                "SELECT count(*) FROM connection_evidence_packets WHERE preparation_run_id=$1",
+                existing["id"],
+            )
             return PreparationRun(str(existing["id"]), count)
-        run = await conn.fetchval("""
+        run = await conn.fetchval(
+            """
             INSERT INTO connection_preparation_runs
                 (snapshot_id,retrieval_run_id,run_key,reranker_identity,settings)
             VALUES ($1,$2,$3,$4::jsonb,$5::jsonb) RETURNING id
-        """, sid, rid, key, json.dumps(asdict(identity)), json.dumps(settings))
-        sources = await conn.fetch("""
+        """,
+            sid,
+            rid,
+            key,
+            json.dumps(asdict(identity)),
+            json.dumps(settings),
+        )
+        sources = await conn.fetch(
+            """
             SELECT s.*, cs.candidate_set_fingerprint FROM connection_candidate_sets cs
             JOIN interaction_sites s ON s.id=cs.source_site_id
             WHERE cs.run_id=$1 ORDER BY s.repo_id,s.path,s.start_byte,s.id
-        """, rid)
+        """,
+            rid,
+        )
         for source in sources:
-            targets = await conn.fetch("""
+            targets = await conn.fetch(
+                """
                 SELECT s.*, c.id AS candidate_id, m.rank AS retrieval_rank, m.channels
                 FROM connection_candidate_matches m
                 JOIN connection_candidates c ON c.id=m.candidate_id
                 JOIN interaction_sites s ON s.id=c.target_site_id
                 WHERE m.run_id=$1 AND m.source_site_id=$2 ORDER BY m.rank
-            """, rid, source["id"])
-            scores = await asyncio.wait_for(
-                rerank_fn(source["retrieval_text"][:options.rerank_chars],
-                          [t["retrieval_text"][:options.rerank_chars] for t in targets]),
-                timeout=options.timeout_seconds,
-            ) if targets else []
-            if not isinstance(scores, (list, tuple)) or len(scores) != len(targets) or any(isinstance(s, bool) or not isinstance(s, (int, float))
-                                                 or not math.isfinite(s) for s in scores):
+            """,
+                rid,
+                source["id"],
+            )
+            scores = []
+            if targets:
+                scores = await asyncio.wait_for(
+                    rerank_fn(
+                        source["retrieval_text"][: options.rerank_chars],
+                        [t["retrieval_text"][: options.rerank_chars] for t in targets],
+                    ),
+                    timeout=options.timeout_seconds,
+                )
+
+            if (
+                not isinstance(scores, (list, tuple))
+                or len(scores) != len(targets)
+                or any(
+                    isinstance(s, bool) or not isinstance(s, (int, float)) or not math.isfinite(s)
+                    for s in scores
+                )
+            ):
                 raise ValueError("Reranker must return one finite score per input document")
-            ordered = sorted(zip(targets, scores), key=lambda pair: (-pair[1], pair[0]["retrieval_rank"]))
-            selected = ordered[:options.target_limit]
-            payload = {"version": PREPARATION_VERSION, "source_site_id": str(source["id"]),
-                       "candidate_set_fingerprint": source["candidate_set_fingerprint"],
-                       "reranker": asdict(identity), "settings": settings,
-                       "alternatives": [], "excerpts": [], "dependencies": [], "omissions": [],
-                       "empty_candidates": not targets,
-                       "query_clipped": len(source["retrieval_text"]) > options.rerank_chars}
+            ordered = sorted(
+                zip(targets, scores), key=lambda pair: (-pair[1], pair[0]["retrieval_rank"])
+            )
+            selected = ordered[: options.target_limit]
+            payload = {
+                "version": PREPARATION_VERSION,
+                "source_site_id": str(source["id"]),
+                "candidate_set_fingerprint": source["candidate_set_fingerprint"],
+                "reranker": asdict(identity),
+                "settings": settings,
+                "alternatives": [],
+                "excerpts": [],
+                "dependencies": [],
+                "omissions": [],
+                "empty_candidates": not targets,
+                "query_clipped": len(source["retrieval_text"]) > options.rerank_chars,
+            }
             for rank, (target, score) in enumerate(ordered, 1):
-                payload["alternatives"].append({"candidate_id": str(target["candidate_id"]),
-                    "target_site_id": str(target["id"]), "rank": rank, "score": score,
-                    "retrieval_rank": target["retrieval_rank"], "channels": json.loads(target["channels"]),
-                    "selected": rank <= options.target_limit,
-                    "input_clipped": len(target["retrieval_text"]) > options.rerank_chars})
+                payload["alternatives"].append(
+                    {
+                        "candidate_id": str(target["candidate_id"]),
+                        "target_site_id": str(target["id"]),
+                        "rank": rank,
+                        "score": score,
+                        "retrieval_rank": target["retrieval_rank"],
+                        "channels": json.loads(target["channels"]),
+                        "selected": rank <= options.target_limit,
+                        "input_clipped": len(target["retrieval_text"]) > options.rerank_chars,
+                    }
+                )
+            # Endpoint excerpts consume the reserved budget before optional context.
             remaining = options.total_bytes
             requests = [(source["repo_id"], source["path"], source, "source")]
             requests += [(t["repo_id"], t["path"], t, "target") for t, _ in selected]
             requests += [(repo, path, None, "additional") for repo, path in paths]
             for repo, path, site, role in requests:
-                file = await conn.fetchrow("""
+                file = await conn.fetchrow(
+                    """
                     SELECT f.content_hash,f.mode,b.content FROM connection_snapshot_files f
                     JOIN connection_source_blobs b USING(content_hash)
                     WHERE f.snapshot_id=$1 AND f.repo_id=$2 AND f.path=$3
-                """, sid, repo, path)
-                dependency = {"repo_id": repo, "path": path,
-                              "content_hash": file["content_hash"] if file else None,
-                              "mode": file["mode"] if file else None}
+                """,
+                    sid,
+                    repo,
+                    path,
+                )
+                dependency = {
+                    "repo_id": repo,
+                    "path": path,
+                    "content_hash": file["content_hash"] if file else None,
+                    "mode": file["mode"] if file else None,
+                }
                 if dependency not in payload["dependencies"]:
                     payload["dependencies"].append(dependency)
                 reason = None
@@ -180,25 +243,61 @@ async def prepare_candidates(
                     payload["omissions"].append({**dependency, "reason": reason, "role": role})
                     continue
                 start, end = (site["start_byte"], site["end_byte"]) if site else (0, len(raw))
-                window = source_window(raw, start, end, min(options.excerpt_bytes, remaining), options.context_bytes)
-                eid = uuid5(sid, fingerprint([repo, path, file["content_hash"], window["start_byte"], window["end_byte"]]))
-                await conn.execute("""
+                window = source_window(
+                    raw, start, end, min(options.excerpt_bytes, remaining), options.context_bytes
+                )
+                eid = uuid5(
+                    sid,
+                    fingerprint(
+                        [repo, path, file["content_hash"], window["start_byte"], window["end_byte"]]
+                    ),
+                )
+                await conn.execute(
+                    """
                     INSERT INTO connection_evidence
                         (id,snapshot_id,repo_id,path,start_byte,end_byte,content_hash,excerpt)
                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(id) DO NOTHING
-                """, eid, sid, repo, path, window["start_byte"], window["end_byte"], file["content_hash"], window["excerpt"])
-                payload["excerpts"].append({**dependency, **window, "evidence_id": str(eid),
-                                            "site_id": str(site["id"]) if site else None, "role": role})
+                """,
+                    eid,
+                    sid,
+                    repo,
+                    path,
+                    window["start_byte"],
+                    window["end_byte"],
+                    file["content_hash"],
+                    window["excerpt"],
+                )
+                payload["excerpts"].append(
+                    {
+                        **dependency,
+                        **window,
+                        "evidence_id": str(eid),
+                        "site_id": str(site["id"]) if site else None,
+                        "role": role,
+                    }
+                )
                 remaining -= window["end_byte"] - window["start_byte"]
             payload["excerpt_bytes"] = options.total_bytes - remaining
             digest = fingerprint(payload)
-            packet = await conn.fetchval("""
+            packet = await conn.fetchval(
+                """
                 INSERT INTO connection_evidence_packets
                     (snapshot_id,preparation_run_id,source_site_id,packet_fingerprint,payload)
                 VALUES ($1,$2,$3,$4,$5::jsonb) RETURNING id
-            """, sid, run, source["id"], digest, json.dumps(payload))
-            await conn.executemany("""
+            """,
+                sid,
+                run,
+                source["id"],
+                digest,
+                json.dumps(payload),
+            )
+            await conn.executemany(
+                """
                 INSERT INTO connection_packet_evidence VALUES ($1,$2,$3) ON CONFLICT DO NOTHING
-            """, [(sid, packet, UUID(e["evidence_id"])) for e in payload["excerpts"]])
-        await conn.execute("UPDATE connection_preparation_runs SET completed_at=now() WHERE id=$1", run)
+            """,
+                [(sid, packet, UUID(e["evidence_id"])) for e in payload["excerpts"]],
+            )
+        await conn.execute(
+            "UPDATE connection_preparation_runs SET completed_at=now() WHERE id=$1", run
+        )
         return PreparationRun(str(run), len(sources))

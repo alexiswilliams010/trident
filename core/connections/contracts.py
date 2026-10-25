@@ -128,8 +128,16 @@ class Decision:
     score: float | None = None
 
     def __post_init__(self) -> None:
-        if not all((self.id, self.candidate_id, self.provider, self.model_version,
-                    self.policy_version, self.evidence_fingerprint)):
+        if not all(
+            (
+                self.id,
+                self.candidate_id,
+                self.provider,
+                self.model_version,
+                self.policy_version,
+                self.evidence_fingerprint,
+            )
+        ):
             raise ValueError("Decision provenance must be explicit")
         if self.outcome not in set(Outcome):
             raise ValueError("Unknown decision outcome")
@@ -156,15 +164,18 @@ class Connection:
 
 
 def validate_connections(
-    snapshot: Snapshot, candidate: Candidate, decision: Decision,
-    edges: tuple[Connection, ...], evidence: tuple[Evidence, ...],
+    snapshot: Snapshot,
+    candidate: Candidate,
+    decision: Decision,
+    edges: tuple[Connection, ...],
+    evidence: tuple[Evidence, ...],
     resource_ids: frozenset[str] = frozenset(),
 ) -> None:
     """Validate a complete publication unit, including shared-resource participation.
 
-resource_ids must be obtained from this snapshot's stored resources. No model
-output can create evidence of cross-repository participation by naming a resource.
-"""
+    resource_ids must be obtained from this snapshot's stored resources. No model
+    output can create evidence of cross-repository participation by naming a resource.
+    """
     from .verbs import VERBS
 
     candidate.validate(snapshot)

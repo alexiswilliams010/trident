@@ -42,23 +42,23 @@ from .grammar_meta import LANGUAGES, language_for_path
 from .languages import HANDLERS
 
 # Directories pruned everywhere, regardless of language.
-ALWAYS_IGNORED: frozenset[str] = frozenset({
-    ".git",
-    ".hg",
-    ".svn",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-})
+ALWAYS_IGNORED: frozenset[str] = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+    }
+)
 
 # Default dependency dirs per language. Sourced from each LanguageHandler's
 # `dependency_dirs` class attribute, so adding a language = one place to edit
 # (the handler module under core/languages/<lang>/).
 DEFAULT_DEP_PATHS: dict[str, tuple[str, ...]] = {
-    name: handler.dependency_dirs
-    for name, handler in HANDLERS.items()
-    if handler.dependency_dirs
+    name: handler.dependency_dirs for name, handler in HANDLERS.items() if handler.dependency_dirs
 }
 
 TRIDENT_IGNORE_FILE = ".tridentignore"
@@ -139,10 +139,10 @@ def _matches_excludes(rel_path: str, patterns: tuple[str, ...]) -> bool:
 
 @dataclass
 class DiscoveredFile:
-    path: Path           # absolute path
-    rel_path: str        # path relative to repo_root, forward-slash separated
+    path: Path  # absolute path
+    rel_path: str  # path relative to repo_root, forward-slash separated
     language: str
-    size: int            # bytes (from os.stat); recorded on branch_files
+    size: int  # bytes (from os.stat); recorded on branch_files
 
 
 def _scan_one_dir(
@@ -187,9 +187,14 @@ def _scan_one_dir(
                 size = entry.stat(follow_symlinks=False).st_size
             except FileNotFoundError:
                 continue
-            files.append(DiscoveredFile(
-                path=Path(entry.path), rel_path=rel, language=lang, size=size,
-            ))
+            files.append(
+                DiscoveredFile(
+                    path=Path(entry.path),
+                    rel_path=rel,
+                    language=lang,
+                    size=size,
+                )
+            )
 
     return files, subdirs
 

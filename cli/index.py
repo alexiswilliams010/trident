@@ -23,7 +23,12 @@ from pathlib import Path
 
 from cli._repo import resolve_repo_and_branch
 from core.chunk_assembler import assemble_chunks
-from core.embedder import EmbedderConfig, OpenAICompatibleEmbedder, embed_branch_chunks, make_fake_embedder
+from core.embedder import (
+    EmbedderConfig,
+    OpenAICompatibleEmbedder,
+    embed_branch_chunks,
+    make_fake_embedder,
+)
 from core.extractor import index_repo
 from core.file_walker import WalkConfig, read_tridentignore
 from core.heuristic_resolver import resolve_branch_imports
@@ -54,10 +59,15 @@ async def _run(
                     print(f"Applied migrations: {', '.join(applied)}")
 
         repo_id, branch_id = await resolve_repo_and_branch(
-            pool, repo_name=repo_name, branch_name=branch_name, create=True,
+            pool,
+            repo_name=repo_name,
+            branch_name=branch_name,
+            create=True,
             root_path=str(repo_path.resolve()),
         )
-        print(f"[repo] {repo_name} → repo_id={repo_id}, branch={branch_name or 'main'} → branch_id={branch_id}")
+        print(
+            f"[repo] {repo_name} → repo_id={repo_id}, branch={branch_name or 'main'} → branch_id={branch_id}"
+        )
 
         # Build the walk config: defaults + .tridentignore (if present) + --exclude flags.
         walk_cfg = WalkConfig.with_defaults(repo_path)
@@ -73,8 +83,12 @@ async def _run(
             print(f"[walk] excluding: {', '.join(all_excludes)}")
 
         extract_result = await index_repo(
-            pool, repo_id, branch_id, repo_path,
-            walk_config=walk_cfg, force_rehash=force_rehash,
+            pool,
+            repo_id,
+            branch_id,
+            repo_path,
+            walk_config=walk_cfg,
+            force_rehash=force_rehash,
         )
         print(
             f"[Tier 1] Indexed {len(extract_result.indexed)} files "
@@ -85,12 +99,14 @@ async def _run(
 
         if do_resolve:
             file_version_ids = (
-                None if force_resolve
-                else [r.file_version_id for r in extract_result.indexed]
+                None if force_resolve else [r.file_version_id for r in extract_result.indexed]
             )
             if file_version_ids is None or file_version_ids:
                 resolve_results = await resolve_repo(
-                    pool, repo_id, branch_id, only_file_version_ids=file_version_ids,
+                    pool,
+                    repo_id,
+                    branch_id,
+                    only_file_version_ids=file_version_ids,
                 )
                 tot_defs = sum(r.n_definitions for r in resolve_results)
                 tot_refs = sum(r.n_references for r in resolve_results)
@@ -135,7 +151,9 @@ async def _run(
                 embed_fn = OpenAICompatibleEmbedder(cfg).embed
                 model_name = cfg.model
             estats = await embed_branch_chunks(pool, branch_id, embed_fn, model_name)
-            print(f"[Tier 3 embed] {estats.embedded}/{estats.chunks_seen} chunks embedded ({model_name})")
+            print(
+                f"[Tier 3 embed] {estats.embedded}/{estats.chunks_seen} chunks embedded ({model_name})"
+            )
 
     return 0
 
@@ -143,29 +161,63 @@ async def _run(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="trident — index a repo (Tier 1 + Tier 2)")
     parser.add_argument("repo_path", type=Path, help="Path to the repo to index")
-    parser.add_argument("--repo-name", type=str, required=True,
-                        help="Human-readable repo name (created on first use)")
-    parser.add_argument("--branch", type=str, default=None,
-                        help="Branch name (defaults to the repo's designated default, "
-                             "auto-created as 'main' on first index)")
-    parser.add_argument("--dsn", type=str, default=None, help="Postgres DSN (defaults to DATABASE_URL env)")
-    parser.add_argument("--init-schema", action="store_true", help="Apply migrations before indexing (idempotent)")
+    parser.add_argument(
+        "--repo-name",
+        type=str,
+        required=True,
+        help="Human-readable repo name (created on first use)",
+    )
+    parser.add_argument(
+        "--branch",
+        type=str,
+        default=None,
+        help="Branch name (defaults to the repo's designated default, "
+        "auto-created as 'main' on first index)",
+    )
+    parser.add_argument(
+        "--dsn", type=str, default=None, help="Postgres DSN (defaults to DATABASE_URL env)"
+    )
+    parser.add_argument(
+        "--init-schema", action="store_true", help="Apply migrations before indexing (idempotent)"
+    )
     parser.add_argument("--no-resolve", action="store_true", help="Skip Tier 2 semantic resolution")
-    parser.add_argument("--no-imports", action="store_true", help="Skip Phase 3 import resolution / cross-file linking")
+    parser.add_argument(
+        "--no-imports",
+        action="store_true",
+        help="Skip Phase 3 import resolution / cross-file linking",
+    )
     parser.add_argument("--no-chunks", action="store_true", help="Skip Tier 3 chunk assembly")
-    parser.add_argument("--embed", choices=["real", "fake"], default=None,
-                        help="Run embedding step. 'real' uses EMBEDDING_BASE_URL/API_KEY/MODEL; 'fake' is the deterministic stub.")
-    parser.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
-                        type=lambda s: [p.strip() for p in s.split(",") if p.strip()],
-                        help="Glob(s) to skip. Repeatable; comma-separates also fine. "
-                             "No-slash patterns match any path component; "
-                             "with-slash patterns match the full repo-relative path.")
-    parser.add_argument("--no-tridentignore", action="store_true",
-                        help="Don't auto-load .tridentignore from the repo root.")
-    parser.add_argument("--force-resolve", action="store_true",
-                        help="Re-run semantic resolution on all files, not just changed ones.")
-    parser.add_argument("--rehash", action="store_true",
-                        help="Compatibility option; file content is always rehashed.")
+    parser.add_argument(
+        "--embed",
+        choices=["real", "fake"],
+        default=None,
+        help="Run embedding step. 'real' uses EMBEDDING_BASE_URL/API_KEY/MODEL; 'fake' is the deterministic stub.",
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        type=lambda s: [p.strip() for p in s.split(",") if p.strip()],
+        help="Glob(s) to skip. Repeatable; comma-separates also fine. "
+        "No-slash patterns match any path component; "
+        "with-slash patterns match the full repo-relative path.",
+    )
+    parser.add_argument(
+        "--no-tridentignore",
+        action="store_true",
+        help="Don't auto-load .tridentignore from the repo root.",
+    )
+    parser.add_argument(
+        "--force-resolve",
+        action="store_true",
+        help="Re-run semantic resolution on all files, not just changed ones.",
+    )
+    parser.add_argument(
+        "--rehash",
+        action="store_true",
+        help="Compatibility option; file content is always rehashed.",
+    )
     args = parser.parse_args(argv)
 
     if not args.repo_path.is_dir():

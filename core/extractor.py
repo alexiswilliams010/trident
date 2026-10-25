@@ -183,7 +183,11 @@ async def index_file(
               from_dependency = EXCLUDED.from_dependency,
               size = EXCLUDED.size
         """,
-        branch_id, discovered.rel_path, file_version_id, from_dependency, discovered.size,
+        branch_id,
+        discovered.rel_path,
+        file_version_id,
+        from_dependency,
+        discovered.size,
     )
 
     return IndexFileResult(
@@ -274,7 +278,8 @@ async def index_repo(
             fv_rows = await conn.fetch(
                 "SELECT id, content_hash FROM file_versions "
                 "WHERE repo_id=$1 AND content_hash = ANY($2::text[])",
-                repo_id, fresh_hashes,
+                repo_id,
+                fresh_hashes,
             )
             fv_by_hash = {r["content_hash"]: r["id"] for r in fv_rows}
 
@@ -295,28 +300,34 @@ async def index_repo(
                     else:
                         cold_by_hash[h] = (f, raw_by_path[f.rel_path])
                     continue
-                if (cached_fv_by_path.get(f.rel_path) == fv_id
-                        and cached_size_by_path.get(f.rel_path) == f.size):
-                    skipped.append(IndexFileResult(
-                        file_version_id=fv_id,
-                        rel_path=f.rel_path,
-                        language=f.language,
-                        node_count=0,
-                        skipped=True,
-                    ))
+                if (
+                    cached_fv_by_path.get(f.rel_path) == fv_id
+                    and cached_size_by_path.get(f.rel_path) == f.size
+                ):
+                    skipped.append(
+                        IndexFileResult(
+                            file_version_id=fv_id,
+                            rel_path=f.rel_path,
+                            language=f.language,
+                            node_count=0,
+                            skipped=True,
+                        )
+                    )
                 else:
                     # Mapping changed, size needs backfill, or both.
                     rebinds.append((f.rel_path, fv_id, f.language, f.size))
             else:
                 # Verified hash matches the prefetched file version.
                 fv_id = cached_fv_by_path[f.rel_path]
-                skipped.append(IndexFileResult(
-                    file_version_id=fv_id,
-                    rel_path=f.rel_path,
-                    language=f.language,
-                    node_count=0,
-                    skipped=True,
-                ))
+                skipped.append(
+                    IndexFileResult(
+                        file_version_id=fv_id,
+                        rel_path=f.rel_path,
+                        language=f.language,
+                        node_count=0,
+                        skipped=True,
+                    )
+                )
 
         if rebinds:
             await conn.execute(
@@ -335,13 +346,15 @@ async def index_repo(
                 [r[3] for r in rebinds],
             )
             for rel_path, fv_id, lang, _size in rebinds:
-                indexed.append(IndexFileResult(
-                    file_version_id=fv_id,
-                    rel_path=rel_path,
-                    language=lang,
-                    node_count=0,
-                    skipped=False,
-                ))
+                indexed.append(
+                    IndexFileResult(
+                        file_version_id=fv_id,
+                        rel_path=rel_path,
+                        language=lang,
+                        node_count=0,
+                        skipped=False,
+                    )
+                )
 
         # Prune branch_files mappings for user files no longer reached by the
         # walker (deletes, moves, newly excluded). Dependency mappings are
@@ -373,11 +386,14 @@ async def index_repo(
             ON CONFLICT (branch_id, path) DO UPDATE
               SET tree_hash = EXCLUDED.tree_hash
             """,
-            branch_id, dir_paths, dir_tree_hashes,
+            branch_id,
+            dir_paths,
+            dir_tree_hashes,
         )
         await conn.execute(
             "DELETE FROM branch_dirs WHERE branch_id=$1 AND path <> ALL($2::text[])",
-            branch_id, dir_paths,
+            branch_id,
+            dir_paths,
         )
 
     # Cold path: parse + insert each new file on its own connection so
@@ -385,14 +401,14 @@ async def index_repo(
     if cold_by_hash:
         sem = asyncio.Semaphore(int(os.environ.get("INDEX_CONCURRENCY", "4")))
 
-        async def _cold(discovered: DiscoveredFile, raw: bytes, content_hash: str) -> IndexFileResult:
+        async def _cold(
+            discovered: DiscoveredFile, raw: bytes, content_hash: str
+        ) -> IndexFileResult:
             async with sem, pool.acquire() as c, c.transaction():
                 return await index_file(c, repo_id, branch_id, discovered, raw, content_hash)
 
         cold_items = list(cold_by_hash.items())  # [(hash, (discovered, raw)), ...]
-        cold_results = await asyncio.gather(
-            *[_cold(d, r, h) for h, (d, r) in cold_items]
-        )
+        cold_results = await asyncio.gather(*[_cold(d, r, h) for h, (d, r) in cold_items])
         indexed.extend(cold_results)
 
         # Map extra paths (same hash as a cold task) onto the minted fv_id.
@@ -407,12 +423,14 @@ async def index_repo(
                     extra_paths.append(d.rel_path)
                     extra_fvs.append(fv_id)
                     extra_sizes.append(d.size)
-                    indexed.append(IndexFileResult(
-                        file_version_id=fv_id,
-                        rel_path=d.rel_path,
-                        language=d.language,
-                        node_count=0,
-                    ))
+                    indexed.append(
+                        IndexFileResult(
+                            file_version_id=fv_id,
+                            rel_path=d.rel_path,
+                            language=d.language,
+                            node_count=0,
+                        )
+                    )
             async with pool.acquire() as c:
                 await c.execute(
                     """
@@ -423,7 +441,11 @@ async def index_repo(
                           from_dependency = EXCLUDED.from_dependency,
                           size = EXCLUDED.size
                     """,
-                    branch_id, extra_paths, extra_fvs, [False] * len(extra_paths), extra_sizes,
+                    branch_id,
+                    extra_paths,
+                    extra_fvs,
+                    [False] * len(extra_paths),
+                    extra_sizes,
                 )
 
     return IndexRepoResult(indexed=indexed, skipped=skipped, deleted=deleted)

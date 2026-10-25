@@ -44,8 +44,8 @@ class RetrievedChunk:
     branch_id: int
     token_count: int
     content: str
-    score: float                     # higher is better; meaning depends on query mode
-    repo_id: int | None = None       # which repo this chunk came from (multi-repo aware)
+    score: float  # higher is better; meaning depends on query mode
+    repo_id: int | None = None  # which repo this chunk came from (multi-repo aware)
 
 
 def _norm_branch_ids(x: int | list[int]) -> list[int]:
@@ -106,7 +106,8 @@ async def structural_query(
             WHERE bf.branch_id = ANY($1::bigint[])
               AND (d.name = $2 OR d.qualified_name = $2 OR d.qualified_name LIKE '%.' || $2)
             """,
-            bids, definition_name,
+            bids,
+            definition_name,
         )
         if not seeds:
             return []
@@ -121,7 +122,8 @@ async def structural_query(
                     WHERE caller_def_id=$1 AND callee_def_id IS NOT NULL
                       AND branch_id = ANY($2::bigint[])
                     """,
-                    caller, bids,
+                    caller,
+                    bids,
                 )
                 for e in edges:
                     cid = e["callee_def_id"]
@@ -134,7 +136,11 @@ async def structural_query(
             frontier = next_frontier
 
         return await _fetch_chunks_for_anchors(
-            conn, list(scores.keys()), scores, granularity, branch_ids=bids,
+            conn,
+            list(scores.keys()),
+            scores,
+            granularity,
+            branch_ids=bids,
             languages=languages,
         )
 
@@ -145,8 +151,8 @@ async def structural_query(
 
 
 SKELETON_PENALTY_FLOOR = 0.3
-SKELETON_GRAPH_REF = 3       # def-level signal at which the factor reaches 1.0
-SKELETON_FILE_GRAPH_REF = 10 # file-level signal threshold for module chunks
+SKELETON_GRAPH_REF = 3  # def-level signal at which the factor reaches 1.0
+SKELETON_FILE_GRAPH_REF = 10  # file-level signal threshold for module chunks
 
 _GRAPH_SIGNAL_SQL = "(COALESCE(out_calls.n, 0) + COALESCE(out_data.n, 0))"
 _FILE_GRAPH_SIGNAL_SQL = "COALESCE(file_sig.n, 0)"
@@ -276,10 +282,12 @@ async def semantic_query(
 
 def _embedding_filter(params: list, identity: EmbeddingIdentity) -> str:
     clauses = []
-    for column, value in (("model_name", identity.model_name),
-                          ("model_version", identity.model_version),
-                          ("dimensions", identity.dimensions),
-                          ("representation_version", identity.representation_version)):
+    for column, value in (
+        ("model_name", identity.model_name),
+        ("model_version", identity.model_version),
+        ("dimensions", identity.dimensions),
+        ("representation_version", identity.representation_version),
+    ):
         params.append(value)
         clauses.append(f"AND ce.{column} = ${len(params)}")
     return " ".join(clauses)
@@ -445,8 +453,15 @@ async def hybrid_query(
     """
     bids = _norm_branch_ids(branch_ids)
     sem_results, lex_results = await asyncio.gather(
-        semantic_query(pool, bids, query, embed_fn, top_k=candidate_pool, languages=languages,
-                       embedding_identity=embedding_identity),
+        semantic_query(
+            pool,
+            bids,
+            query,
+            embed_fn,
+            top_k=candidate_pool,
+            languages=languages,
+            embedding_identity=embedding_identity,
+        ),
         lexical_query(pool, bids, query, top_k=candidate_pool, languages=languages),
     )
     if not sem_results and not lex_results:
@@ -472,8 +487,11 @@ async def hybrid_query(
         for c in ranked:
             c.score = scores[c.chunk_id]
         return _mmr_rerank(
-            ranked, scores, top_k,
-            repo_lambda=mmr_repo_lambda, file_lambda=mmr_file_lambda,
+            ranked,
+            scores,
+            top_k,
+            repo_lambda=mmr_repo_lambda,
+            file_lambda=mmr_file_lambda,
         )
 
     anchor_ids = list(anchor_scores.keys())
@@ -495,11 +513,13 @@ async def hybrid_query(
             WHERE caller_def_id = ANY($1::bigint[]) AND callee_def_id IS NOT NULL
               AND branch_id = ANY($2::bigint[])
             """,
-            anchor_ids, bids,
+            anchor_ids,
+            bids,
         )
         for r in call_rows:
-            _add_bonus(r["callee_def_id"], r["caller_def_id"],
-                       conf_weight.get(r["confidence"], 0.5))
+            _add_bonus(
+                r["callee_def_id"], r["caller_def_id"], conf_weight.get(r["confidence"], 0.5)
+            )
 
         effective_anchor_scores = dict(anchor_scores)
         for cid, bonus in related_bonus.items():
@@ -525,7 +545,8 @@ async def hybrid_query(
               AND branch_id = ANY($2::bigint[])
               AND (base_def_id = ANY($1::bigint[]) OR child_def_id = ANY($1::bigint[]))
             """,
-            expanded_ids, bids,
+            expanded_ids,
+            bids,
         )
         for r in inh_rows:
             w = conf_weight.get(r["confidence"], 0.5)
@@ -548,7 +569,8 @@ async def hybrid_query(
             WHERE branch_id = ANY($2::bigint[])
               AND (child_def_id = ANY($1::bigint[]) OR base_def_id = ANY($1::bigint[]))
             """,
-            expanded_ids, bids,
+            expanded_ids,
+            bids,
         )
         for r in ovr_rows:
             if r["base_def_id"] in expanded_scores:
@@ -565,8 +587,12 @@ async def hybrid_query(
         if related_bonus:
             related_ids = sorted(related_bonus.keys())
             related_chunks = await _fetch_chunks_for_anchors(
-                conn, related_ids, scores={cid: 1.0 for cid in related_ids},
-                granularity="function", branch_ids=bids, languages=languages,
+                conn,
+                related_ids,
+                scores={cid: 1.0 for cid in related_ids},
+                granularity="function",
+                branch_ids=bids,
+                languages=languages,
             )
             for nc in related_chunks:
                 bonus = related_bonus.get(nc.anchor_def_id or -1, 0.0)
@@ -582,8 +608,11 @@ async def hybrid_query(
     for c in ranked:
         c.score = scores[c.chunk_id]
     return _mmr_rerank(
-        ranked, scores, top_k,
-        repo_lambda=mmr_repo_lambda, file_lambda=mmr_file_lambda,
+        ranked,
+        scores,
+        top_k,
+        repo_lambda=mmr_repo_lambda,
+        file_lambda=mmr_file_lambda,
     )
 
 
@@ -612,9 +641,8 @@ def _mmr_rerank(
         best_idx = 0
         best_adj = float("-inf")
         for i, c in enumerate(remaining):
-            penalty = (
-                repo_lambda * repo_count.get(c.repo_id, 0)
-                + file_lambda * file_count.get(c.file_version_id, 0)
+            penalty = repo_lambda * repo_count.get(c.repo_id, 0) + file_lambda * file_count.get(
+                c.file_version_id, 0
             )
             adj = scores.get(c.chunk_id, 0.0) - penalty
             if adj > best_adj:

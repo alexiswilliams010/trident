@@ -95,7 +95,8 @@ async def _file_version_id_for_path(conn, branch_id: int, path: str) -> int:
     """Helper: look up the file_version mapped at `path` in this branch."""
     return await conn.fetchval(
         "SELECT file_version_id FROM branch_files WHERE branch_id=$1 AND path=$2",
-        branch_id, path,
+        branch_id,
+        path,
     )
 
 
@@ -191,21 +192,22 @@ async def test_index_go_fixture(clean_repo, go_fixture_root: Path) -> None:
     async with pool.acquire() as conn:
         # index_repo records repo_root so Phase 3 can find go.mod.
         root_path = await conn.fetchval(
-            "SELECT root_path FROM repos WHERE id=$1", repo_id,
+            "SELECT root_path FROM repos WHERE id=$1",
+            repo_id,
         )
         assert root_path is not None
         assert root_path.endswith("go_fixture")
 
         composed_id = await _file_version_id_for_path(conn, branch_id, "pkg/iface/composed.go")
         type_elems = await conn.fetchval(
-            "SELECT COUNT(*) FROM nodes "
-            "WHERE file_version_id=$1 AND node_type='type_elem'", composed_id,
+            "SELECT COUNT(*) FROM nodes WHERE file_version_id=$1 AND node_type='type_elem'",
+            composed_id,
         )
         assert type_elems >= 4
 
         method_elems = await conn.fetchval(
-            "SELECT COUNT(*) FROM nodes "
-            "WHERE file_version_id=$1 AND node_type='method_elem'", composed_id,
+            "SELECT COUNT(*) FROM nodes WHERE file_version_id=$1 AND node_type='method_elem'",
+            composed_id,
         )
         assert method_elems >= 1
 
@@ -308,10 +310,12 @@ async def test_in_place_modify_then_revert_reuses_file_version(clean_repo, tmp_p
     async with pool.acquire() as conn:
         fv_initial = await conn.fetchval(
             "SELECT file_version_id FROM branch_files WHERE branch_id=$1 AND path=$2",
-            branch_id, "module.py",
+            branch_id,
+            "module.py",
         )
         fv_count_initial = await conn.fetchval(
-            "SELECT COUNT(*) FROM file_versions WHERE repo_id=$1", repo_id,
+            "SELECT COUNT(*) FROM file_versions WHERE repo_id=$1",
+            repo_id,
         )
     assert fv_count_initial == 1
 
@@ -322,10 +326,12 @@ async def test_in_place_modify_then_revert_reuses_file_version(clean_repo, tmp_p
     async with pool.acquire() as conn:
         fv_after_modify = await conn.fetchval(
             "SELECT file_version_id FROM branch_files WHERE branch_id=$1 AND path=$2",
-            branch_id, "module.py",
+            branch_id,
+            "module.py",
         )
         fv_count_after_modify = await conn.fetchval(
-            "SELECT COUNT(*) FROM file_versions WHERE repo_id=$1", repo_id,
+            "SELECT COUNT(*) FROM file_versions WHERE repo_id=$1",
+            repo_id,
         )
     assert fv_after_modify != fv_initial, "modified content should map to a new file_version"
     assert fv_count_after_modify == 2, "new content_hash adds a second file_version row"
@@ -338,10 +344,12 @@ async def test_in_place_modify_then_revert_reuses_file_version(clean_repo, tmp_p
     async with pool.acquire() as conn:
         fv_after_revert = await conn.fetchval(
             "SELECT file_version_id FROM branch_files WHERE branch_id=$1 AND path=$2",
-            branch_id, "module.py",
+            branch_id,
+            "module.py",
         )
         fv_count_after_revert = await conn.fetchval(
-            "SELECT COUNT(*) FROM file_versions WHERE repo_id=$1", repo_id,
+            "SELECT COUNT(*) FROM file_versions WHERE repo_id=$1",
+            repo_id,
         )
     assert fv_after_revert == fv_initial, "revert should reuse the original file_version row"
     assert fv_count_after_revert == 2, (
@@ -352,7 +360,8 @@ async def test_in_place_modify_then_revert_reuses_file_version(clean_repo, tmp_p
     # Sanity: the original's nodes are still attached to the original file_version.
     async with pool.acquire() as conn:
         n_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM nodes WHERE file_version_id=$1", fv_initial,
+            "SELECT COUNT(*) FROM nodes WHERE file_version_id=$1",
+            fv_initial,
         )
     assert n_count > 0
 
@@ -389,6 +398,7 @@ async def test_indexing_prunes_moved_and_deleted_files(clean_repo, tmp_path: Pat
     # branch_files confirms the old paths are gone and the new path exists.
     async with pool.acquire() as conn:
         remaining = await conn.fetch(
-            "SELECT path FROM branch_files WHERE branch_id=$1 ORDER BY path", branch_id,
+            "SELECT path FROM branch_files WHERE branch_id=$1 ORDER BY path",
+            branch_id,
         )
     assert [r["path"] for r in remaining] == ["keep.py", "sub/moved.py"]
